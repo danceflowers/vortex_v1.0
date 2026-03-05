@@ -18,4 +18,12 @@ RUN chmod +x ./ci/install_dependencies.sh ./ci/toolchain_install.sh && \
     ./ci/install_dependencies.sh && \
     ./ci/toolchain_install.sh --riscv32 --llvm --libcrt32 --libc32
 
+RUN test -f /workspace/third_party/ramulator/ext/spdlog/include/spdlog/spdlog.h && \
+    test -d /workspace/third_party/ramulator/ext/yaml-cpp && \
+    cmake -S /workspace/third_party/ramulator \
+          -B /workspace/third_party/ramulator/build \
+          -DFETCHCONTENT_FULLY_DISCONNECTED=ON && \
+    cmake --build /workspace/third_party/ramulator/build -j"$(nproc)" && \
+    cp /workspace/third_party/ramulator/build/libramulator.so /workspace/third_party/ramulator/
+
 CMD ["bash"]

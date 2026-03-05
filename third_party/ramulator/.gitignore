@@ -1,6 +1,13 @@
 build/
 .vscode
 ext/
+!ext/
+!ext/argparse/
+!ext/argparse/**
+!ext/spdlog/
+!ext/spdlog/**
+!ext/yaml-cpp/
+!ext/yaml-cpp/**
 ramulator2
 *.so
 autobuild.sh
