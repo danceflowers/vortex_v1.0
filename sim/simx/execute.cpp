@@ -12,6 +12,7 @@
 // limitations under the License.
 
 #include <iostream>
+#include <algorithm>
 #include <stdlib.h>
 #include <unistd.h>
 #include <math.h>
@@ -168,6 +169,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
 #endif // XLEN_64
 
   bool rd_write = false;
+  last_instr_retired_ = true;
 
   visit_var(op_type,
     [&](AluType alu_type) {
@@ -1453,13 +1455,67 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
   #ifdef EXT_TCU_ENABLE
     ,[&](TcuType tcu_type) {
       auto tpuArgs = std::get<IntrTcuArgs>(instrArgs);
+      auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
+      trace->data = trace_data;
       switch (tcu_type) {
-      case TcuType::WMMA: {
-        auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
-        trace->data = trace_data;
-        assert(warp.tmask.count() == num_threads);
-        tensor_unit_->wmma(wid, tpuArgs.fmt_s, tpuArgs.fmt_d, tpuArgs.step_m, tpuArgs.step_n, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get());
+      case TcuType::TMEM_ALLOC: {
+        auto handle = core_->tmem_alloc(std::max<uint32_t>(1, rs1_data.at(thread_start).u32));
+        for (uint32_t t = thread_start; t < num_threads; ++t) {
+          if (!warp.tmask.test(t))
+            continue;
+          rd_data[t].u = handle;
+        }
+        trace_data->rd_write = true;
         rd_write = true;
+      } break;
+      case TcuType::TMEM_FREE: {
+        auto handle = rs1_data.at(thread_start).u32;
+        core_->tmem_free(handle);
+      } break;
+      case TcuType::TMA_LOAD: {
+        auto handle = rs1_data.at(thread_start).u32;
+        auto desc_addr = rs2_data.at(thread_start).u;
+        auto async_id = core_->tma_load(handle, desc_addr, tpuArgs.transpose_b);
+        for (uint32_t t = thread_start; t < num_threads; ++t) {
+          if (!warp.tmask.test(t))
+            continue;
+          rd_data[t].u = async_id;
+        }
+        trace_data->rd_write = true;
+        rd_write = true;
+      } break;
+      case TcuType::TMA_STORE: {
+        auto handle = rs1_data.at(thread_start).u32;
+        auto desc_addr = rs2_data.at(thread_start).u;
+        auto async_id = core_->tma_store(handle, desc_addr);
+        for (uint32_t t = thread_start; t < num_threads; ++t) {
+          if (!warp.tmask.test(t))
+            continue;
+          rd_data[t].u = async_id;
+        }
+        trace_data->rd_write = true;
+        rd_write = true;
+      } break;
+      case TcuType::MMA_LOAD: {
+        auto handle = rs1_data.at(thread_start).u32;
+        tensor_unit_->mma_load(wid, handle, tpuArgs, trace_data.get());
+        rd_write = trace_data->rd_write;
+      } break;
+      case TcuType::MMA_STORE: {
+        auto handle = rs1_data.at(thread_start).u32;
+        tensor_unit_->mma_store(wid, handle, tpuArgs, trace_data.get());
+        rd_write = trace_data->rd_write;
+      } break;
+      case TcuType::TMA_WAIT: {
+        auto async_id = rs1_data.at(thread_start).u32;
+        if (!core_->tma_wait(async_id)) {
+          last_instr_retired_ = false;
+        }
+      } break;
+      case TcuType::WMMA: {
+        assert(warp.tmask.count() == num_threads);
+        tensor_unit_->wmma(wid, tpuArgs.fmt_ab, tpuArgs.fmt_c, tpuArgs.step_m, tpuArgs.step_n, tpuArgs.step_k, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get());
+        rd_write = trace_data->rd_write;
       } break;
       default:
         std::abort();
@@ -1467,6 +1523,12 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
     }
   #endif // EXT_TCU_ENABLE
   );
+
+  if (!last_instr_retired_) {
+    trace->~instr_trace_t();
+    core_->trace_pool().deallocate(trace, 1);
+    return nullptr;
+  }
 
   if (rd_write) {
     trace->wb = true;

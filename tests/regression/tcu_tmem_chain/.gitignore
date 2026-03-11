@@ -1,0 +1,7 @@
+.config_stamp
+kernel.dump
+kernel.elf
+kernel.vxbin
+ramulator.stats.log
+tcu_tmem_chain
+trace/

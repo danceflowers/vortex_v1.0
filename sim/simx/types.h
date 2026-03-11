@@ -639,20 +639,61 @@ inline std::ostream &operator<<(std::ostream &os, const VpuOpType& type) {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+enum class TcuTarget : uint8_t {
+  None = 0,
+  A,
+  B,
+  C
+};
+
+inline std::ostream &operator<<(std::ostream &os, const TcuTarget& target) {
+  switch (target) {
+  case TcuTarget::None: os << "NONE"; break;
+  case TcuTarget::A:    os << "A"; break;
+  case TcuTarget::B:    os << "B"; break;
+  case TcuTarget::C:    os << "C"; break;
+  default:
+    assert(false);
+  }
+  return os;
+}
+
 enum class TcuType {
+  TMEM_ALLOC,
+  TMEM_FREE,
+  TMA_LOAD,
+  TMA_STORE,
+  MMA_LOAD,
+  MMA_STORE,
+  TMA_WAIT,
   WMMA,
 };
 
 struct IntrTcuArgs {
-  uint32_t fmt_s  : 4;
-  uint32_t fmt_d  : 4;
-  uint32_t step_m : 4;
-  uint32_t step_n : 4;
+  uint32_t fmt_ab = 0;
+  uint32_t fmt_c = 0;
+  uint32_t step_m = 0;
+  uint32_t step_n = 0;
+  uint32_t step_k = 0;
+  uint32_t bank_span = 0;
+  uint32_t packet_count = 0;
+  uint32_t async_id = 0;
+  uint32_t descriptor = 0;
+  uint8_t ws = 0;
+  uint8_t transpose_b = 0;
+  TcuTarget target = TcuTarget::None;
 };
 
 inline std::ostream &operator<<(std::ostream &os, const TcuType& type) {
   switch (type) {
-  case TcuType::WMMA: os << "WMMA"; break;
+  case TcuType::TMEM_ALLOC: os << "TMEM_ALLOC"; break;
+  case TcuType::TMEM_FREE:  os << "TMEM_FREE"; break;
+  case TcuType::TMA_LOAD:   os << "TMA_LOAD"; break;
+  case TcuType::TMA_STORE:  os << "TMA_STORE"; break;
+  case TcuType::MMA_LOAD:   os << "MMA_LOAD"; break;
+  case TcuType::MMA_STORE:  os << "MMA_STORE"; break;
+  case TcuType::TMA_WAIT:   os << "TMA_WAIT"; break;
+  case TcuType::WMMA:       os << "WMMA"; break;
   default:
     assert(false);
   }

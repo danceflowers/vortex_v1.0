@@ -60,6 +60,7 @@ struct warp_t {
   Word                              PC;
   Byte                              fcsr;
   uint32_t                          uuid;
+  bool                              ibuffer_needs_rewind;
 
   warp_t(uint32_t num_threads);
 
@@ -164,6 +165,7 @@ private:
 #endif
 
   PoolAllocator<Instr, 64> instr_pool_;
+  bool last_instr_retired_;
 };
 
 }

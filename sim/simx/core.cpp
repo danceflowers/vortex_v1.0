@@ -13,7 +13,9 @@
 
 #include <iostream>
 #include <iomanip>
+#include <cstring>
 #include <string.h>
+#include <algorithm>
 #include <assert.h>
 #include <util.h>
 #include "types.h"
@@ -56,6 +58,9 @@ Core::Core(const SimContext& ctx,
   , pending_icache_(arch_.num_warps())
   , commit_arbs_(ISSUE_WIDTH)
   , ibuffer_arbs_(ISSUE_WIDTH, {ArbiterType::RoundRobin, PER_ISSUE_WARPS})
+#ifdef EXT_TCU_ENABLE
+  , next_async_id_(1)
+#endif
 {
   char sname[100];
 
@@ -198,6 +203,15 @@ void Core::reset() {
 
   pending_instrs_.clear();
   pending_ifetches_ = 0;
+
+#ifdef EXT_TCU_ENABLE
+  for (auto& bank : tmem_banks_) {
+    bank.fill(0);
+  }
+  tmem_bank_allocs_.fill(false);
+  pending_tma_reqs_.clear();
+  next_async_id_ = 1;
+#endif
 
   perf_stats_ = PerfStats();
 }
@@ -479,4 +493,279 @@ void Core::set_satp(uint64_t satp) {
   emulator_.set_satp(satp); //JAEWON wit, tid???
   // emulator_.set_csr(VX_CSR_SATP,satp,0,0); //JAEWON wit, tid???
 }
+#endif
+
+#ifdef EXT_TCU_ENABLE
+
+uint32_t Core::pack_tmem_handle(uint32_t start_bank, uint32_t bank_span) {
+  return ((bank_span & 0xff) << 8) | (start_bank & 0xff);
+}
+
+bool Core::unpack_tmem_handle(uint32_t handle, uint32_t* start_bank, uint32_t* bank_span) {
+  auto sb = handle & 0xff;
+  auto span = (handle >> 8) & 0xff;
+  if (span == 0 || sb >= 8 || (sb + span) > 8) {
+    return false;
+  }
+  *start_bank = sb;
+  *bank_span = span;
+  return true;
+}
+
+bool Core::read_tma_descriptor(uint64_t desc_addr, TmaDescriptor* out) {
+  if (nullptr == out) {
+    return false;
+  }
+  std::memset(out, 0, sizeof(TmaDescriptor));
+  this->dcache_read(out, desc_addr, sizeof(TmaDescriptor));
+  return true;
+}
+
+bool Core::tmem_query(uint32_t handle, uint32_t* bank_span, uint32_t* size_bytes) const {
+  uint32_t start_bank = 0;
+  uint32_t span = 0;
+  if (!unpack_tmem_handle(handle, &start_bank, &span)) {
+    return false;
+  }
+  if (bank_span) {
+    *bank_span = span;
+  }
+  if (size_bytes) {
+    *size_bytes = span * tmem_banks_.front().size();
+  }
+  return true;
+}
+
+bool Core::tmem_copy_in(uint32_t handle, const uint8_t* data, uint32_t size_bytes) {
+  uint32_t start_bank = 0;
+  uint32_t span = 0;
+  if (!unpack_tmem_handle(handle, &start_bank, &span)) {
+    return false;
+  }
+  uint32_t capacity = span * tmem_banks_.front().size();
+  if (size_bytes > capacity) {
+    return false;
+  }
+  uint32_t copied = 0;
+  for (uint32_t bank = 0; bank < span; ++bank) {
+    auto& dst = tmem_banks_.at(start_bank + bank);
+    uint32_t chunk = std::min<uint32_t>(dst.size(), size_bytes - copied);
+    std::copy_n(data + copied, chunk, dst.begin());
+    if (chunk < dst.size()) {
+      std::fill(dst.begin() + chunk, dst.end(), 0);
+    }
+    copied += chunk;
+    if (copied >= size_bytes) {
+      break;
+    }
+  }
+  return true;
+}
+
+bool Core::tmem_copy_out(uint32_t handle, uint8_t* data, uint32_t size_bytes) const {
+  uint32_t start_bank = 0;
+  uint32_t span = 0;
+  if (!unpack_tmem_handle(handle, &start_bank, &span)) {
+    return false;
+  }
+  uint32_t capacity = span * tmem_banks_.front().size();
+  if (size_bytes > capacity) {
+    return false;
+  }
+  uint32_t copied = 0;
+  for (uint32_t bank = 0; bank < span; ++bank) {
+    const auto& src = tmem_banks_.at(start_bank + bank);
+    uint32_t chunk = std::min<uint32_t>(src.size(), size_bytes - copied);
+    std::copy_n(src.begin(), chunk, data + copied);
+    copied += chunk;
+    if (copied >= size_bytes) {
+      break;
+    }
+  }
+  return true;
+}
+
+void Core::process_tma_request(TmaRequest& req) {
+  TmaDescriptor desc;
+  if (!read_tma_descriptor(req.desc_addr, &desc)) {
+    req.completed = true;
+    return;
+  }
+
+  uint32_t bank_span = 0;
+  uint32_t capacity = 0;
+  if (!tmem_query(req.handle, &bank_span, &capacity)) {
+    req.completed = true;
+    return;
+  }
+
+  uint32_t size_bytes = std::min<uint32_t>(desc.size_bytes, capacity);
+  std::vector<uint8_t> buffer(size_bytes, 0);
+  bool transpose_b = req.transpose_b || ((desc.flags & 0x1) != 0);
+  if (!req.is_store) {
+    if (desc.rows > 0 && desc.cols > 0 && desc.elem_bytes > 0 && transpose_b) {
+      uint32_t matrix_bytes = desc.rows * desc.cols * desc.elem_bytes;
+      std::vector<uint8_t> src(matrix_bytes, 0);
+      this->dcache_read(src.data(), desc.addr, matrix_bytes);
+      for (uint32_t r = 0; r < desc.rows; ++r) {
+        for (uint32_t c = 0; c < desc.cols; ++c) {
+          auto src_off = (r * desc.cols + c) * desc.elem_bytes;
+          auto dst_off = (c * desc.rows + r) * desc.elem_bytes;
+          if (dst_off + desc.elem_bytes <= buffer.size() && src_off + desc.elem_bytes <= src.size()) {
+            std::copy_n(src.data() + src_off, desc.elem_bytes, buffer.data() + dst_off);
+          }
+        }
+      }
+    } else {
+      this->dcache_read(buffer.data(), desc.addr, size_bytes);
+    }
+    (void)tmem_copy_in(req.handle, buffer.data(), size_bytes);
+  } else {
+    if (tmem_copy_out(req.handle, buffer.data(), size_bytes)) {
+      this->dcache_write(buffer.data(), desc.addr, size_bytes);
+    }
+  }
+  req.completed = true;
+}
+
+void Core::advance_tma_requests() {
+  for (auto& entry : pending_tma_reqs_) {
+    auto& req = entry.second;
+    if (!req.completed && perf_stats_.cycles >= req.ready_cycle) {
+      process_tma_request(req);
+    }
+  }
+}
+
+uint32_t Core::tmem_alloc(uint32_t bank_span) {
+  advance_tma_requests();
+  if (bank_span == 0 || bank_span > tmem_banks_.size()) {
+    return 0;
+  }
+  for (uint32_t start = 0; start + bank_span <= tmem_banks_.size(); ++start) {
+    bool available = true;
+    for (uint32_t i = 0; i < bank_span; ++i) {
+      if (tmem_bank_allocs_.at(start + i)) {
+        available = false;
+        break;
+      }
+    }
+    if (!available) {
+      continue;
+    }
+    for (uint32_t i = 0; i < bank_span; ++i) {
+      tmem_bank_allocs_.at(start + i) = true;
+      tmem_banks_.at(start + i).fill(0);
+    }
+    return pack_tmem_handle(start, bank_span);
+  }
+  return 0;
+}
+
+bool Core::tmem_free(uint32_t handle) {
+  advance_tma_requests();
+  uint32_t start_bank = 0;
+  uint32_t bank_span = 0;
+  if (!unpack_tmem_handle(handle, &start_bank, &bank_span)) {
+    return false;
+  }
+  for (uint32_t i = 0; i < bank_span; ++i) {
+    tmem_bank_allocs_.at(start_bank + i) = false;
+    tmem_banks_.at(start_bank + i).fill(0);
+  }
+  return true;
+}
+
+uint32_t Core::tma_load(uint32_t handle, uint64_t desc_addr, bool transpose_b) {
+  advance_tma_requests();
+  uint32_t start_bank = 0;
+  uint32_t bank_span = 0;
+  if (!unpack_tmem_handle(handle, &start_bank, &bank_span)) {
+    return 0;
+  }
+  auto async_id = next_async_id_++;
+  pending_tma_reqs_[async_id] = TmaRequest{
+    async_id,
+    handle,
+    desc_addr,
+    perf_stats_.cycles + 1,
+    transpose_b,
+    false,
+    false
+  };
+  return async_id;
+}
+
+uint32_t Core::tma_store(uint32_t handle, uint64_t desc_addr) {
+  advance_tma_requests();
+  uint32_t start_bank = 0;
+  uint32_t bank_span = 0;
+  if (!unpack_tmem_handle(handle, &start_bank, &bank_span)) {
+    return 0;
+  }
+  auto async_id = next_async_id_++;
+  pending_tma_reqs_[async_id] = TmaRequest{
+    async_id,
+    handle,
+    desc_addr,
+    perf_stats_.cycles + 1,
+    false,
+    true,
+    false
+  };
+  return async_id;
+}
+
+bool Core::tma_wait(uint32_t async_id) {
+  advance_tma_requests();
+  auto it = pending_tma_reqs_.find(async_id);
+  if (it == pending_tma_reqs_.end()) {
+    return true;
+  }
+  if (!it->second.completed) {
+    return false;
+  }
+  pending_tma_reqs_.erase(it);
+  return true;
+}
+
+bool Core::tmem_read_packet(uint32_t handle, uint32_t packet_idx, TmemPacket* out) {
+  advance_tma_requests();
+  if (nullptr == out) {
+    return false;
+  }
+  uint32_t size_bytes = 0;
+  if (!tmem_query(handle, nullptr, &size_bytes)) {
+    return false;
+  }
+  uint32_t offset = packet_idx * out->bytes.size();
+  if (offset + out->bytes.size() > size_bytes) {
+    return false;
+  }
+  std::vector<uint8_t> tile(size_bytes, 0);
+  if (!tmem_copy_out(handle, tile.data(), size_bytes)) {
+    return false;
+  }
+  std::copy_n(tile.data() + offset, out->bytes.size(), out->bytes.begin());
+  return true;
+}
+
+bool Core::tmem_write_packet(uint32_t handle, uint32_t packet_idx, const TmemPacket& in) {
+  advance_tma_requests();
+  uint32_t size_bytes = 0;
+  if (!tmem_query(handle, nullptr, &size_bytes)) {
+    return false;
+  }
+  uint32_t offset = packet_idx * in.bytes.size();
+  if (offset + in.bytes.size() > size_bytes) {
+    return false;
+  }
+  std::vector<uint8_t> tile(size_bytes, 0);
+  if (!tmem_copy_out(handle, tile.data(), size_bytes)) {
+    return false;
+  }
+  std::copy_n(in.bytes.begin(), in.bytes.size(), tile.begin() + offset);
+  return tmem_copy_in(handle, tile.data(), size_bytes);
+}
+
 #endif

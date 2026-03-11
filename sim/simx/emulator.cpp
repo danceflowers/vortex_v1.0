@@ -36,6 +36,7 @@ warp_t::warp_t(uint32_t num_threads)
   , tmask(num_threads)
   , PC(0)
   , uuid(0)
+  , ibuffer_needs_rewind(false)
 {}
 
 void warp_t::reset(uint64_t startup_addr) {
@@ -43,6 +44,10 @@ void warp_t::reset(uint64_t startup_addr) {
   this->PC = startup_addr;
   this->uuid = 0;
   this->fcsr = 0;
+  this->ibuffer_needs_rewind = false;
+  while (!this->ibuffer.empty()) {
+    this->ibuffer.pop_front();
+  }
 
   for (auto& reg_file : this->ireg_file) {
     for (auto& reg : reg_file) {
@@ -87,6 +92,7 @@ Emulator::Emulator(const Arch &arch, const DCRS &dcrs, Core* core)
   #endif
 {
   std::srand(50);
+  last_instr_retired_ = true;
   this->reset();
 }
 
@@ -121,6 +127,7 @@ void Emulator::reset() {
 
   stalled_warps_.reset();
   active_warps_.reset();
+  last_instr_retired_ = true;
 
   // activate first warp and thread
   active_warps_.set(0);
@@ -199,18 +206,24 @@ instr_trace_t* Emulator::step() {
 
     // decode
     this->decode(instr_code, scheduled_warp, uuid);
-  } else {
+  } else if (warp.ibuffer_needs_rewind) {
     // we have a micro-instruction in the ibuffer
     // adjust PC back to original (incremented in execute())
     warp.PC -= 4;
+    warp.ibuffer_needs_rewind = false;
   }
 
-  // pop the instruction from the ibuffer
   auto instr = warp.ibuffer.front();
-  warp.ibuffer.pop_front();
 
   // Execute
   auto trace = this->execute(*instr, scheduled_warp);
+
+  if (last_instr_retired_) {
+    warp.ibuffer.pop_front();
+    warp.ibuffer_needs_rewind = !warp.ibuffer.empty();
+  } else {
+    warp.ibuffer_needs_rewind = false;
+  }
 
   return trace;
 }

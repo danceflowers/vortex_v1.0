@@ -25,7 +25,11 @@ void kernel_body(kernel_arg_t *__UNIFORM__ arg) {
   // Initialize accumulator tile to zero
   ctx::fill_fragment(fragC, 0);
 
-  for (int i = 0; i < K; i += ctx::tileK) {
+  // The generated code advances source pointers in 32-bit packed-word units
+  // for WMMA loads. Scale tileK back by input packing ratio to keep K-loop
+  // progress aligned with logical K from kernel arguments.
+  constexpr uint32_t k_step = ctx::tileK / ctx::i_ratio;
+  for (uint32_t i = 0; i < K; i += k_step) {
     auto pTileA = pA + tile_row * K + i;
 
     // Load A tile

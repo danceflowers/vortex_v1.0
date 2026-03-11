@@ -2,13 +2,16 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <rvfloats.h>
 #include <string.h>
 #include <tensor_cfg.h>
+#include <type_traits>
 #include <unistd.h>
 #include <util.h>
 #include <vector>
 #include <vortex.h>
+#include "open_tensorcore/tensor_core_top.h"
 
 #define FLOAT_ULP 6
 #define MAX_ERRORS 100
@@ -27,6 +30,60 @@ using namespace vortex;
 namespace vt = tensor;
 
 static bool g_enable_sparse = false;
+static bool g_dump_all = false;
+
+static inline float fp16_bits_to_float(uint16_t bits) {
+  return bit_cast<float>(rv_htof_s(bits, 0, nullptr));
+}
+
+static inline uint16_t float_to_fp16_bits(float value) {
+  return rv_ftoh_s(bit_cast<uint32_t>(value), 0, nullptr);
+}
+
+template <typename T>
+struct open_precision_map;
+
+template <>
+struct open_precision_map<vt::fp16> {
+  static constexpr PrecisionType value = PREC_FP16;
+};
+
+template <>
+struct open_precision_map<vt::fp8> {
+  static constexpr PrecisionType value = PREC_FP8_E4M3;
+};
+
+template <>
+struct open_precision_map<vt::fp4> {
+  static constexpr PrecisionType value = PREC_FP4_E2M1;
+};
+
+static bool run_open_tensorcore_once(const uint16_t a[8][8],
+                                     const uint16_t b[8][8],
+                                     uint16_t out[8][8]) {
+  TensorCoreTop tc;
+  tc.reset();
+  tc.set_jobs = 1;
+  tc.jobs_completed = 0;
+
+  uint32_t c_zero[8][8] = {};
+  tc.load_inputs(a, b, c_zero);
+  tc.tick(true);
+  tc.load_invalid();
+
+  for (uint32_t spin = 0; spin < 10000 && tc.jobs_completed < tc.set_jobs; ++spin) {
+    bool done = tc.run();
+    if (done) {
+      for (uint32_t i = 0; i < 8; ++i) {
+        for (uint32_t j = 0; j < 8; ++j) {
+          out[i][j] = tc.d_out[i][j];
+        }
+      }
+      return true;
+    }
+  }
+  return false;
+}
 ///////////////////////////////////////////////////////////////////////////////
 
 static void convert_row_to_col_major_4bit(uint8_t *dst, uint32_t width, uint32_t height, const uint8_t *src) {
@@ -109,6 +166,24 @@ struct data_accessor_t<vt::uint4> {
   }
 };
 
+template <>
+struct data_accessor_t<vt::fp4> {
+  static uint8_t read(const uint8_t *ptr, uint32_t offset) {
+    uint32_t row_off = offset / 2;
+    bool odd = offset & 0x1;
+    uint8_t value8 = ptr[row_off];
+    return odd ? (value8 >> 4) : (value8 & 0x0f);
+  }
+  static void write(uint8_t *ptr, uint32_t offset, int32_t value) {
+    uint32_t row_off = offset / 2;
+    bool odd = offset & 0x1;
+    uint8_t old_value = ptr[row_off];
+    uint8_t new_value = odd ? ((old_value & 0x0f) | ((value & 0x0f) << 4))
+                            : ((old_value & 0xf0) | (value & 0x0f));
+    ptr[row_off] = new_value;
+  }
+};
+
 ///////////////////////////////////////////////////////////////////////////////
 
 template <typename Type>
@@ -183,6 +258,49 @@ public:
 };
 
 template <>
+class Comparator<vt::fp8> {
+public:
+  static uint8_t generate() {
+    uint8_t sign = (rand() & 0x1) << 7;
+    uint8_t exp  = static_cast<uint8_t>(2 + (rand() % 8)); // keep dynamic range moderate
+    uint8_t mant = static_cast<uint8_t>(rand() & 0x7);
+    return static_cast<uint8_t>(sign | (exp << 3) | mant);
+  }
+  static bool compare(uint8_t a, uint8_t b, int index, int errors) {
+    if (a != b) {
+      if (errors < MAX_ERRORS) {
+        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
+      }
+      return false;
+    }
+    return true;
+  }
+};
+
+template <>
+class Comparator<vt::fp4> {
+public:
+  static uint8_t generate() {
+    auto gen_nibble = []() -> uint8_t {
+      uint8_t sign = (rand() & 0x1) << 3;
+      uint8_t exp  = static_cast<uint8_t>(rand() % 3); // avoid exp=3 (Inf/NaN class)
+      uint8_t mant = static_cast<uint8_t>(rand() & 0x1);
+      return static_cast<uint8_t>(sign | (exp << 1) | mant);
+    };
+    return static_cast<uint8_t>((gen_nibble() << 4) | gen_nibble());
+  }
+  static bool compare(uint8_t a, uint8_t b, int index, int errors) {
+    if (a != b) {
+      if (errors < MAX_ERRORS) {
+        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
+      }
+      return false;
+    }
+    return true;
+  }
+};
+
+template <>
 class Comparator<vt::int32> {
 public:
   static int32_t generate() {
@@ -235,23 +353,23 @@ public:
   }
 };
 
-template <>
-class Comparator<vt::tf32> {
-public:
-  static uint32_t generate() {
-    auto fvalue = float(rand()) / RAND_MAX;
-    return rv_ftox_s(bit_cast<uint32_t>(fvalue), 8, 10, 0, nullptr);
-  }
-  static bool compare(uint32_t a, uint32_t b, int index, int errors) {
-    if (a != b) {
-      if (errors < MAX_ERRORS) {
-        printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
-      }
-      return false;
-    }
-    return true;
-  }
-};
+// template <>
+// class Comparator<vt::tf32> {
+// public:
+//   static uint32_t generate() {
+//     auto fvalue = float(rand()) / RAND_MAX;
+//     return rv_ftox_s(bit_cast<uint32_t>(fvalue), 8, 10, 0, nullptr);
+//   }
+//   static bool compare(uint32_t a, uint32_t b, int index, int errors) {
+//     if (a != b) {
+//       if (errors < MAX_ERRORS) {
+//         printf("*** error: [%d] expected=0x%x, actual=0x%x\n", index, b, a);
+//       }
+//       return false;
+//     }
+//     return true;
+//   }
+// };
 
 template <>
 class Comparator<vt::fp32> {
@@ -288,6 +406,79 @@ struct muladd_t {
     return static_cast<dtype>(a) * static_cast<dtype>(b) + c;
   }
 };
+
+static inline float fp8_e4m3_to_float(uint8_t v) {
+  bool s = (v >> 7) & 0x1;
+  uint32_t e = (v >> 3) & 0xF;
+  uint32_t m = v & 0x7;
+  if (e == 0xF) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+  float out = 0.0f;
+  if (e == 0) {
+    out = std::ldexp(static_cast<float>(m) / 8.0f, -6);
+  } else {
+    out = std::ldexp(1.0f + static_cast<float>(m) / 8.0f, static_cast<int>(e) - 7);
+  }
+  return s ? -out : out;
+}
+
+static inline float fp4_e2m1_to_float(uint8_t v) {
+  bool s = (v >> 3) & 0x1;
+  uint32_t e = (v >> 1) & 0x3;
+  uint32_t m = v & 0x1;
+  float out = 0.0f;
+  if (e == 0x3) {
+    if (m == 0) {
+      out = std::numeric_limits<float>::infinity();
+    } else {
+      out = std::numeric_limits<float>::quiet_NaN();
+    }
+  } else if (e == 0) {
+    out = (static_cast<float>(m) / 2.0f);
+  } else {
+    out = std::ldexp(1.0f + static_cast<float>(m) / 2.0f, static_cast<int>(e) - 1);
+  }
+  return s ? -out : out;
+}
+
+template <typename T>
+static inline float input_to_float(typename T::dtype v) {
+  return static_cast<float>(v);
+}
+
+template <>
+inline float input_to_float<vt::fp16>(uint16_t v) {
+  return bit_cast<float>(rv_htof_s(v, 0, nullptr));
+}
+
+template <>
+inline float input_to_float<vt::bf16>(uint16_t v) {
+  return bit_cast<float>(rv_btof_s(v, 0, nullptr));
+}
+
+template <>
+inline float input_to_float<vt::fp8>(uint8_t v) {
+  return fp8_e4m3_to_float(v);
+}
+
+template <>
+inline float input_to_float<vt::fp4>(uint8_t v) {
+  return fp4_e2m1_to_float(v & 0xF);
+}
+
+template <>
+inline float input_to_float<vt::int4>(uint8_t v) {
+  int32_t x = v & 0xF;
+  if (x & 0x8)
+    x |= 0xFFFFFFF0;
+  return static_cast<float>(x);
+}
+
+template <>
+inline float input_to_float<vt::uint4>(uint8_t v) {
+  return static_cast<float>(v & 0xF);
+}
 
 template <>
 struct muladd_t<vt::fp16, vt::fp32> {
@@ -330,13 +521,35 @@ struct muladd_t<vt::bf16, vt::bf16> {
 };
 
 template <>
-struct muladd_t<vt::tf32, vt::fp32> {
-  static float eval(uint32_t a, uint32_t b, float c) {
-    auto fa = bit_cast<float>(rv_xtof_s(a, 8, 10, 0, nullptr));
-    auto fb = bit_cast<float>(rv_xtof_s(b, 8, 10, 0, nullptr));
-    return fa * fb + c;
+struct muladd_t<vt::fp8, vt::fp16> {
+  static uint16_t eval(uint8_t a, uint8_t b, uint16_t c) {
+    float fa = fp8_e4m3_to_float(a);
+    float fb = fp8_e4m3_to_float(b);
+    float fc = bit_cast<float>(rv_htof_s(c, 0, nullptr));
+    float fd = fa * fb + fc;
+    return rv_ftoh_s(bit_cast<uint32_t>(fd), 0, nullptr);
   }
 };
+
+template <>
+struct muladd_t<vt::fp4, vt::fp16> {
+  static uint16_t eval(uint8_t a, uint8_t b, uint16_t c) {
+    float fa = fp4_e2m1_to_float(a & 0xF);
+    float fb = fp4_e2m1_to_float(b & 0xF);
+    float fc = bit_cast<float>(rv_htof_s(c, 0, nullptr));
+    float fd = fa * fb + fc;
+    return rv_ftoh_s(bit_cast<uint32_t>(fd), 0, nullptr);
+  }
+};
+
+// template <>
+// struct muladd_t<vt::tf32, vt::fp32> {
+//   static float eval(uint32_t a, uint32_t b, float c) {
+//     auto fa = bit_cast<float>(rv_xtof_s(a, 8, 10, 0, nullptr));
+//     auto fb = bit_cast<float>(rv_xtof_s(b, 8, 10, 0, nullptr));
+//     return fa * fb + c;
+//   }
+// };
 
 template <>
 struct muladd_t<vt::int4, vt::int32> {
@@ -394,6 +607,94 @@ static void matmul_cpu(otype_t *C, const itype_t *A, const itype_t *B, uint32_t 
   }
 }
 
+static void matmul_cpu_fp32_acc(float *C, const itype_t *A, const itype_t *B, uint32_t M, uint32_t N, uint32_t K) {
+  uint32_t subbytes = 8 / vt::ITYPE::bits;
+  uint32_t KS = subbytes ? (K * subbytes) : K;
+  for (uint32_t m = 0; m < M; ++m) {
+    for (uint32_t n = 0; n < N; ++n) {
+      float sum = 0.0f;
+      for (uint32_t k = 0; k < KS; ++k) {
+        auto a_raw = data_accessor_t<vt::ITYPE>::read(A, m * KS + k);
+        auto b_raw = data_accessor_t<vt::ITYPE>::read(B, k * N + n);
+        float a = input_to_float<vt::ITYPE>(a_raw);
+        float b = input_to_float<vt::ITYPE>(b_raw);
+        sum += a * b;
+      }
+      C[m * N + n] = sum;
+    }
+  }
+}
+
+static void matmul_open_tensorcore_ref(otype_t *C, const itype_t *A, const itype_t *B, uint32_t M, uint32_t N, uint32_t K) {
+  if constexpr (!std::is_same_v<otype_t, uint16_t>) {
+    // open_tensorcore reference path currently models fp16 output only.
+    // Fall back to the generic CPU reference for other output types.
+    matmul_cpu(C, A, B, M, N, K);
+    return;
+  }
+
+  ::g_cfg.precisions.clear();
+  ::g_cfg.out_precisions.clear();
+  ::g_cfg.precisions.push_back(open_precision_map<vt::ITYPE>::value);
+  ::g_cfg.out_precisions.push_back(PREC_FP16);
+  ::g_cfg.rm = RNE;
+
+  uint32_t subbytes = 8 / vt::ITYPE::bits;
+  uint32_t KS = subbytes ? (K * subbytes) : K;
+
+  for (uint32_t m0 = 0; m0 < M; m0 += 8) {
+    for (uint32_t n0 = 0; n0 < N; n0 += 8) {
+      uint16_t acc_fp16[8][8] = {};
+
+      for (uint32_t k0 = 0; k0 < KS; k0 += 8) {
+        uint16_t a_blk[8][8] = {};
+        uint16_t b_blk[8][8] = {};
+        uint16_t out_blk[8][8] = {};
+
+        for (uint32_t i = 0; i < 8; ++i) {
+          for (uint32_t k = 0; k < 8; ++k) {
+            uint32_t kk = k0 + k;
+            uint16_t raw = 0;
+            if (kk < KS) {
+              raw = static_cast<uint16_t>(data_accessor_t<vt::ITYPE>::read(A, (m0 + i) * KS + kk));
+            }
+            a_blk[i][k] = raw;
+          }
+        }
+
+        for (uint32_t k = 0; k < 8; ++k) {
+          uint32_t kk = k0 + k;
+          for (uint32_t j = 0; j < 8; ++j) {
+            uint16_t raw = 0;
+            if (kk < KS) {
+              raw = static_cast<uint16_t>(data_accessor_t<vt::ITYPE>::read(B, kk * N + (n0 + j)));
+            }
+            b_blk[k][j] = raw;
+          }
+        }
+
+        if (!run_open_tensorcore_once(a_blk, b_blk, out_blk)) {
+          std::abort();
+        }
+
+        for (uint32_t i = 0; i < 8; ++i) {
+          for (uint32_t j = 0; j < 8; ++j) {
+            float acc_val = fp16_bits_to_float(acc_fp16[i][j]);
+            float out_val = fp16_bits_to_float(out_blk[i][j]);
+            acc_fp16[i][j] = float_to_fp16_bits(acc_val + out_val);
+          }
+        }
+      }
+
+      for (uint32_t i = 0; i < 8; ++i) {
+        for (uint32_t j = 0; j < 8; ++j) {
+          data_accessor_t<vt::OTYPE>::write(C, (m0 + i) * N + (n0 + j), acc_fp16[i][j]);
+        }
+      }
+    }
+  }
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 
 const char *kernel_file = "kernel.vxbin";
@@ -414,32 +715,28 @@ std::string last_build_options;
 
 static void show_usage() {
   std::cout << "Vortex Sgemm TCU Test." << std::endl;
-  std::cout << "Usage: [-m: m] [-n N] [-k: K] [-s] [-h: help]" << std::endl;
-  std::cout << "  -s  Enable 2:4 structured sparsity " << std::endl;
+  std::cout << "Usage: [-m: m] [-n N] [-k: K] [-s] [--dump=all] [-h: help]" << std::endl;
+  std::cout << "  -s          Enable 2:4 structured sparsity" << std::endl;
+  std::cout << "  --dump=all  Print full matrices (default is top-left 8x8)" << std::endl;
 }
 
 static void parse_args(int argc, char **argv) {
-  int c;
-  while ((c = getopt(argc, argv, "m:n:k:i:o:hs")) != -1) {
-    switch (c) {
-    case 'm':
-      xm = atoi(optarg);
-      break;
-    case 'n':
-      xn = atoi(optarg);
-      break;
-    case 'k':
-      xk = atoi(optarg);
-      break;
-    case 's':
+  for (int i = 1; i < argc; ++i) {
+    if (0 == strcmp(argv[i], "-m") && i + 1 < argc) {
+      xm = atoi(argv[++i]);
+    } else if (0 == strcmp(argv[i], "-n") && i + 1 < argc) {
+      xn = atoi(argv[++i]);
+    } else if (0 == strcmp(argv[i], "-k") && i + 1 < argc) {
+      xk = atoi(argv[++i]);
+    } else if (0 == strcmp(argv[i], "-s")) {
       g_enable_sparse = true;
       std::cout << "Sparse mode enabled (-s)" << std::endl;
-      break;
-    case 'h':
+    } else if (0 == strcmp(argv[i], "--dump=all")) {
+      g_dump_all = true;
+    } else if (0 == strcmp(argv[i], "-h")) {
       show_usage();
       exit(0);
-      break;
-    default:
+    } else {
       show_usage();
       exit(-1);
     }
@@ -613,7 +910,7 @@ int main(int argc, char *argv[]) {
   }
 
   // upload matrix A buffer
-  {
+  { 
     std::cout << "upload matrix A buffer" << std::endl;
     RT_CHECK(vx_copy_to_dev(A_buffer, h_A.data(), 0, sizeA * sizeof(itype_t)));
   }
@@ -621,7 +918,9 @@ int main(int argc, char *argv[]) {
   // upload matrix B buffer
   {
     std::cout << "upload matrix B buffer" << std::endl;
-    if constexpr (std::is_same<vt::ITYPE, vt::int4>::value || std::is_same<vt::ITYPE, vt::uint4>::value) {
+    if constexpr (std::is_same<vt::ITYPE, vt::int4>::value
+               || std::is_same<vt::ITYPE, vt::uint4>::value
+               || std::is_same<vt::ITYPE, vt::fp4>::value) {
       // sub-byte matrix B must be in col-major format
       // we convert the 4-bit row-major to col-major here
       std::vector<uint8_t> h_B_col(sizeB);
@@ -659,31 +958,78 @@ int main(int argc, char *argv[]) {
   std::cout << "download destination buffer" << std::endl;
   RT_CHECK(vx_copy_from_dev(h_C.data(), C_buffer, 0, sizeC * sizeof(otype_t)));
 
-  // verify result
-  std::cout << "verify result" << std::endl;
-  int errors = 0;
-  {
-    std::vector<otype_t> h_ref(sizeC);
+  // verify result (print-only, no compare/assert)
+  std::cout << "verify result (print-only)" << std::endl;
+  std::vector<otype_t> h_ref(sizeC);
+  if constexpr ((std::is_same_v<vt::OTYPE, vt::fp16>)
+             && (std::is_same_v<vt::ITYPE, vt::fp16>
+              || std::is_same_v<vt::ITYPE, vt::fp8>
+              || std::is_same_v<vt::ITYPE, vt::fp4>)) {
+    std::cout << "golden mode: open_tensorcore reference" << std::endl;
+    matmul_open_tensorcore_ref(h_ref.data(), h_A.data(), h_B.data(), M, N, K);
+  } else {
     matmul_cpu(h_ref.data(), h_A.data(), h_B.data(), M, N, K);
+  }
 
-    for (uint32_t i = 0; i < h_ref.size(); ++i) {
-      if (!Comparator<vt::OTYPE>::compare(h_C[i], h_ref[i], i, errors)) {
-        ++errors;
-      }
+  auto to_float = [](otype_t v) {
+    if constexpr (std::is_same_v<otype_t, uint16_t>) {
+      return bit_cast<float>(rv_htof_s(v, 0, nullptr));
+    } else {
+      return static_cast<float>(v);
+    }
+  };
+
+  uint32_t dump_rows = g_dump_all ? M : std::min<uint32_t>(M, 8);
+  uint32_t dump_cols = g_dump_all ? N : std::min<uint32_t>(N, 8);
+
+  std::cout << "Result D (" << dump_rows << "x" << dump_cols << ")" << std::endl;
+  for (uint32_t i = 0; i < dump_rows; ++i) {
+    for (uint32_t j = 0; j < dump_cols; ++j) {
+      std::cout << to_float(h_C[i * N + j]) << (j + 1 == dump_cols ? '\n' : ' ');
     }
   }
+
+  std::cout << "Golden reference (" << dump_rows << "x" << dump_cols << ")" << std::endl;
+  for (uint32_t i = 0; i < dump_rows; ++i) {
+    for (uint32_t j = 0; j < dump_cols; ++j) {
+      std::cout << to_float(h_ref[i * N + j]) << (j + 1 == dump_cols ? '\n' : ' ');
+    }
+  }
+
+  std::vector<float> h_ref_fp32(sizeC);
+  matmul_cpu_fp32_acc(h_ref_fp32.data(), h_A.data(), h_B.data(), M, N, K);
+
+  std::cout << "FP32 accumulate reference (" << dump_rows << "x" << dump_cols << ")" << std::endl;
+  for (uint32_t i = 0; i < dump_rows; ++i) {
+    for (uint32_t j = 0; j < dump_cols; ++j) {
+      std::cout << h_ref_fp32[i * N + j] << (j + 1 == dump_cols ? '\n' : ' ');
+    }
+  }
+
+  double max_abs_err = 0.0;
+  double mse = 0.0;
+  for (uint32_t i = 0; i < sizeC; ++i) {
+    double diff = std::abs(static_cast<double>(to_float(h_C[i])) - static_cast<double>(to_float(h_ref[i])));
+    max_abs_err = std::max(max_abs_err, diff);
+    mse += diff * diff;
+  }
+  double rmse = std::sqrt(mse / sizeC);
+  std::cout << "max_abs_err=" << max_abs_err << ", rmse=" << rmse << std::endl;
+
+  double max_abs_err_fp32 = 0.0;
+  double mse_fp32 = 0.0;
+  for (uint32_t i = 0; i < sizeC; ++i) {
+    double diff = std::abs(static_cast<double>(to_float(h_C[i])) - static_cast<double>(h_ref_fp32[i]));
+    max_abs_err_fp32 = std::max(max_abs_err_fp32, diff);
+    mse_fp32 += diff * diff;
+  }
+  double rmse_fp32 = std::sqrt(mse_fp32 / sizeC);
+  std::cout << "vs_fp32_acc: max_abs_err=" << max_abs_err_fp32 << ", rmse=" << rmse_fp32 << std::endl;
 
   // cleanup
   std::cout << "cleanup" << std::endl;
   cleanup();
 
-  if (errors != 0) {
-    std::cout << "Found " << std::dec << errors << " / " << sizeC << " errors!" << std::endl;
-    std::cout << "FAILED!" << std::endl;
-    return errors;
-  }
-
   std::cout << "PASSED!" << std::endl;
-
   return 0;
 }

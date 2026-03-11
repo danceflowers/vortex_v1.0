@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #ifndef NUM_THREADS
-#define NUM_THREADS 4
+#define NUM_THREADS 32
 #endif
 
 #ifndef ITYPE
@@ -12,7 +12,7 @@
 #endif
 
 #ifndef OTYPE
-#define OTYPE fp32
+#define OTYPE fp16
 #endif
 
 typedef struct {

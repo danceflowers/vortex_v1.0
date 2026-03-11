@@ -27,6 +27,7 @@ public:
 
   struct ExeTraceData : public ITraceData {
     using Ptr = std::shared_ptr<ExeTraceData>;
+    bool rd_write = false;
   };
 
 	struct PerfStats {
@@ -52,11 +53,22 @@ public:
 
   virtual void tick();
 
+  void mma_load(uint32_t wid,
+                uint32_t handle,
+                IntrTcuArgs args,
+                ExeTraceData* trace_data);
+
+  void mma_store(uint32_t wid,
+                 uint32_t handle,
+                 IntrTcuArgs args,
+                 ExeTraceData* trace_data);
+
 	void wmma(uint32_t wid,
-			 	    uint32_t fmt_s,
-						uint32_t fmt_d,
+			 	    uint32_t fmt_ab,
+						uint32_t fmt_c,
 			 	    uint32_t step_m,
 						uint32_t step_n,
+            uint32_t step_k,
 	          const std::vector<reg_data_t>& rs1_data,
 					  const std::vector<reg_data_t>& rs2_data,
 					  const std::vector<reg_data_t>& rs3_data,

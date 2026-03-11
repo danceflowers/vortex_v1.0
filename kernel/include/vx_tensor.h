@@ -24,6 +24,73 @@ enum mem_layout {
   col_major
 };
 
+struct tma_descriptor_t {
+  uint64_t addr;
+  uint32_t size_bytes;
+  uint32_t stride_bytes;
+  uint16_t rows;
+  uint16_t cols;
+  uint16_t elem_bytes;
+  uint16_t flags;
+} __attribute__((packed));
+
+inline __attribute__((always_inline)) uint32_t tmem_alloc(uint32_t bank_span) {
+  uint32_t handle;
+  __asm__ volatile (".insn r %2, 1, 2, %0, %1, x0"
+    : "=r"(handle)
+    : "r"(bank_span), "i"(RISCV_CUSTOM0)
+    : "memory");
+  return handle;
+}
+
+inline __attribute__((always_inline)) void tmem_free(uint32_t handle) {
+  __asm__ volatile (".insn r %1, 2, 2, x0, %0, x0"
+    :
+    : "r"(handle), "i"(RISCV_CUSTOM0)
+    : "memory");
+}
+
+inline __attribute__((always_inline)) uint32_t tma_load(uint32_t handle, const tma_descriptor_t* desc) {
+  uint32_t async_id;
+  __asm__ volatile (".insn r %3, 3, 2, %0, %1, %2"
+    : "=r"(async_id)
+    : "r"(handle), "r"(desc), "i"(RISCV_CUSTOM0)
+    : "memory");
+  return async_id;
+}
+
+inline __attribute__((always_inline)) uint32_t tma_store(uint32_t handle, const tma_descriptor_t* desc) {
+  uint32_t async_id;
+  __asm__ volatile (".insn r %3, 4, 2, %0, %1, %2"
+    : "=r"(async_id)
+    : "r"(handle), "r"(desc), "i"(RISCV_CUSTOM0)
+    : "memory");
+  return async_id;
+}
+
+inline __attribute__((always_inline)) void tma_wait(uint32_t async_id) {
+  __asm__ volatile (".insn r %1, 7, 2, x0, %0, x0"
+    :
+    : "r"(async_id), "i"(RISCV_CUSTOM0)
+    : "memory");
+}
+
+template <typename It, typename Ot>
+inline __attribute__((always_inline)) void mma_load(uint32_t handle) {
+  __asm__ volatile (".insn r %[insn], 5, 2, x%[fab], %[handle], x%[fc]"
+    :
+    : [insn]"i"(RISCV_CUSTOM0), [fab]"i"(It::id), [fc]"i"(Ot::id), [handle]"r"(handle)
+    : "memory");
+}
+
+template <typename It, typename Ot>
+inline __attribute__((always_inline)) void mma_store(uint32_t handle) {
+  __asm__ volatile (".insn r %[insn], 6, 2, x%[fc], %[handle], x%[fab]"
+    :
+    : [insn]"i"(RISCV_CUSTOM0), [fc]"i"(Ot::id), [fab]"i"(It::id), [handle]"r"(handle)
+    : "memory");
+}
+
 namespace detail {
 
   template <typename F, std::size_t... Is>
@@ -128,7 +195,7 @@ template <uint32_t NT, // number of threads per warp
           typename Ot> // output type (C,D)
 struct wmma_context {
 private:
-  using cfg = wmma_config_t<NT>;
+  using cfg = wmma_config_t<NT, It, Ot>;
 
   enum frag_use_t { matrix_a, matrix_b, accumulator };
 
@@ -247,31 +314,56 @@ public:
       });
     } else {
       // Load accumulator matrix C
-      uint32_t block_row = lane / cfg::tcN;
-      uint32_t block_col = lane % cfg::tcN;
-      uint32_t m_stride = cfg::tcM;
-      uint32_t n_stride = cfg::tcN;
-      if constexpr (src_layout == col_major) {
-        std::swap(block_row, block_col);
-      }
-      auto base = reinterpret_cast<const output_t*>(src) + block_row * ldm + block_col;
-      detail::unroll_for<Frag::NR>([&](auto r) {
-        uint32_t block_m  = r / cfg::n_steps;
-        uint32_t block_n  = r % cfg::n_steps;
-        uint32_t elem_row = block_m * m_stride;
-        uint32_t elem_col = block_n * n_stride;
+      if constexpr (std::is_same_v<output_t, uint16_t>) {
+        // FP16 accumulator is packed as 2x16-bit values in one 32-bit vreg.
+        uint32_t tcN_pairs = cfg::tcN / 2;
+        uint32_t block_row = lane / tcN_pairs;
+        uint32_t block_col = (lane % tcN_pairs) * 2;
+        uint32_t m_stride = cfg::tcM;
+        uint32_t n_stride = cfg::tcN;
         if constexpr (src_layout == col_major) {
-          std::swap(elem_row, elem_col);
+          std::swap(block_row, block_col);
         }
-        auto ptr = base + elem_row * ldm + elem_col;
-        if constexpr (sizeof(vreg_t) == sizeof(output_t)) {
-          dst.data[r] = *reinterpret_cast<const vreg_t *>(ptr);
-        } else {
-          vreg_t tmp(0);
-          *reinterpret_cast<output_t*>(&tmp) = *ptr;
-          dst.data[r] = tmp;
+        auto base = reinterpret_cast<const output_t*>(src) + block_row * ldm + block_col;
+        detail::unroll_for<Frag::NR>([&](auto r) {
+          uint32_t block_m  = r / cfg::n_steps;
+          uint32_t block_n  = r % cfg::n_steps;
+          uint32_t elem_row = block_m * m_stride;
+          uint32_t elem_col = block_n * n_stride;
+          if constexpr (src_layout == col_major) {
+            std::swap(elem_row, elem_col);
+          }
+          auto ptr = base + elem_row * ldm + elem_col;
+          uint32_t packed = static_cast<uint32_t>(ptr[0]) | (static_cast<uint32_t>(ptr[1]) << 16);
+          dst.data[r] = *reinterpret_cast<const vreg_t*>(&packed);
+        });
+      } else {
+        uint32_t block_row = lane / cfg::tcN;
+        uint32_t block_col = lane % cfg::tcN;
+        uint32_t m_stride = cfg::tcM;
+        uint32_t n_stride = cfg::tcN;
+        if constexpr (src_layout == col_major) {
+          std::swap(block_row, block_col);
         }
-      });
+        auto base = reinterpret_cast<const output_t*>(src) + block_row * ldm + block_col;
+        detail::unroll_for<Frag::NR>([&](auto r) {
+          uint32_t block_m  = r / cfg::n_steps;
+          uint32_t block_n  = r % cfg::n_steps;
+          uint32_t elem_row = block_m * m_stride;
+          uint32_t elem_col = block_n * n_stride;
+          if constexpr (src_layout == col_major) {
+            std::swap(elem_row, elem_col);
+          }
+          auto ptr = base + elem_row * ldm + elem_col;
+          if constexpr (sizeof(vreg_t) == sizeof(output_t)) {
+            dst.data[r] = *reinterpret_cast<const vreg_t *>(ptr);
+          } else {
+            vreg_t tmp(0);
+            *reinterpret_cast<output_t*>(&tmp) = *ptr;
+            dst.data[r] = tmp;
+          }
+        });
+      }
     }
   }
 
@@ -279,30 +371,55 @@ public:
   static __attribute__((always_inline)) void store_matrix_sync(void *dst, const Frag &src, size_t ldm) {
     static_assert(Frag::Use == accumulator, "only accumulator fragment can be stored");
     uint32_t lane = vx_thread_id();
-    uint32_t block_row = lane / cfg::tcN;
-    uint32_t block_col = lane % cfg::tcN;
-    uint32_t m_stride  = cfg::tcM;
-    uint32_t n_stride  = cfg::tcN;
-    if constexpr (dst_layout == col_major) {
-      std::swap(block_row, block_col);
-    }
-    auto base = reinterpret_cast<output_t*>(dst) + block_row * ldm + block_col;
-    detail::unroll_for<Frag::NR>([&](auto r) {
-      uint32_t block_m  = r / cfg::n_steps;
-      uint32_t block_n  = r % cfg::n_steps;
-      uint32_t elem_row = block_m * m_stride;
-      uint32_t elem_col = block_n * n_stride;
+    if constexpr (std::is_same_v<output_t, uint16_t>) {
+      uint32_t tcN_pairs = cfg::tcN / 2;
+      uint32_t block_row = lane / tcN_pairs;
+      uint32_t block_col = (lane % tcN_pairs) * 2;
+      uint32_t m_stride  = cfg::tcM;
+      uint32_t n_stride  = cfg::tcN;
       if constexpr (dst_layout == col_major) {
-        std::swap(elem_row, elem_col);
+        std::swap(block_row, block_col);
       }
-      auto ptr = base + elem_row * ldm + elem_col;
-      if constexpr (sizeof(vreg_t) == sizeof(output_t)) {
-        *reinterpret_cast<vreg_t*>(ptr) = src.data[r];
-      } else {
-        vreg_t tmp(src.data[r]);
-        *ptr = *reinterpret_cast<const output_t*>(&tmp);
+      auto base = reinterpret_cast<output_t*>(dst) + block_row * ldm + block_col;
+      detail::unroll_for<Frag::NR>([&](auto r) {
+        uint32_t block_m  = r / cfg::n_steps;
+        uint32_t block_n  = r % cfg::n_steps;
+        uint32_t elem_row = block_m * m_stride;
+        uint32_t elem_col = block_n * n_stride;
+        if constexpr (dst_layout == col_major) {
+          std::swap(elem_row, elem_col);
+        }
+        auto ptr = base + elem_row * ldm + elem_col;
+        auto packed = *reinterpret_cast<const uint32_t*>(&src.data[r]);
+        ptr[0] = static_cast<output_t>(packed & 0xffff);
+        ptr[1] = static_cast<output_t>((packed >> 16) & 0xffff);
+      });
+    } else {
+      uint32_t block_row = lane / cfg::tcN;
+      uint32_t block_col = lane % cfg::tcN;
+      uint32_t m_stride  = cfg::tcM;
+      uint32_t n_stride  = cfg::tcN;
+      if constexpr (dst_layout == col_major) {
+        std::swap(block_row, block_col);
       }
-    });
+      auto base = reinterpret_cast<output_t*>(dst) + block_row * ldm + block_col;
+      detail::unroll_for<Frag::NR>([&](auto r) {
+        uint32_t block_m  = r / cfg::n_steps;
+        uint32_t block_n  = r % cfg::n_steps;
+        uint32_t elem_row = block_m * m_stride;
+        uint32_t elem_col = block_n * n_stride;
+        if constexpr (dst_layout == col_major) {
+          std::swap(elem_row, elem_col);
+        }
+        auto ptr = base + elem_row * ldm + elem_col;
+        if constexpr (sizeof(vreg_t) == sizeof(output_t)) {
+          *reinterpret_cast<vreg_t*>(ptr) = src.data[r];
+        } else {
+          vreg_t tmp(src.data[r]);
+          *ptr = *reinterpret_cast<const output_t*>(&tmp);
+        }
+      });
+    }
   }
 
   template <typename FragD, typename FragA, typename FragB, typename FragC>
@@ -334,14 +451,22 @@ public:
       register float fb7 __asm__("f17") = fragB.data[7];
 
       // fragC: mix of caller-saved (f28-f31) and callee-saved (f18-f21)
-      register float fc0 __asm__("f24") = fragC.data[0];
-      register float fc1 __asm__("f25") = fragC.data[1];
-      register float fc2 __asm__("f26") = fragC.data[2];
-      register float fc3 __asm__("f27") = fragC.data[3];
-      register float fc4 __asm__("f28") = fragC.data[4];
-      register float fc5 __asm__("f29") = fragC.data[5];
-      register float fc6 __asm__("f30") = fragC.data[6];
-      register float fc7 __asm__("f31") = fragC.data[7];
+      float c0 = (FragC::NR > 0) ? fragC.data[0] : 0.0f;
+      float c1 = (FragC::NR > 1) ? fragC.data[1] : 0.0f;
+      float c2 = (FragC::NR > 2) ? fragC.data[2] : 0.0f;
+      float c3 = (FragC::NR > 3) ? fragC.data[3] : 0.0f;
+      float c4 = (FragC::NR > 4) ? fragC.data[4] : 0.0f;
+      float c5 = (FragC::NR > 5) ? fragC.data[5] : 0.0f;
+      float c6 = (FragC::NR > 6) ? fragC.data[6] : 0.0f;
+      float c7 = (FragC::NR > 7) ? fragC.data[7] : 0.0f;
+      register float fc0 __asm__("f24") = c0;
+      register float fc1 __asm__("f25") = c1;
+      register float fc2 __asm__("f26") = c2;
+      register float fc3 __asm__("f27") = c3;
+      register float fc4 __asm__("f28") = c4;
+      register float fc5 __asm__("f29") = c5;
+      register float fc6 __asm__("f30") = c6;
+      register float fc7 __asm__("f31") = c7;
 
       // Force outputs into accumulator registers
       register float fd0 __asm__("f24");
@@ -362,7 +487,12 @@ public:
       );
 
       // Write results to fragD
-      fragD.data = {fd0, fd1, fd2, fd3, fd4, fd5, fd6, fd7};
+      if constexpr (FragD::NR == 8) {
+        fragD.data = {fd0, fd1, fd2, fd3, fd4, fd5, fd6, fd7};
+      } else {
+        static_assert(FragD::NR == 4, "Unsupported accumulator register count");
+        fragD.data = {fd0, fd1, fd2, fd3};
+      }
     } else {
       static_assert(FragB::NR == 4, "Unsupported number of registers for FragB");
       // fragB: caller-saved registers (f28-f31)
@@ -372,14 +502,22 @@ public:
       register float fb3 __asm__("f31") = fragB.data[3];
 
       // fragC: mix of caller-saved (f10-f17)
-      register float fc0 __asm__("f10") = fragC.data[0];
-      register float fc1 __asm__("f11") = fragC.data[1];
-      register float fc2 __asm__("f12") = fragC.data[2];
-      register float fc3 __asm__("f13") = fragC.data[3];
-      register float fc4 __asm__("f14") = fragC.data[4];
-      register float fc5 __asm__("f15") = fragC.data[5];
-      register float fc6 __asm__("f16") = fragC.data[6];
-      register float fc7 __asm__("f17") = fragC.data[7];
+      float c0 = (FragC::NR > 0) ? fragC.data[0] : 0.0f;
+      float c1 = (FragC::NR > 1) ? fragC.data[1] : 0.0f;
+      float c2 = (FragC::NR > 2) ? fragC.data[2] : 0.0f;
+      float c3 = (FragC::NR > 3) ? fragC.data[3] : 0.0f;
+      float c4 = (FragC::NR > 4) ? fragC.data[4] : 0.0f;
+      float c5 = (FragC::NR > 5) ? fragC.data[5] : 0.0f;
+      float c6 = (FragC::NR > 6) ? fragC.data[6] : 0.0f;
+      float c7 = (FragC::NR > 7) ? fragC.data[7] : 0.0f;
+      register float fc0 __asm__("f10") = c0;
+      register float fc1 __asm__("f11") = c1;
+      register float fc2 __asm__("f12") = c2;
+      register float fc3 __asm__("f13") = c3;
+      register float fc4 __asm__("f14") = c4;
+      register float fc5 __asm__("f15") = c5;
+      register float fc6 __asm__("f16") = c6;
+      register float fc7 __asm__("f17") = c7;
 
       // Force outputs into accumulator registers
       register float fd0 __asm__("f10");
@@ -400,7 +538,12 @@ public:
       );
 
       // Write results to fragD
-      fragD.data = {fd0, fd1, fd2, fd3, fd4, fd5, fd6, fd7};
+      if constexpr (FragD::NR == 8) {
+        fragD.data = {fd0, fd1, fd2, fd3, fd4, fd5, fd6, fd7};
+      } else {
+        static_assert(FragD::NR == 4, "Unsupported accumulator register count");
+        fragD.data = {fd0, fd1, fd2, fd3};
+      }
     }
   }
 };

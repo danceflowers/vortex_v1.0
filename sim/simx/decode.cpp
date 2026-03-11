@@ -14,6 +14,7 @@
 #include <iostream>
 #include <string>
 #include <sstream>
+#include <algorithm>
 #include <stdlib.h>
 #include <string.h>
 #include <iomanip>
@@ -1081,37 +1082,143 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
       switch (funct3) {
       case 0: { // WMMA
         namespace vt = vortex::tensor;
-        using cfg = vt::wmma_config_t<NUM_THREADS>;
-        uint32_t ra_base = 0;
-        uint32_t rb_base = (cfg::NRB == 4) ? 28 : 10;
-        uint32_t rc_base = (cfg::NRB == 4) ? 10 : 24;
-        uint32_t fmt_d = rd;
-        uint32_t fmt_s = rs1;
-        uint32_t steps = 0;
-        uint32_t steps_count = cfg::m_steps * cfg::n_steps * cfg::k_steps;
-        uint32_t steps_shift = 32 - log2ceil(steps_count);
-        uint32_t uuid_hi = (uuid >> 32) & 0xffffffff;
-        uint32_t uuid_lo = uuid & 0xffffffff;
-        for (uint32_t k = 0; k < cfg::k_steps; ++k) {
-          for (uint32_t m = 0; m < cfg::m_steps; ++m) {
-            for (uint32_t n = 0; n < cfg::n_steps; ++n) {
-              uint32_t rs1 = ra_base + (m / cfg::a_sub_blocks) * cfg::k_steps + k;
-              uint32_t rs2 = rb_base + (k * cfg::n_steps + n) / cfg::b_sub_blocks;
-              uint32_t rs3 = rc_base + m * cfg::n_steps + n;
-              uint32_t uuid_lo_x = (steps << steps_shift) | uuid_lo;
-              uint64_t uuid_x = (static_cast<uint64_t>(uuid_hi) << 32) | uuid_lo_x;
-              ++steps;
-              auto instr = std::allocate_shared<Instr>(instr_pool_, uuid_x, FUType::TCU);
-              instr->setOpType(TcuType::WMMA);
-              instr->setArgs(IntrTcuArgs{fmt_s, fmt_d, m, n});
-              instr->setDestReg(rs3, RegType::Float);
-              instr->setSrcReg(0, rs1, RegType::Float);
-              instr->setSrcReg(1, rs2, RegType::Float);
-              instr->setSrcReg(2, rs3, RegType::Float);
-              ibuffer.push_back(instr);
+        auto fmt_c = rd;
+        auto fmt_ab = rs1;
+
+        auto emit_wmma = [&](auto cfg_tag) {
+          using cfg = decltype(cfg_tag);
+          uint32_t ra_base = 0;
+          uint32_t rb_base = (cfg::NRB == 4) ? 28 : 10;
+          uint32_t rc_base = (cfg::NRB == 4) ? 10 : 24;
+          uint32_t steps = 0;
+          uint32_t steps_count = cfg::m_steps * cfg::n_steps * cfg::k_steps;
+          uint32_t steps_shift = 32 - log2ceil(steps_count);
+          uint32_t uuid_hi = (uuid >> 32) & 0xffffffff;
+          uint32_t uuid_lo = uuid & 0xffffffff;
+          for (uint32_t k = 0; k < cfg::k_steps; ++k) {
+            for (uint32_t m = 0; m < cfg::m_steps; ++m) {
+              for (uint32_t n = 0; n < cfg::n_steps; ++n) {
+                uint32_t rs1 = ra_base + (m / cfg::a_sub_blocks) * cfg::k_steps + k;
+                uint32_t rs2 = rb_base + (k * cfg::n_steps + n) / cfg::b_sub_blocks;
+                uint32_t rs3 = rc_base + m * cfg::n_steps + n;
+                uint32_t uuid_lo_x = (steps << steps_shift) | uuid_lo;
+                uint64_t uuid_x = (static_cast<uint64_t>(uuid_hi) << 32) | uuid_lo_x;
+                ++steps;
+                auto instr = std::allocate_shared<Instr>(instr_pool_, uuid_x, FUType::TCU);
+                instr->setOpType(TcuType::WMMA);
+                instr->setArgs(IntrTcuArgs{fmt_ab, fmt_c, m, n, k});
+                instr->setDestReg(rs3, RegType::Float);
+                instr->setSrcReg(0, rs1, RegType::Float);
+                instr->setSrcReg(1, rs2, RegType::Float);
+                instr->setSrcReg(2, rs3, RegType::Float);
+                ibuffer.push_back(instr);
+              }
             }
           }
+        };
+
+        if (fmt_c == vt::fp16::id) {
+          switch (fmt_ab) {
+          case vt::fp8::id:
+            emit_wmma(vt::wmma_config_t<NUM_THREADS, vt::fp8, vt::fp16>{});
+            break;
+          case vt::fp16::id:
+          default:
+            emit_wmma(vt::wmma_config_t<NUM_THREADS, vt::fp16, vt::fp16>{});
+            break;
+          }
+        } else {
+          switch (fmt_ab) {
+          case vt::fp8::id:
+            emit_wmma(vt::wmma_config_t<NUM_THREADS, vt::fp8, vt::fp32>{});
+            break;
+          case vt::fp16::id:
+          default:
+            emit_wmma(vt::wmma_config_t<NUM_THREADS, vt::fp16, vt::fp32>{});
+            break;
+          }
         }
+      } break;
+      case 1: { // TMEM_ALLOC
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::TMEM_ALLOC);
+        instr->setArgs(IntrTcuArgs{});
+        instr->setDestReg(rd, RegType::Integer);
+        instr->setSrcReg(0, rs1, RegType::Integer);
+        ibuffer.push_back(instr);
+      } break;
+      case 2: { // TMEM_FREE
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::TMEM_FREE);
+        instr->setArgs(IntrTcuArgs{});
+        instr->setSrcReg(0, rs1, RegType::Integer);
+        ibuffer.push_back(instr);
+      } break;
+      case 3: { // TMA_LOAD
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::TMA_LOAD);
+        instr->setArgs(IntrTcuArgs{
+          0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, static_cast<uint8_t>(funct2 & 0x1)
+        });
+        instr->setDestReg(rd, RegType::Integer);
+        instr->setSrcReg(0, rs1, RegType::Integer);
+        instr->setSrcReg(1, rs2, RegType::Integer);
+        ibuffer.push_back(instr);
+      } break;
+      case 4: { // TMA_STORE
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::TMA_STORE);
+        instr->setArgs(IntrTcuArgs{});
+        instr->setDestReg(rd, RegType::Integer);
+        instr->setSrcReg(0, rs1, RegType::Integer);
+        instr->setSrcReg(1, rs2, RegType::Integer);
+        ibuffer.push_back(instr);
+      } break;
+      case 5: { // MMA_LOAD
+        namespace vt = vortex::tensor;
+        auto emit_fill = [&](TcuTarget target) {
+          auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+          instr->setOpType(TcuType::MMA_LOAD);
+          instr->setArgs(IntrTcuArgs{
+            rd,
+            rs2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            static_cast<uint8_t>(funct2 & 0x1),
+            0,
+            target
+          });
+          instr->setSrcReg(0, rs1, RegType::Integer);
+          ibuffer.push_back(instr);
+        };
+        emit_fill(TcuTarget::A);
+        if ((funct2 & 0x1) == 0) {
+          emit_fill(TcuTarget::B);
+        }
+        emit_fill(TcuTarget::C);
+      } break;
+      case 6: { // MMA_STORE
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::MMA_STORE);
+        instr->setArgs(IntrTcuArgs{
+          rs2,
+          rd
+        });
+        instr->setSrcReg(0, rs1, RegType::Integer);
+        ibuffer.push_back(instr);
+      } break;
+      case 7: { // TMA_WAIT
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::TMA_WAIT);
+        instr->setArgs(IntrTcuArgs{});
+        instr->setSrcReg(0, rs1, RegType::Integer);
+        ibuffer.push_back(instr);
       } break;
       default:
         std::abort();

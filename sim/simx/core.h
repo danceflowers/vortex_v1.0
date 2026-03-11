@@ -13,6 +13,8 @@
 
 #pragma once
 
+#include <array>
+#include <unordered_map>
 #include <vector>
 #include <simobject.h>
 #include "types.h"
@@ -163,6 +165,33 @@ public:
   TensorUnit::Ptr& tensor_unit() {
     return tensor_unit_;
   }
+
+  struct TmemPacket {
+    std::array<uint8_t, 64> bytes;
+
+    TmemPacket() {
+      bytes.fill(0);
+    }
+  };
+
+  struct TmaDescriptor {
+    uint64_t addr = 0;
+    uint32_t size_bytes = 0;
+    uint32_t stride_bytes = 0;
+    uint16_t rows = 0;
+    uint16_t cols = 0;
+    uint16_t elem_bytes = 0;
+    uint16_t flags = 0;
+  } __attribute__((packed));
+
+  uint32_t tmem_alloc(uint32_t bank_span);
+  bool tmem_free(uint32_t handle);
+  uint32_t tma_load(uint32_t handle, uint64_t desc_addr, bool transpose_b);
+  uint32_t tma_store(uint32_t handle, uint64_t desc_addr);
+  bool tma_wait(uint32_t async_id);
+  bool tmem_read_packet(uint32_t handle, uint32_t packet_idx, TmemPacket* out);
+  bool tmem_write_packet(uint32_t handle, uint32_t packet_idx, const TmemPacket& in);
+  bool tmem_query(uint32_t handle, uint32_t* bank_span, uint32_t* size_bytes) const;
 #endif
 
 #ifdef EXT_V_ENABLE
@@ -227,6 +256,31 @@ private:
   std::vector<Arbiter> ibuffer_arbs_;
 
   PoolAllocator<instr_trace_t, 64> trace_pool_;
+
+#ifdef EXT_TCU_ENABLE
+  struct TmaRequest {
+    uint32_t async_id = 0;
+    uint32_t handle = 0;
+    uint64_t desc_addr = 0;
+    uint64_t ready_cycle = 0;
+    bool transpose_b = false;
+    bool is_store = false;
+    bool completed = false;
+  };
+
+  std::array<std::array<uint8_t, 256>, 8> tmem_banks_;
+  std::array<bool, 8> tmem_bank_allocs_;
+  std::unordered_map<uint32_t, TmaRequest> pending_tma_reqs_;
+  uint32_t next_async_id_;
+
+  static uint32_t pack_tmem_handle(uint32_t start_bank, uint32_t bank_span);
+  static bool unpack_tmem_handle(uint32_t handle, uint32_t* start_bank, uint32_t* bank_span);
+  bool read_tma_descriptor(uint64_t desc_addr, TmaDescriptor* out);
+  void advance_tma_requests();
+  void process_tma_request(TmaRequest& req);
+  bool tmem_copy_in(uint32_t handle, const uint8_t* data, uint32_t size_bytes);
+  bool tmem_copy_out(uint32_t handle, uint8_t* data, uint32_t size_bytes) const;
+#endif
 
   friend class LsuUnit;
   friend class AluUnit;
