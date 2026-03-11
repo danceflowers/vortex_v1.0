@@ -30,8 +30,15 @@ check_gcc_version() {
 # Update package list
 apt-get update -y
 
+libffi_pkg=libffi-dev
+if apt-cache show libffi8 >/dev/null 2>&1; then
+    libffi_pkg=libffi8
+elif apt-cache show libffi7 >/dev/null 2>&1; then
+    libffi_pkg=libffi7
+fi
+
 # install system dependencies
-apt-get install -y build-essential valgrind libstdc++6 binutils python3 uuid-dev ccache cmake libffi8
+apt-get install -y build-essential valgrind libstdc++6 binutils python3 uuid-dev ccache cmake "$libffi_pkg"
 
 # Check and install GCC 11 if necessary
 if check_gcc_version; then
