@@ -16,6 +16,9 @@ Run this from the repository root:
 docker build -t vortex-v2.0 -f vortex_v2.0/Dockerfile .
 ```
 
+The image build can bootstrap missing `third_party/softfloat`, `third_party/ramulator`,
+and `third_party/ramulator/ext/*` sources, so a clean checkout can still build the image.
+
 ## Open a container
 
 If you want the container to use the checkout you pulled from GitHub, bind-mount the repository into the same in-container path:
@@ -25,6 +28,13 @@ docker run --rm -it \
   -v "$PWD":/mnt/d/wode_code_trunk/vortex \
   -w /mnt/d/wode_code_trunk/vortex \
   vortex-v2.0
+```
+
+If you bind-mount the host checkout, it hides the snapshot baked into the image.
+Make sure the host tree itself has the required submodules populated, for example:
+
+```bash
+git submodule update --init --recursive
 ```
 
 If you only want the image snapshot that was baked in during `docker build`, drop the `-v` mount:
