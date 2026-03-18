@@ -1,6 +1,6 @@
 # vortex_v2.0
 
-Docker packaging for the current Vortex CModel tree. The package follows the same pattern as `vortex_v1.0`, but it keeps the in-container source path fixed at:
+Docker packaging for the current Vortex CModel tree and the latest TCU-related regression tests. The package keeps the in-container source path fixed at:
 
 ```bash
 /mnt/d/wode_code_trunk/vortex
@@ -19,15 +19,19 @@ docker build -t vortex-v2.0 -f vortex_v2.0/Dockerfile .
 The image build can bootstrap missing `third_party/softfloat`, `third_party/ramulator`,
 and `third_party/ramulator/ext/*` sources, so a clean checkout can still build the image.
 
+Before building on another server, sync the repository and submodules:
+
+```bash
+git pull
+git submodule update --init --recursive
+```
+
 ## Open a container
 
 If you want the container to use the checkout you pulled from GitHub, bind-mount the repository into the same in-container path:
 
 ```bash
-docker run --rm -it \
-  -v "$PWD":/mnt/d/wode_code_trunk/vortex \
-  -w /mnt/d/wode_code_trunk/vortex \
-  vortex-v2.0
+./vortex_v2.0/run.sh
 ```
 
 If you bind-mount the host checkout, it hides the snapshot baked into the image.
@@ -40,39 +44,79 @@ git submodule update --init --recursive
 If you only want the image snapshot that was baked in during `docker build`, drop the `-v` mount:
 
 ```bash
-docker run --rm -it vortex-v2.0
+./vortex_v2.0/run.sh --no-mount
+```
+
+You can also run a command directly without opening an interactive shell:
+
+```bash
+./vortex_v2.0/run.sh ./vortex_v2.0/run_tcu_tests.sh
 ```
 
 ## Commands to run inside the container
 
-Rebuild the CModel:
+Prepare the generated hardware headers and rebuild the CModel:
 
 ```bash
+make -C /mnt/d/wode_code_trunk/vortex/hw config
 make -C /mnt/d/wode_code_trunk/vortex/runtime/simx clean
-make -C /mnt/d/wode_code_trunk/vortex/runtime/simx -j4
+make -C /mnt/d/wode_code_trunk/vortex/runtime/simx -j"$(nproc)"
 ```
 
-Build and run the new `128x128x128` TMEM/TMA regression:
+Run all current TCU-related regressions in one shot:
 
 ```bash
-make -C /mnt/d/wode_code_trunk/vortex/tests/regression/sgemm_tcu_tmem clean all
-cd /mnt/d/wode_code_trunk/vortex/tests/regression/sgemm_tcu_tmem
-LD_LIBRARY_PATH=/mnt/d/wode_code_trunk/vortex/runtime \
-VORTEX_DRIVER=simx \
-./sgemm_tcu_tmem
+./vortex_v2.0/run_tcu_tests.sh
 ```
 
-Build and run the single-tile TMEM/TMA chain regression:
+Run a subset:
 
 ```bash
-make -C /mnt/d/wode_code_trunk/vortex/tests/regression/tcu_tmem_chain clean all
-cd /mnt/d/wode_code_trunk/vortex/tests/regression/tcu_tmem_chain
-LD_LIBRARY_PATH=/mnt/d/wode_code_trunk/vortex/runtime \
-VORTEX_DRIVER=simx \
-./tcu_tmem_chain
+./vortex_v2.0/run_tcu_tests.sh sgemm_tcu sgemm_tcu_tmem
+```
+
+## Individual TCU Tests
+
+Baseline SGEMM TCU:
+
+```bash
+make -C /mnt/d/wode_code_trunk/vortex/tests/regression/sgemm_tcu clean all && \
+make -C /mnt/d/wode_code_trunk/vortex/tests/regression/sgemm_tcu run-simx \
+  OPTS="-m 128 -n 128 -k 128"
+```
+
+TMEM/TMA SGEMM:
+
+```bash
+make -C /mnt/d/wode_code_trunk/vortex/tests/regression/sgemm_tcu_tmem clean all run-simx
+```
+
+Single-tile TMEM chain:
+
+```bash
+make -C /mnt/d/wode_code_trunk/vortex/tests/regression/tcu_tmem_chain clean all run-simx
+```
+
+Async mbarrier + TMEM:
+
+```bash
+make -C /mnt/d/wode_code_trunk/vortex/tests/regression/tcu_mbarrier_async clean all run-simx
+```
+
+TMEM shift fence:
+
+```bash
+make -C /mnt/d/wode_code_trunk/vortex/tests/regression/tcu_tmem_shift_fence clean all run-simx
+```
+
+WMMA overlap:
+
+```bash
+make -C /mnt/d/wode_code_trunk/vortex/tests/regression/tcu_wmma_overlap clean all run-simx
 ```
 
 ## Notes
 
 - The image installs the same dependency/toolchain flow used by `vortex_v1.0`: `ci/install_dependencies.sh` and `ci/toolchain_install.sh`.
-- `TMEM/TMA` regressions assume the current repository defaults: `NUM_THREADS=32` and `EXT_TCU_ENABLE=1`.
+- The current TCU regression set is `sgemm_tcu`, `sgemm_tcu_tmem`, `tcu_mbarrier_async`, `tcu_tmem_chain`, `tcu_tmem_shift_fence`, and `tcu_wmma_overlap`.
+- The default flow assumes the current repository defaults: `NUM_THREADS=32` and `EXT_TCU_ENABLE=1`.

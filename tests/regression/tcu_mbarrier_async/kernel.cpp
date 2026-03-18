@@ -8,9 +8,9 @@ using ctx = vt::wmma_context_ab<NUM_THREADS, vt::ATYPE, vt::BTYPE, vt::OTYPE>;
 static constexpr uint32_t kTmaInDescId = 0;
 static constexpr uint32_t kTmaOutDescId = 1;
 static constexpr uint32_t kMmaDescId = 0;
-static constexpr uint32_t kMmaLoadBarrierId = 0;
-static constexpr uint32_t kWmmaBarrierId = 1;
-static constexpr uint32_t kMmaStoreBarrierId = 2;
+static constexpr uint32_t kMmaLoadBarrierId = 2;
+static constexpr uint32_t kWmmaBarrierId = 3;
+static constexpr uint32_t kMmaStoreBarrierId = 4;
 
 static inline void wait_tensor_async(uint32_t barrier_id) {
   (void)vt::tc_commit(barrier_id);
@@ -28,8 +28,14 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   ctx::fill_fragment(fragC, 0);
 
   uint32_t handle = vt::tmem_alloc(arg->bank_span);
-  uint32_t load_id = vt::tma_load(handle, kTmaInDescId);
-  vt::tma_wait(load_id);
+
+  vt::mbarrier_init(0, 1);
+  (void)vt::tma_load(handle, kTmaInDescId);
+  (void)vt::tc_commit(0);
+  vt::tc_fence_before();
+  vt::mbarrier_arrive(0);
+  vt::mbarrier_wait(0);
+  vt::tc_fence_after();
 
   vt::mbarrier_init(kMmaLoadBarrierId, 1);
   vt::mma_load<kMmaDescId>(handle);
@@ -41,8 +47,14 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   vt::mma_store<kMmaDescId>(handle);
   wait_tensor_async(kMmaStoreBarrierId);
 
-  uint32_t store_id = vt::tma_store(handle, kTmaOutDescId);
-  vt::tma_wait(store_id);
+  vt::mbarrier_init(1, 1);
+  (void)vt::tma_store(handle, kTmaOutDescId);
+  (void)vt::tc_commit(1);
+  vt::tc_fence_before();
+  vt::mbarrier_arrive(1);
+  vt::mbarrier_wait(1);
+  vt::tc_fence_after();
+
   vt::tmem_free(handle);
 }
 

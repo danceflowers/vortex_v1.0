@@ -78,6 +78,9 @@ uint16_t convert_to_fp9(uint32_t raw_bits, PrecisionType prec) {
             max_exp_code = 31;
             input_mant_width = 10;
             break;
+
+        case PREC_FP9:
+            return raw_bits & 0x1FF;
             
         default: return 0;
     }

@@ -658,40 +658,97 @@ inline std::ostream &operator<<(std::ostream &os, const TcuTarget& target) {
   return os;
 }
 
+enum class TcuPayloadKind : uint8_t {
+  Dense = 0,
+  SparsePayload,
+  SparseMeta,
+};
+
+inline std::ostream &operator<<(std::ostream &os, const TcuPayloadKind& kind) {
+  switch (kind) {
+  case TcuPayloadKind::Dense:         os << "DENSE"; break;
+  case TcuPayloadKind::SparsePayload: os << "SPARSE_PAYLOAD"; break;
+  case TcuPayloadKind::SparseMeta:    os << "SPARSE_META"; break;
+  default:
+    assert(false);
+  }
+  return os;
+}
+
+enum class TcuFenceMode : uint8_t {
+  Before = 0,
+  After,
+};
+
+inline std::ostream &operator<<(std::ostream &os, const TcuFenceMode& mode) {
+  switch (mode) {
+  case TcuFenceMode::Before: os << "BEFORE"; break;
+  case TcuFenceMode::After:  os << "AFTER"; break;
+  default:
+    assert(false);
+  }
+  return os;
+}
+
 enum class TcuType {
   TMEM_ALLOC,
   TMEM_FREE,
+  TMEM_REL_PERMIT,
   TMA_LOAD,
   TMA_STORE,
+  TC_COMMIT,
+  TC_FENCE,
+  TC_WAIT,
+  TMEM_SHIFT,
   MMA_LOAD,
   MMA_STORE,
+  MBAR_INIT,
+  MBAR_ARRIVE,
+  MBAR_WAIT,
   TMA_WAIT,
   WMMA,
 };
 
 struct IntrTcuArgs {
   uint32_t fmt_ab = 0;
+  uint32_t fmt_a = 0;
+  uint32_t fmt_b = 0;
   uint32_t fmt_c = 0;
   uint32_t step_m = 0;
   uint32_t step_n = 0;
   uint32_t step_k = 0;
   uint32_t bank_span = 0;
+  uint32_t meta_bank_span = 0;
   uint32_t packet_count = 0;
   uint32_t async_id = 0;
-  uint32_t descriptor = 0;
+  uint32_t descriptor = 0xffffffffu;
+  uint32_t sparse_mode = 0;
+  uint32_t barrier_id = 0;
   uint8_t ws = 0;
+  uint8_t sp = 0;
+  uint8_t macro_op = 0;
   uint8_t transpose_b = 0;
   TcuTarget target = TcuTarget::None;
+  TcuPayloadKind payload_kind = TcuPayloadKind::Dense;
+  TcuFenceMode fence_mode = TcuFenceMode::Before;
 };
 
 inline std::ostream &operator<<(std::ostream &os, const TcuType& type) {
   switch (type) {
   case TcuType::TMEM_ALLOC: os << "TMEM_ALLOC"; break;
   case TcuType::TMEM_FREE:  os << "TMEM_FREE"; break;
+  case TcuType::TMEM_REL_PERMIT: os << "TMEM_REL_PERMIT"; break;
   case TcuType::TMA_LOAD:   os << "TMA_LOAD"; break;
   case TcuType::TMA_STORE:  os << "TMA_STORE"; break;
+  case TcuType::TC_COMMIT:  os << "TC_COMMIT"; break;
+  case TcuType::TC_FENCE:   os << "TC_FENCE"; break;
+  case TcuType::TC_WAIT:    os << "TC_WAIT"; break;
+  case TcuType::TMEM_SHIFT: os << "TMEM_SHIFT"; break;
   case TcuType::MMA_LOAD:   os << "MMA_LOAD"; break;
   case TcuType::MMA_STORE:  os << "MMA_STORE"; break;
+  case TcuType::MBAR_INIT:   os << "MBAR_INIT"; break;
+  case TcuType::MBAR_ARRIVE: os << "MBAR_ARRIVE"; break;
+  case TcuType::MBAR_WAIT:   os << "MBAR_WAIT"; break;
   case TcuType::TMA_WAIT:   os << "TMA_WAIT"; break;
   case TcuType::WMMA:       os << "WMMA"; break;
   default:

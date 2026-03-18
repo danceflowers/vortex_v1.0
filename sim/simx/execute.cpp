@@ -48,6 +48,25 @@ inline int64_t check_boxing(int64_t a) {
   return nan_box(0x7fc00000); // NaN
 }
 
+#ifdef EXT_TCU_ENABLE
+static inline void resolve_mma_descriptor(Core* core, IntrTcuArgs* args) {
+  if (args->descriptor == 0xffffffffu) {
+    return;
+  }
+  Core::MmaDescriptor desc;
+  if (!core->read_mma_descriptor(args->descriptor, &desc)) {
+    std::abort();
+  }
+  args->fmt_a = desc.fmt_a;
+  args->fmt_b = desc.fmt_b;
+  args->fmt_ab = (desc.fmt_a == desc.fmt_b) ? desc.fmt_a : 0;
+  args->fmt_c = desc.fmt_c;
+  args->ws = desc.ws;
+  args->sp = desc.sp;
+  args->sparse_mode = desc.sparse_mode;
+}
+#endif
+
 void Emulator::fetch_registers(std::vector<reg_data_t>& out, uint32_t wid, uint32_t src_index, const RegOpd& reg) {
   __unused(src_index);
   auto& warp = warps_.at(wid);
@@ -1459,7 +1478,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       trace->data = trace_data;
       switch (tcu_type) {
       case TcuType::TMEM_ALLOC: {
-        auto handle = core_->tmem_alloc(std::max<uint32_t>(1, rs1_data.at(thread_start).u32));
+        auto handle = core_->tmem_alloc(std::max<uint32_t>(1, rs1_data.at(thread_start).u32));//rs1_data stored the number of contiguous banks to allocate
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t))
             continue;
@@ -1472,10 +1491,13 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         auto handle = rs1_data.at(thread_start).u32;
         core_->tmem_free(handle);
       } break;
+      case TcuType::TMEM_REL_PERMIT: {
+        core_->tmem_rel_permit();
+      } break;
       case TcuType::TMA_LOAD: {
         auto handle = rs1_data.at(thread_start).u32;
-        auto desc_addr = rs2_data.at(thread_start).u;
-        auto async_id = core_->tma_load(handle, desc_addr, tpuArgs.transpose_b);
+        auto desc_id = rs2_data.at(thread_start).u32;
+        auto async_id = core_->tma_load(wid, handle, desc_id, tpuArgs.transpose_b);
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t))
             continue;
@@ -1486,8 +1508,8 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       } break;
       case TcuType::TMA_STORE: {
         auto handle = rs1_data.at(thread_start).u32;
-        auto desc_addr = rs2_data.at(thread_start).u;
-        auto async_id = core_->tma_store(handle, desc_addr);
+        auto desc_id = rs2_data.at(thread_start).u32;
+        auto async_id = core_->tma_store(wid, handle, desc_id);
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t))
             continue;
@@ -1496,25 +1518,92 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         trace_data->rd_write = true;
         rd_write = true;
       } break;
+      case TcuType::TC_COMMIT: {
+        auto barrier_id = rs1_data.at(thread_start).u32;
+        auto committed = core_->tc_commit(wid, barrier_id);
+        tpuArgs.barrier_id = barrier_id;
+        for (uint32_t t = thread_start; t < num_threads; ++t) {
+          if (!warp.tmask.test(t))
+            continue;
+          rd_data[t].u = committed;
+        }
+        trace_data->rd_write = (rdest.type != RegType::None) && (rdest.idx != 0);
+        rd_write = trace_data->rd_write;
+      } break;
+      case TcuType::TC_FENCE: {
+        if (!core_->tc_fence(wid, tpuArgs.fence_mode)) {
+          core_->suspend(wid, WarpStallReason::AsyncTensor);
+          last_instr_retired_ = false;
+        }
+      } break;
+      case TcuType::TC_WAIT: {
+        if (!core_->tc_wait(wid)) {
+          core_->suspend(wid, WarpStallReason::AsyncTensor);
+          last_instr_retired_ = false;
+        }
+      } break;
+      case TcuType::TMEM_SHIFT: {
+        auto handle = rs1_data.at(thread_start).u32;
+        auto async_id = core_->tmem_shift(wid, handle);
+        for (uint32_t t = thread_start; t < num_threads; ++t) {
+          if (!warp.tmask.test(t))
+            continue;
+          rd_data[t].u = async_id;
+        }
+        trace_data->rd_write = (rdest.type != RegType::None) && (rdest.idx != 0);
+        rd_write = trace_data->rd_write;
+      } break;
       case TcuType::MMA_LOAD: {
+        resolve_mma_descriptor(core_, &tpuArgs);
         auto handle = rs1_data.at(thread_start).u32;
         tensor_unit_->mma_load(wid, handle, tpuArgs, trace_data.get());
+        if (trace_data->retry) {
+          core_->set_stall_reason(wid, WarpStallReason::AsyncTensor);
+          last_instr_retired_ = false;
+        }
         rd_write = trace_data->rd_write;
       } break;
       case TcuType::MMA_STORE: {
+        resolve_mma_descriptor(core_, &tpuArgs);
         auto handle = rs1_data.at(thread_start).u32;
         tensor_unit_->mma_store(wid, handle, tpuArgs, trace_data.get());
+        if (trace_data->retry) {
+          core_->set_stall_reason(wid, WarpStallReason::AsyncTensor);
+          last_instr_retired_ = false;
+        }
         rd_write = trace_data->rd_write;
+      } break;
+      case TcuType::MBAR_INIT: {
+        auto barrier_id = rs1_data.at(thread_start).u32;
+        auto count = rs2_data.at(thread_start).u32;
+        core_->mbarrier_init(barrier_id, count);
+      } break;
+      case TcuType::MBAR_ARRIVE: {
+        auto barrier_id = rs1_data.at(thread_start).u32;
+        core_->mbarrier_arrive(barrier_id);
+      } break;
+      case TcuType::MBAR_WAIT: {
+        auto barrier_id = rs1_data.at(thread_start).u32;
+        if (!core_->mbarrier_wait(wid, barrier_id)) {
+          core_->suspend(wid, WarpStallReason::MBarrier);
+          last_instr_retired_ = false;
+        }
       } break;
       case TcuType::TMA_WAIT: {
         auto async_id = rs1_data.at(thread_start).u32;
-        if (!core_->tma_wait(async_id)) {
+        if (!core_->tma_wait(wid, async_id)) {
+          core_->suspend(wid, WarpStallReason::AsyncTensor);
           last_instr_retired_ = false;
         }
       } break;
       case TcuType::WMMA: {
         assert(warp.tmask.count() == num_threads);
-        tensor_unit_->wmma(wid, tpuArgs.fmt_ab, tpuArgs.fmt_c, tpuArgs.step_m, tpuArgs.step_n, tpuArgs.step_k, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get());
+        resolve_mma_descriptor(core_, &tpuArgs);
+        tensor_unit_->wmma(wid, tpuArgs, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get());
+        if (trace_data->retry) {
+          core_->set_stall_reason(wid, WarpStallReason::AsyncTensor);
+          last_instr_retired_ = false;
+        }
         rd_write = trace_data->rd_write;
       } break;
       default:

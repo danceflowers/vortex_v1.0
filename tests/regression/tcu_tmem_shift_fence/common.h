@@ -8,22 +8,6 @@
 #define NUM_THREADS 32
 #endif
 
-#ifndef ITYPE
-#define ITYPE fp16
-#endif
-
-#ifndef ATYPE
-#define ATYPE ITYPE
-#endif
-
-#ifndef BTYPE
-#define BTYPE ITYPE
-#endif
-
-#ifndef OTYPE
-#define OTYPE fp32
-#endif
-
 typedef vortex::tensor::descriptor_table_arg_t descriptor_table_arg_t;
 
 typedef struct {

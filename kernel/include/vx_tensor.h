@@ -24,6 +24,19 @@ enum mem_layout {
   col_major
 };
 
+enum tcu_target : uint8_t {
+  tcu_target_none = 0,
+  tcu_target_a = 1,
+  tcu_target_b = 2,
+  tcu_target_c = 3,
+};
+
+enum tcu_payload_kind : uint8_t {
+  tcu_payload_dense = 0,
+  tcu_payload_sparse_payload = 1,
+  tcu_payload_sparse_meta = 2,
+};
+
 struct tma_descriptor_t {
   uint64_t addr;
   uint32_t size_bytes;
@@ -32,7 +45,49 @@ struct tma_descriptor_t {
   uint16_t cols;
   uint16_t elem_bytes;
   uint16_t flags;
+  uint16_t tmem_base;
+  uint16_t meta_tmem_base;
+  uint16_t bank_span;
+  uint16_t meta_bank_span;
+  uint8_t tile_role;
+  uint8_t payload_kind;
+  uint8_t reserved[14];
 } __attribute__((packed));
+
+struct mma_descriptor_t {
+  uint32_t fmt_a;
+  uint32_t fmt_b;
+  uint32_t fmt_c;
+  uint8_t ws;
+  uint8_t sp;
+  uint8_t sparse_mode;
+  uint8_t reserved;
+} __attribute__((packed));
+
+template <typename At, typename Bt, typename Ot>
+inline __attribute__((always_inline)) constexpr mma_descriptor_t make_mma_descriptor(uint8_t ws = 0,
+                                                                                     uint8_t sp = 0,
+                                                                                     uint8_t sparse_mode = 0) {
+  return mma_descriptor_t{At::id, Bt::id, Ot::id, ws, sp, sparse_mode, 0};
+}
+
+inline __attribute__((always_inline)) uint16_t tmem_handle_base(uint32_t handle) {
+  return handle & 0xff;
+}
+
+inline __attribute__((always_inline)) uint16_t tmem_handle_span(uint32_t handle) {
+  return (handle >> 8) & 0xff;
+}
+
+inline __attribute__((always_inline)) void bind_tmem_payload_region(tma_descriptor_t* desc, uint32_t handle) {
+  desc->tmem_base = tmem_handle_base(handle);
+  desc->bank_span = tmem_handle_span(handle);
+}
+
+inline __attribute__((always_inline)) void bind_tmem_meta_region(tma_descriptor_t* desc, uint32_t handle) {
+  desc->meta_tmem_base = tmem_handle_base(handle);
+  desc->meta_bank_span = tmem_handle_span(handle);
+}
 
 inline __attribute__((always_inline)) uint32_t tmem_alloc(uint32_t bank_span) {
   uint32_t handle;
@@ -50,20 +105,27 @@ inline __attribute__((always_inline)) void tmem_free(uint32_t handle) {
     : "memory");
 }
 
-inline __attribute__((always_inline)) uint32_t tma_load(uint32_t handle, const tma_descriptor_t* desc) {
+inline __attribute__((always_inline)) void tmem_rel_permit() {
+  __asm__ volatile (".insn r %0, 0, 3, x0, x0, x0"
+    :
+    : "i"(RISCV_CUSTOM0)
+    : "memory");
+}
+
+inline __attribute__((always_inline)) uint32_t tma_load(uint32_t handle, uint32_t desc_id) {
   uint32_t async_id;
   __asm__ volatile (".insn r %3, 3, 2, %0, %1, %2"
     : "=r"(async_id)
-    : "r"(handle), "r"(desc), "i"(RISCV_CUSTOM0)
+    : "r"(handle), "r"(desc_id), "i"(RISCV_CUSTOM0)
     : "memory");
   return async_id;
 }
 
-inline __attribute__((always_inline)) uint32_t tma_store(uint32_t handle, const tma_descriptor_t* desc) {
+inline __attribute__((always_inline)) uint32_t tma_store(uint32_t handle, uint32_t desc_id) {
   uint32_t async_id;
   __asm__ volatile (".insn r %3, 4, 2, %0, %1, %2"
     : "=r"(async_id)
-    : "r"(handle), "r"(desc), "i"(RISCV_CUSTOM0)
+    : "r"(handle), "r"(desc_id), "i"(RISCV_CUSTOM0)
     : "memory");
   return async_id;
 }
@@ -75,6 +137,70 @@ inline __attribute__((always_inline)) void tma_wait(uint32_t async_id) {
     : "memory");
 }
 
+inline __attribute__((always_inline)) uint32_t tc_commit(uint32_t barrier_id) {
+  uint32_t committed;
+  __asm__ volatile (".insn r %2, 1, 3, %0, %1, x0"
+    : "=r"(committed)
+    : "r"(barrier_id), "i"(RISCV_CUSTOM0)
+    : "memory");
+  return committed;
+}
+
+inline __attribute__((always_inline)) void tc_fence_before() {
+  __asm__ volatile (".insn r %0, 2, 3, x0, x0, x0"
+    :
+    : "i"(RISCV_CUSTOM0)
+    : "memory");
+}
+
+inline __attribute__((always_inline)) void tc_fence_after() {
+  __asm__ volatile (".insn r %0, 2, 3, x1, x0, x0"
+    :
+    : "i"(RISCV_CUSTOM0)
+    : "memory");
+}
+
+inline __attribute__((always_inline)) void tc_fence() {
+  tc_fence_before();
+}
+
+inline __attribute__((always_inline)) void tc_wait() {
+  __asm__ volatile (".insn r %0, 7, 3, x0, x0, x0"
+    :
+    : "i"(RISCV_CUSTOM0)
+    : "memory");
+}
+
+inline __attribute__((always_inline)) uint32_t tmem_shift(uint32_t handle) {
+  uint32_t async_id;
+  __asm__ volatile (".insn r %2, 3, 3, %0, %1, x0"
+    : "=r"(async_id)
+    : "r"(handle), "i"(RISCV_CUSTOM0)
+    : "memory");
+  return async_id;
+}
+
+inline __attribute__((always_inline)) void mbarrier_init(uint32_t barrier_id, uint32_t count) {
+  __asm__ volatile (".insn r %2, 4, 3, x0, %0, %1"
+    :
+    : "r"(barrier_id), "r"(count), "i"(RISCV_CUSTOM0)
+    : "memory");
+}
+
+inline __attribute__((always_inline)) void mbarrier_arrive(uint32_t barrier_id) {
+  __asm__ volatile (".insn r %1, 5, 3, x0, %0, x0"
+    :
+    : "r"(barrier_id), "i"(RISCV_CUSTOM0)
+    : "memory");
+}
+
+inline __attribute__((always_inline)) void mbarrier_wait(uint32_t barrier_id) {
+  __asm__ volatile (".insn r %1, 6, 3, x0, %0, x0"
+    :
+    : "r"(barrier_id), "i"(RISCV_CUSTOM0)
+    : "memory");
+}
+
 template <typename It, typename Ot>
 inline __attribute__((always_inline)) void mma_load(uint32_t handle) {
   __asm__ volatile (".insn r %[insn], 5, 2, x%[fab], %[handle], x%[fc]"
@@ -83,11 +209,86 @@ inline __attribute__((always_inline)) void mma_load(uint32_t handle) {
     : "memory");
 }
 
+template <typename It, uint32_t Funct7>
+inline __attribute__((always_inline)) void mma_load_component(uint32_t handle) {
+  __asm__ volatile (".insn r %[insn], 5, %[funct7], x%[fmt], %[handle], x0"
+    :
+    : [insn]"i"(RISCV_CUSTOM0), [funct7]"i"(Funct7), [fmt]"i"(It::id), [handle]"r"(handle)
+    : "memory");
+}
+
+template <typename At, typename Bt, typename Ot>
+inline __attribute__((always_inline)) void mma_load(uint32_t handle) {
+  mma_load_component<At, 34>(handle);
+  mma_load_component<Bt, 66>(handle);
+  mma_load_component<Ot, 98>(handle);
+}
+
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_load(uint32_t handle) {
+  static_assert(DescId < max_static_descriptor_id, "desc_id must fit in the encoded desc_id field");
+  __asm__ volatile (".insn r %[insn], 5, 4, x%[desc_id], %[handle], x0"
+    :
+    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle)
+    : "memory");
+}
+
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_load_a(uint32_t handle) {
+  static_assert(DescId < max_static_descriptor_id, "desc_id must fit in the encoded desc_id field");
+  __asm__ volatile (".insn r %[insn], 5, 4, x%[desc_id], %[handle], x1"
+    :
+    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle)
+    : "memory");
+}
+
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_load_b(uint32_t handle) {
+  static_assert(DescId < max_static_descriptor_id, "desc_id must fit in the encoded desc_id field");
+  __asm__ volatile (".insn r %[insn], 5, 4, x%[desc_id], %[handle], x2"
+    :
+    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle)
+    : "memory");
+}
+
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_load_c(uint32_t handle) {
+  static_assert(DescId < max_static_descriptor_id, "desc_id must fit in the encoded desc_id field");
+  __asm__ volatile (".insn r %[insn], 5, 4, x%[desc_id], %[handle], x3"
+    :
+    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle)
+    : "memory");
+}
+
 template <typename It, typename Ot>
 inline __attribute__((always_inline)) void mma_store(uint32_t handle) {
   __asm__ volatile (".insn r %[insn], 6, 2, x%[fc], %[handle], x%[fab]"
     :
     : [insn]"i"(RISCV_CUSTOM0), [fc]"i"(Ot::id), [fab]"i"(It::id), [handle]"r"(handle)
+    : "memory");
+}
+
+template <typename At, typename Bt, typename Ot>
+inline __attribute__((always_inline)) void mma_store(uint32_t handle) {
+  static_assert(sizeof(Bt) >= 0, "Bt is only used to select the overload");
+  mma_store<At, Ot>(handle);
+}
+
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_store(uint32_t handle) {
+  static_assert(DescId < max_static_descriptor_id, "desc_id must fit in the encoded desc_id field");
+  __asm__ volatile (".insn r %[insn], 6, 4, x%[desc_id], %[handle], x0"
+    :
+    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle)
+    : "memory");
+}
+
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_store_c(uint32_t handle) {
+  static_assert(DescId < max_static_descriptor_id, "desc_id must fit in the encoded desc_id field");
+  __asm__ volatile (".insn r %[insn], 6, 4, x%[desc_id], %[handle], x3"
+    :
+    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle)
     : "memory");
 }
 
@@ -191,11 +392,12 @@ namespace detail {
 }
 
 template <uint32_t NT, // number of threads per warp
-          typename It, // input type (A,B)
+          typename At, // input type A
+          typename Bt, // input type B
           typename Ot> // output type (C,D)
-struct wmma_context {
+struct wmma_context_ab {
 private:
-  using cfg = wmma_config_t<NT, It, Ot>;
+  using cfg = wmma_ab_config_t<NT, At, Bt, Ot>;
 
   enum frag_use_t { matrix_a, matrix_b, accumulator };
 
@@ -211,21 +413,26 @@ private:
 
 public:
 
-  using input_t  = typename It::dtype;
+  using input_a_t = typename At::dtype;
+  using input_b_t = typename Bt::dtype;
   using output_t = typename Ot::dtype;
 
-  using input_acessor_t = detail::data_accessor_t<It, vreg_t>;
+  using input_a_accessor_t = detail::data_accessor_t<At, vreg_t>;
+  using input_b_accessor_t = detail::data_accessor_t<Bt, vreg_t>;
   using output_acessor_t = detail::data_accessor_t<Ot, vreg_t>;
 
-  static constexpr uint32_t input_is_subbyte = (It::bits < 8);
+  static constexpr uint32_t input_a_is_subbyte = (At::bits < 8);
+  static constexpr uint32_t input_b_is_subbyte = (Bt::bits < 8);
 
-  static constexpr uint32_t i_ratio = sizeof(vreg_t) / sizeof(input_t);
+  static constexpr uint32_t a_i_ratio = cfg::a_i_ratio;
+  static constexpr uint32_t b_i_ratio = cfg::b_i_ratio;
   static constexpr uint32_t tileM = cfg::tileM;
   static constexpr uint32_t tileN = cfg::tileN;
-  static constexpr uint32_t tileK = cfg::tileK * i_ratio;
+  static constexpr uint32_t tileK_a = cfg::tileK_a;
+  static constexpr uint32_t tileK_b = cfg::tileK_b;
 
-  using fragment_a   = fragment_t<matrix_a, input_t, cfg::NRA>;
-  using fragment_b   = fragment_t<matrix_b, input_t, cfg::NRB>;
+  using fragment_a   = fragment_t<matrix_a, input_a_t, cfg::NRA>;
+  using fragment_b   = fragment_t<matrix_b, input_b_t, cfg::NRB>;
   using fragment_acc = fragment_t<accumulator, output_t, cfg::NRC>;
 
   template <typename Frag, typename T>
@@ -233,8 +440,10 @@ public:
     vreg_t fill_data;
     if constexpr (Frag::Use == accumulator) {
       fill_data = output_acessor_t::bit_fill(value);
+    } else if constexpr (Frag::Use == matrix_a) {
+      fill_data = input_a_accessor_t::bit_fill(value);
     } else {
-      fill_data = input_acessor_t::bit_fill(value);
+      fill_data = input_b_accessor_t::bit_fill(value);
     }
     detail::unroll_for<Frag::NR>([&](auto r) {
       vreg_t tmp;
@@ -251,26 +460,26 @@ public:
       uint32_t block_idx = (cfg::a_block_size == NT) ? 0 : (lane / cfg::a_block_size);
       uint32_t lane_in_blk = (cfg::a_block_size == NT) ? lane : (lane % cfg::a_block_size);
       uint32_t block_row = (lane_in_blk / cfg::tcK) + (block_idx * cfg::tcM);
-      uint32_t block_col = (lane_in_blk % cfg::tcK) * i_ratio;
+      uint32_t block_col = (lane_in_blk % cfg::tcK) * a_i_ratio;
       uint32_t m_stride  = cfg::a_sub_blocks * cfg::tcM;
-      uint32_t k_stride  = cfg::tcK * i_ratio;
+      uint32_t k_stride  = cfg::tcK * a_i_ratio;
       if constexpr (src_layout == col_major) {
         std::swap(block_row, block_col);
       }
-      auto base = reinterpret_cast<const input_t*>(src) + block_row * ldm + block_col;
+      auto base = reinterpret_cast<const input_a_t*>(src) + block_row * ldm + block_col;
       detail::unroll_for<Frag::NR>([&](auto r) {
         uint32_t block_m  = r / cfg::k_steps;
         uint32_t block_k  = r % cfg::k_steps;
         uint32_t elem_row = block_m * m_stride;
         uint32_t elem_col = block_k * k_stride;
         if constexpr (src_layout == col_major) {
-          static_assert(input_is_subbyte == false, "col_major layout is not supported for sub-byte matrix_a");
+          static_assert(input_a_is_subbyte == false, "col_major layout is not supported for sub-byte matrix_a");
           std::swap(elem_row, elem_col);
           auto ptr = base + elem_row * ldm + elem_col;
-          if constexpr (sizeof(vreg_t) == sizeof(input_t) && !input_is_subbyte) {
+          if constexpr (sizeof(vreg_t) == sizeof(input_a_t) && !input_a_is_subbyte) {
             dst.data[r] = *reinterpret_cast<const vreg_t*>(ptr);
           } else {
-            dst.data[r] = input_acessor_t::pack_row(ptr, ldm);
+            dst.data[r] = input_a_accessor_t::pack_row(ptr, ldm);
           }
         } else {
           // raw_major layout
@@ -284,25 +493,25 @@ public:
       uint32_t block_idx = (cfg::b_block_size == NT) ? 0 : (lane / cfg::b_block_size);
       uint32_t lane_in_blk = (cfg::b_block_size == NT) ? lane : (lane % cfg::b_block_size);
       uint32_t block_col = (lane_in_blk / cfg::tcK) + (block_idx * cfg::tcN);
-      uint32_t block_row = (lane_in_blk % cfg::tcK) * i_ratio;
+      uint32_t block_row = (lane_in_blk % cfg::tcK) * b_i_ratio;
       uint32_t n_stride  = cfg::b_sub_blocks * cfg::tcN;
-      uint32_t k_stride  = cfg::tcK * i_ratio;
+      uint32_t k_stride  = cfg::tcK * b_i_ratio;
       if constexpr (src_layout == col_major) {
         std::swap(block_row, block_col);
       }
-      auto base = reinterpret_cast<const input_t*>(src) + block_row * ldm + block_col;
+      auto base = reinterpret_cast<const input_b_t*>(src) + block_row * ldm + block_col;
       detail::unroll_for<Frag::NR>([&](auto r) {
         uint32_t block_k = r / cfg::b_sub_steps;
         uint32_t block_n = r % cfg::b_sub_steps;
         uint32_t elem_row = block_k * k_stride;
         uint32_t elem_col = block_n * n_stride;
         if constexpr (src_layout == row_major) {
-          static_assert(input_is_subbyte == false, "row_major layout is not supported for sub-byte matrix_b");
+          static_assert(input_b_is_subbyte == false, "row_major layout is not supported for sub-byte matrix_b");
           auto ptr = base + elem_row * ldm + elem_col;
-          if constexpr (sizeof(vreg_t) == sizeof(input_t) && !input_is_subbyte) {
+          if constexpr (sizeof(vreg_t) == sizeof(input_b_t) && !input_b_is_subbyte) {
             dst.data[r] = *reinterpret_cast<const vreg_t*>(ptr);
           } else {
-            dst.data[r] = input_acessor_t::pack_row(ptr, ldm);
+            dst.data[r] = input_b_accessor_t::pack_row(ptr, ldm);
           }
         } else {
           // col_major layout
@@ -478,9 +687,9 @@ public:
       register float fd6 __asm__("f30");
       register float fd7 __asm__("f31");
 
-      __asm__ volatile (".insn r %[insn], 0, 2, x%[fmd], x%[fms], x0"
+      __asm__ volatile (".insn r %[insn], 0, 2, x%[fmd], x%[fma], x%[fmb]"
         : "=f"(fd0), "=f"(fd1), "=f"(fd2), "=f"(fd3), "=f"(fd4), "=f"(fd5), "=f"(fd6), "=f"(fd7)
-        : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Ot::id), [fms]"i"(It::id),
+        : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Ot::id), [fma]"i"(At::id), [fmb]"i"(Bt::id),
           "f"(fa0), "f"(fa1), "f"(fa2), "f"(fa3), "f"(fa4), "f"(fa5), "f"(fa6), "f"(fa7),
           "f"(fb0), "f"(fb1), "f"(fb2), "f"(fb3), "f"(fb4), "f"(fb5), "f"(fb6), "f"(fb7),
           "f"(fc0), "f"(fc1), "f"(fc2), "f"(fc3), "f"(fc4), "f"(fc5), "f"(fc6), "f"(fc7)
@@ -529,9 +738,9 @@ public:
       register float fd6 __asm__("f16");
       register float fd7 __asm__("f17");
 
-      __asm__ volatile (".insn r %[insn], 0, 2, x%[fmd], x%[fms], x0"
+      __asm__ volatile (".insn r %[insn], 0, 2, x%[fmd], x%[fma], x%[fmb]"
         : "=f"(fd0), "=f"(fd1), "=f"(fd2), "=f"(fd3), "=f"(fd4), "=f"(fd5), "=f"(fd6), "=f"(fd7)
-        : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Ot::id), [fms]"i"(It::id),
+        : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Ot::id), [fma]"i"(At::id), [fmb]"i"(Bt::id),
           "f"(fa0), "f"(fa1), "f"(fa2), "f"(fa3), "f"(fa4), "f"(fa5), "f"(fa6), "f"(fa7),
           "f"(fb0), "f"(fb1), "f"(fb2), "f"(fb3),
           "f"(fc0), "f"(fc1), "f"(fc2), "f"(fc3), "f"(fc4), "f"(fc5), "f"(fc6), "f"(fc7)
@@ -546,7 +755,129 @@ public:
       }
     }
   }
+
+  template <uint32_t DescId, typename FragD, typename FragA, typename FragB, typename FragC>
+  static __attribute__((always_inline)) void mma_sync(FragD &fragD, const FragA &fragA, const FragB &fragB, const FragC &fragC) {
+    static_assert(DescId < max_static_descriptor_id, "desc_id must fit in the encoded desc_id field");
+    static_assert(FragA::Use == matrix_a, "A must be matrix_a");
+    static_assert(FragB::Use == matrix_b, "B must be matrix_b");
+    static_assert(FragC::Use == accumulator, "C must be accumulator");
+    static_assert(FragD::Use == accumulator, "D must be accumulator");
+
+    register float fa0 __asm__("f0")  = fragA.data[0];
+    register float fa1 __asm__("f1")  = fragA.data[1];
+    register float fa2 __asm__("f2")  = fragA.data[2];
+    register float fa3 __asm__("f3")  = fragA.data[3];
+    register float fa4 __asm__("f4")  = fragA.data[4];
+    register float fa5 __asm__("f5")  = fragA.data[5];
+    register float fa6 __asm__("f6")  = fragA.data[6];
+    register float fa7 __asm__("f7")  = fragA.data[7];
+
+    if constexpr (FragB::NR == 8) {
+      register float fb0 __asm__("f10") = fragB.data[0];
+      register float fb1 __asm__("f11") = fragB.data[1];
+      register float fb2 __asm__("f12") = fragB.data[2];
+      register float fb3 __asm__("f13") = fragB.data[3];
+      register float fb4 __asm__("f14") = fragB.data[4];
+      register float fb5 __asm__("f15") = fragB.data[5];
+      register float fb6 __asm__("f16") = fragB.data[6];
+      register float fb7 __asm__("f17") = fragB.data[7];
+
+      float c0 = (FragC::NR > 0) ? fragC.data[0] : 0.0f;
+      float c1 = (FragC::NR > 1) ? fragC.data[1] : 0.0f;
+      float c2 = (FragC::NR > 2) ? fragC.data[2] : 0.0f;
+      float c3 = (FragC::NR > 3) ? fragC.data[3] : 0.0f;
+      float c4 = (FragC::NR > 4) ? fragC.data[4] : 0.0f;
+      float c5 = (FragC::NR > 5) ? fragC.data[5] : 0.0f;
+      float c6 = (FragC::NR > 6) ? fragC.data[6] : 0.0f;
+      float c7 = (FragC::NR > 7) ? fragC.data[7] : 0.0f;
+      register float fc0 __asm__("f24") = c0;
+      register float fc1 __asm__("f25") = c1;
+      register float fc2 __asm__("f26") = c2;
+      register float fc3 __asm__("f27") = c3;
+      register float fc4 __asm__("f28") = c4;
+      register float fc5 __asm__("f29") = c5;
+      register float fc6 __asm__("f30") = c6;
+      register float fc7 __asm__("f31") = c7;
+
+      register float fd0 __asm__("f24");
+      register float fd1 __asm__("f25");
+      register float fd2 __asm__("f26");
+      register float fd3 __asm__("f27");
+      register float fd4 __asm__("f28");
+      register float fd5 __asm__("f29");
+      register float fd6 __asm__("f30");
+      register float fd7 __asm__("f31");
+
+      __asm__ volatile (".insn r %[insn], 0, 4, x%[desc_id], x0, x0"
+        : "=f"(fd0), "=f"(fd1), "=f"(fd2), "=f"(fd3), "=f"(fd4), "=f"(fd5), "=f"(fd6), "=f"(fd7)
+        : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId),
+          "f"(fa0), "f"(fa1), "f"(fa2), "f"(fa3), "f"(fa4), "f"(fa5), "f"(fa6), "f"(fa7),
+          "f"(fb0), "f"(fb1), "f"(fb2), "f"(fb3), "f"(fb4), "f"(fb5), "f"(fb6), "f"(fb7),
+          "f"(fc0), "f"(fc1), "f"(fc2), "f"(fc3), "f"(fc4), "f"(fc5), "f"(fc6), "f"(fc7)
+      );
+
+      if constexpr (FragD::NR == 8) {
+        fragD.data = {fd0, fd1, fd2, fd3, fd4, fd5, fd6, fd7};
+      } else {
+        static_assert(FragD::NR == 4, "Unsupported accumulator register count");
+        fragD.data = {fd0, fd1, fd2, fd3};
+      }
+    } else {
+      static_assert(FragB::NR == 4, "Unsupported number of registers for FragB");
+      register float fb0 __asm__("f28") = fragB.data[0];
+      register float fb1 __asm__("f29") = fragB.data[1];
+      register float fb2 __asm__("f30") = fragB.data[2];
+      register float fb3 __asm__("f31") = fragB.data[3];
+
+      float c0 = (FragC::NR > 0) ? fragC.data[0] : 0.0f;
+      float c1 = (FragC::NR > 1) ? fragC.data[1] : 0.0f;
+      float c2 = (FragC::NR > 2) ? fragC.data[2] : 0.0f;
+      float c3 = (FragC::NR > 3) ? fragC.data[3] : 0.0f;
+      float c4 = (FragC::NR > 4) ? fragC.data[4] : 0.0f;
+      float c5 = (FragC::NR > 5) ? fragC.data[5] : 0.0f;
+      float c6 = (FragC::NR > 6) ? fragC.data[6] : 0.0f;
+      float c7 = (FragC::NR > 7) ? fragC.data[7] : 0.0f;
+      register float fc0 __asm__("f10") = c0;
+      register float fc1 __asm__("f11") = c1;
+      register float fc2 __asm__("f12") = c2;
+      register float fc3 __asm__("f13") = c3;
+      register float fc4 __asm__("f14") = c4;
+      register float fc5 __asm__("f15") = c5;
+      register float fc6 __asm__("f16") = c6;
+      register float fc7 __asm__("f17") = c7;
+
+      register float fd0 __asm__("f10");
+      register float fd1 __asm__("f11");
+      register float fd2 __asm__("f12");
+      register float fd3 __asm__("f13");
+      register float fd4 __asm__("f14");
+      register float fd5 __asm__("f15");
+      register float fd6 __asm__("f16");
+      register float fd7 __asm__("f17");
+
+      __asm__ volatile (".insn r %[insn], 0, 4, x%[desc_id], x0, x0"
+        : "=f"(fd0), "=f"(fd1), "=f"(fd2), "=f"(fd3), "=f"(fd4), "=f"(fd5), "=f"(fd6), "=f"(fd7)
+        : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId),
+          "f"(fa0), "f"(fa1), "f"(fa2), "f"(fa3), "f"(fa4), "f"(fa5), "f"(fa6), "f"(fa7),
+          "f"(fb0), "f"(fb1), "f"(fb2), "f"(fb3),
+          "f"(fc0), "f"(fc1), "f"(fc2), "f"(fc3), "f"(fc4), "f"(fc5), "f"(fc6), "f"(fc7)
+      );
+
+      if constexpr (FragD::NR == 8) {
+        fragD.data = {fd0, fd1, fd2, fd3, fd4, fd5, fd6, fd7};
+      } else {
+        static_assert(FragD::NR == 4, "Unsupported accumulator register count");
+        fragD.data = {fd0, fd1, fd2, fd3};
+      }
+    }
+  }
 };
+
+template <uint32_t NT,
+          typename It,
+          typename Ot>
+using wmma_context = wmma_context_ab<NT, It, It, Ot>;
 
 } // namespace tensor
 } // namespace vortex

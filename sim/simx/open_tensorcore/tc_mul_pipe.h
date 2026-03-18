@@ -10,6 +10,7 @@ struct {
     uint32_t a_fp9;
     uint32_t b_fp9;
     bool input_valid;
+    TensorCoreMeta meta;
 } mul_input;
 
 // ===================================
@@ -23,6 +24,7 @@ uint32_t a_val;
 uint32_t b_val;
 uint32_t c_in;
 bool valid;
+TensorCoreMeta meta;
 } r1;
 
 // register 2
@@ -30,6 +32,7 @@ struct {
 fmul_s2_out s2_result;
 uint32_t c_in;
 bool valid;
+TensorCoreMeta meta;
 } r2;
 
 // register 3
@@ -37,6 +40,7 @@ struct {
 uint32_t result;
 uint32_t c_in;
 bool valid;
+TensorCoreMeta meta;
 } r3;
 
 void reset(){
@@ -44,6 +48,7 @@ void reset(){
     r2.valid = false;
     r3.valid = false;
     mul_input.input_valid = false;
+    mul_input.meta = {};
 }
 
 // ===================================
@@ -65,6 +70,10 @@ const uint32_t& out_data() const{
     return r3.result;
 }
 
+const TensorCoreMeta& out_meta() const{
+    return r3.meta;
+}
+
 void tick(bool out_ready ,const Config& g_cfg ,uint32_t& c_in){
 bool s3_ready = out_ready || !r3.valid;
 bool s2_ready = s3_ready || !r2.valid;
@@ -74,8 +83,10 @@ if (s3_ready){
         r3.result = fmul_s3(r2.s2_result, 5, 8);
         r3.c_in = r2.c_in;
         r3.valid = true;
+        r3.meta = r2.meta;
     }else{
         r3.valid = false;
+        r3.meta = {};
     }
 }
 
@@ -84,8 +95,10 @@ if (s2_ready){
         r2.s2_result = fmul_s2(r1.a_val, r1.b_val, 5, 8, r1.s1_result);
         r2.c_in = r1.c_in;
         r2.valid = true;
+        r2.meta = r1.meta;
     }else{
         r2.valid = false;
+        r2.meta = {};
     }
 }
 
@@ -98,8 +111,10 @@ if (s1_ready){
         r1.c_in = c_in;
         r1.s1_result = fmul_s1(r1.a_val, r1.b_val, 5, 8, g_cfg.rm);
         r1.valid = true;
+        r1.meta = mul_input.meta;
     }else{
         r1.valid = false;
+        r1.meta = {};
     }
 }
 

@@ -19,6 +19,7 @@ import subprocess
 import struct
 import sys
 import re
+import tempfile
 
 def get_vma_size(elf_file):
     try:
@@ -54,25 +55,29 @@ def create_vxbin_binary(input_elf, output_bin, objcopy_path):
     min_vma, max_vma = get_vma_size(input_elf)
 
     # Create a binary data from the ELF file using objcopy
-    temp_bin_path = '/tmp/temp_kernel.bin'
-    subprocess.check_call([objcopy_path, '-O', 'binary', input_elf, temp_bin_path])
+    temp_bin_path = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix='vxbin_', suffix='.bin', delete=False) as temp_file:
+            temp_bin_path = temp_file.name
 
-    # Read the binary file to determine its size
-    with open(temp_bin_path, 'rb') as temp_file:
-        binary_data = temp_file.read()
+        subprocess.check_call([objcopy_path, '-O', 'binary', input_elf, temp_bin_path])
 
-    # Pack addresses into 64-bit unsigned integer
-    min_vma_bytes = struct.pack('<Q', min_vma)
-    max_vma_bytes = struct.pack('<Q', max_vma)
+        # Read the binary file to determine its size
+        with open(temp_bin_path, 'rb') as temp_file:
+            binary_data = temp_file.read()
 
-    # Write the total size and binary data to the final output file
-    with open(output_bin, 'wb') as bin_file:
-        bin_file.write(min_vma_bytes)
-        bin_file.write(max_vma_bytes)
-        bin_file.write(binary_data)
+        # Pack addresses into 64-bit unsigned integer
+        min_vma_bytes = struct.pack('<Q', min_vma)
+        max_vma_bytes = struct.pack('<Q', max_vma)
 
-    # Remove the temporary binary file
-    os.remove(temp_bin_path)
+        # Write the total size and binary data to the final output file
+        with open(output_bin, 'wb') as bin_file:
+            bin_file.write(min_vma_bytes)
+            bin_file.write(max_vma_bytes)
+            bin_file.write(binary_data)
+    finally:
+        if temp_bin_path is not None and os.path.exists(temp_bin_path):
+            os.remove(temp_bin_path)
     # print("Binary created successfully: {}, min_vma={:x}, max_vma={:x}".format(output_bin, min_vma, max_vma))
 
 if __name__ == '__main__':

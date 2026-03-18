@@ -28,6 +28,7 @@ public:
   struct ExeTraceData : public ITraceData {
     using Ptr = std::shared_ptr<ExeTraceData>;
     bool rd_write = false;
+    bool retry = false;
   };
 
 	struct PerfStats {
@@ -63,17 +64,15 @@ public:
                  IntrTcuArgs args,
                  ExeTraceData* trace_data);
 
-	void wmma(uint32_t wid,
-			 	    uint32_t fmt_ab,
-						uint32_t fmt_c,
-			 	    uint32_t step_m,
-						uint32_t step_n,
-            uint32_t step_k,
+  void wmma(uint32_t wid,
+            IntrTcuArgs args,
 	          const std::vector<reg_data_t>& rs1_data,
-					  const std::vector<reg_data_t>& rs2_data,
-					  const std::vector<reg_data_t>& rs3_data,
-					  std::vector<reg_data_t>& rd_data,
-					  ExeTraceData* trace_data);
+	          const std::vector<reg_data_t>& rs2_data,
+	          const std::vector<reg_data_t>& rs3_data,
+	          std::vector<reg_data_t>& rd_data,
+	          ExeTraceData* trace_data);
+
+  uint32_t scheduler_score(uint32_t wid, TcuType tcu_type, IntrTcuArgs args) const;
 
 	const PerfStats& perf_stats() const;
 

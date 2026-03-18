@@ -1,7 +1,7 @@
 ROOT_DIR := $(realpath ../../..)
 include $(ROOT_DIR)/config.mk
 
-PROJECT := sgemm_tcu_tmem
+PROJECT := tcu_mbarrier_async
 ITYPE ?= fp16
 ATYPE ?= $(ITYPE)
 BTYPE ?= $(ITYPE)

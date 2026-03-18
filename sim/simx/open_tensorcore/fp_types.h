@@ -12,7 +12,7 @@
 enum RoundingMode : uint8_t { RNE=0, RTZ=1, RDN=2, RUP=3, RMM=4 };
 
 // Precision type identifiers
-enum PrecisionType { PREC_FP4_E2M1, PREC_FP8_E4M3, PREC_FP8_E5M2, PREC_FP16, PREC_FP32 };
+enum PrecisionType { PREC_FP4_E2M1, PREC_FP8_E4M3, PREC_FP8_E5M2, PREC_FP9, PREC_FP16, PREC_FP32 };
 
 // ─────────────────────────────────────────────────────────────
 //  Leading-zero counter 
@@ -244,6 +244,7 @@ inline uint16_t convert_to_fp9(uint32_t raw_bits, PrecisionType prec) {
         case PREC_FP4_E2M1: return fp4_to_fp9(raw_bits & 0xF);
         case PREC_FP8_E4M3: return fp8_e4m3_to_fp9(raw_bits & 0xFF);
         case PREC_FP8_E5M2: return fp8_e5m2_to_fp9(raw_bits & 0xFF);
+        case PREC_FP9:      return raw_bits & 0x1FF;
         case PREC_FP16:     return fp16_to_fp9(raw_bits & 0xFFFF);
         default: return 0;
     }
@@ -305,6 +306,35 @@ inline uint32_t fp16_to_fp22(uint16_t fp16) {
         return (s << 21) | (ne << 13) | ((((m << (1+lz)) & 0x3FF) << 3) & 0x1FFF);
     }
     return (s << 21) | ((e + 112) << 13) | ((m << 3) & 0x1FFF);
+}
+
+inline uint32_t fp32_to_fp22(uint32_t fp32) {
+    bool s = (fp32 >> 31) & 1;
+    int e = (fp32 >> 23) & 0xFF;
+    uint32_t m = fp32 & 0x7FFFFF;
+    if (e == 0 && m == 0) return (s << 21);
+    if (e == 0xFF) return (s << 21) | (0xFF << 13) | (m ? 0x1000 : 0);
+    if (e == 0) {
+        int lz = clz(m, 23);
+        int ne = -126 - lz + 127;
+        if (ne <= 0) return (s << 21) | ((m << (1 + lz)) >> 10);
+        return (s << 21) | (ne << 13) | ((((m << (1 + lz)) & 0x7FFFFF) >> 10) & 0x1FFF);
+    }
+    uint32_t fp22m = (m >> 10) & 0x1FFF;
+    bool g = (m >> 9) & 1;
+    bool r = (m >> 8) & 1;
+    bool st = (m & 0xFF) != 0;
+    if (g && (r || st || (fp22m & 1))) {
+        fp22m++;
+        if (fp22m >= (1u << 13)) {
+            fp22m = 0;
+            e++;
+            if (e >= 0xFF) {
+                return (s << 21) | (0xFF << 13);
+            }
+        }
+    }
+    return (s << 21) | (e << 13) | fp22m;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -399,6 +429,7 @@ inline uint32_t convert_c_to_fp22(uint32_t raw_bits, PrecisionType prec) {
         case PREC_FP8_E4M3: return fp9_to_fp22(fp8_e4m3_to_fp9(raw_bits & 0xFF));
         case PREC_FP8_E5M2: return fp9_to_fp22(fp8_e5m2_to_fp9(raw_bits & 0xFF));
         case PREC_FP16:     return fp16_to_fp22(raw_bits & 0xFFFF);
+        case PREC_FP32:     return fp32_to_fp22(raw_bits);
         case PREC_FP4_E2M1: return fp9_to_fp22(fp4_to_fp9(raw_bits & 0xF));
         default: return 0;
     }

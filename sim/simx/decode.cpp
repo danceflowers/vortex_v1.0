@@ -24,6 +24,7 @@
 #include "debug.h"
 #include "types.h"
 #include "emulator.h"
+#include "core.h"
 #include "arch.h"
 #include "instr.h"
 
@@ -1083,7 +1084,8 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
       case 0: { // WMMA
         namespace vt = vortex::tensor;
         auto fmt_c = rd;
-        auto fmt_ab = rs1;
+        auto fmt_a = rs1;
+        auto fmt_b = rs2;
 
         auto emit_wmma = [&](auto cfg_tag) {
           using cfg = decltype(cfg_tag);
@@ -1105,8 +1107,16 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
                 uint64_t uuid_x = (static_cast<uint64_t>(uuid_hi) << 32) | uuid_lo_x;
                 ++steps;
                 auto instr = std::allocate_shared<Instr>(instr_pool_, uuid_x, FUType::TCU);
+                IntrTcuArgs args{};
+                args.fmt_ab = (fmt_a == fmt_b) ? fmt_a : 0;
+                args.fmt_a = fmt_a;
+                args.fmt_b = fmt_b;
+                args.fmt_c = fmt_c;
+                args.step_m = m;
+                args.step_n = n;
+                args.step_k = k;
                 instr->setOpType(TcuType::WMMA);
-                instr->setArgs(IntrTcuArgs{fmt_ab, fmt_c, m, n, k});
+                instr->setArgs(args);
                 instr->setDestReg(rs3, RegType::Float);
                 instr->setSrcReg(0, rs1, RegType::Float);
                 instr->setSrcReg(1, rs2, RegType::Float);
@@ -1117,26 +1127,18 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
           }
         };
 
+        bool supported_a = (fmt_a == vt::fp8::id || fmt_a == vt::fp16::id);
+        bool supported_b = (fmt_b == vt::fp8::id || fmt_b == vt::fp16::id);
+        if (!supported_a || !supported_b) {
+          std::abort();
+        }
+
         if (fmt_c == vt::fp16::id) {
-          switch (fmt_ab) {
-          case vt::fp8::id:
-            emit_wmma(vt::wmma_config_t<NUM_THREADS, vt::fp8, vt::fp16>{});
-            break;
-          case vt::fp16::id:
-          default:
-            emit_wmma(vt::wmma_config_t<NUM_THREADS, vt::fp16, vt::fp16>{});
-            break;
-          }
+          emit_wmma(vt::wmma_config_t<NUM_THREADS, vt::fp16, vt::fp16>{});
+        } else if (fmt_c == vt::fp32::id) {
+          emit_wmma(vt::wmma_config_t<NUM_THREADS, vt::fp16, vt::fp32>{});
         } else {
-          switch (fmt_ab) {
-          case vt::fp8::id:
-            emit_wmma(vt::wmma_config_t<NUM_THREADS, vt::fp8, vt::fp32>{});
-            break;
-          case vt::fp16::id:
-          default:
-            emit_wmma(vt::wmma_config_t<NUM_THREADS, vt::fp16, vt::fp32>{});
-            break;
-          }
+          std::abort();
         }
       } break;
       case 1: { // TMEM_ALLOC
@@ -1156,11 +1158,10 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
       } break;
       case 3: { // TMA_LOAD
         auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        IntrTcuArgs args{};
+        args.transpose_b = static_cast<uint8_t>(funct2 & 0x1);
         instr->setOpType(TcuType::TMA_LOAD);
-        instr->setArgs(IntrTcuArgs{
-          0, 0, 0, 0, 0, 0, 0, 0, 0,
-          0, static_cast<uint8_t>(funct2 & 0x1)
-        });
+        instr->setArgs(args);
         instr->setDestReg(rd, RegType::Integer);
         instr->setSrcReg(0, rs1, RegType::Integer);
         instr->setSrcReg(1, rs2, RegType::Integer);
@@ -1176,40 +1177,33 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
         ibuffer.push_back(instr);
       } break;
       case 5: { // MMA_LOAD
-        namespace vt = vortex::tensor;
         auto emit_fill = [&](TcuTarget target) {
           auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+          IntrTcuArgs args{};
+          args.fmt_ab = rd;
+          args.fmt_a = rd;
+          args.fmt_b = rd;
+          args.fmt_c = rs2;
+          args.ws = static_cast<uint8_t>(funct2 & 0x1);
+          args.target = target;
           instr->setOpType(TcuType::MMA_LOAD);
-          instr->setArgs(IntrTcuArgs{
-            rd,
-            rs2,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            static_cast<uint8_t>(funct2 & 0x1),
-            0,
-            target
-          });
+          instr->setArgs(args);
           instr->setSrcReg(0, rs1, RegType::Integer);
           ibuffer.push_back(instr);
         };
         emit_fill(TcuTarget::A);
-        if ((funct2 & 0x1) == 0) {
-          emit_fill(TcuTarget::B);
-        }
+        emit_fill(TcuTarget::B);
         emit_fill(TcuTarget::C);
       } break;
       case 6: { // MMA_STORE
         auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        IntrTcuArgs args{};
+        args.fmt_ab = rs2;
+        args.fmt_a = rs2;
+        args.fmt_b = rs2;
+        args.fmt_c = rd;
         instr->setOpType(TcuType::MMA_STORE);
-        instr->setArgs(IntrTcuArgs{
-          rs2,
-          rd
-        });
+        instr->setArgs(args);
         instr->setSrcReg(0, rs1, RegType::Integer);
         ibuffer.push_back(instr);
       } break;
@@ -1218,6 +1212,155 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
         instr->setOpType(TcuType::TMA_WAIT);
         instr->setArgs(IntrTcuArgs{});
         instr->setSrcReg(0, rs1, RegType::Integer);
+        ibuffer.push_back(instr);
+      } break;
+      default:
+        std::abort();
+      }
+    } break;
+    case 4: {
+      auto decode_macro_target = [&](uint32_t reg) {
+        switch (reg) {
+        case 0:
+          return TcuTarget::None;
+        case 1:
+          return TcuTarget::A;
+        case 2:
+          return TcuTarget::B;
+        case 3:
+          return TcuTarget::C;
+        default:
+          std::abort();
+        }
+      };
+      switch (funct3) {
+      case 0: { // WMMA using preloaded desc_id
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        IntrTcuArgs args{};
+        args.descriptor = rd;
+        args.macro_op = 1;
+        instr->setOpType(TcuType::WMMA);
+        instr->setArgs(args);
+        ibuffer.push_back(instr);
+      } break;
+      case 5: { // MMA_LOAD using preloaded desc_id
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        IntrTcuArgs args{};
+        args.descriptor = rd;
+        args.macro_op = 1;
+        args.target = decode_macro_target(rs2);
+        instr->setOpType(TcuType::MMA_LOAD);
+        instr->setArgs(args);
+        instr->setSrcReg(0, rs1, RegType::Integer);
+        ibuffer.push_back(instr);
+      } break;
+      case 6: { // MMA_STORE using preloaded desc_id
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        IntrTcuArgs args{};
+        args.descriptor = rd;
+        args.macro_op = 1;
+        args.target = decode_macro_target(rs2);
+        instr->setOpType(TcuType::MMA_STORE);
+        instr->setArgs(args);
+        instr->setSrcReg(0, rs1, RegType::Integer);
+        ibuffer.push_back(instr);
+      } break;
+      default:
+        std::abort();
+      }
+    } break;
+    case 34:
+    case 66:
+    case 98: {
+      if (funct3 != 5) {
+        std::abort();
+      }
+      auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+      IntrTcuArgs args{};
+      switch (funct7) {
+      case 34:
+        args.fmt_a = rd;
+        args.target = TcuTarget::A;
+        break;
+      case 66:
+        args.fmt_b = rd;
+        args.target = TcuTarget::B;
+        break;
+      case 98:
+        args.fmt_c = rd;
+        args.target = TcuTarget::C;
+        break;
+      default:
+        std::abort();
+      }
+      instr->setOpType(TcuType::MMA_LOAD);
+      instr->setArgs(args);
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    case 3: {
+      switch (funct3) {
+      case 0: { // TMEM_REL_PERMIT
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::TMEM_REL_PERMIT);
+        instr->setArgs(IntrTcuArgs{});
+        ibuffer.push_back(instr);
+      } break;
+      case 1: { // TC_COMMIT
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::TC_COMMIT);
+        instr->setArgs(IntrTcuArgs{});
+        if (rd != 0) {
+          instr->setDestReg(rd, RegType::Integer);
+        }
+        instr->setSrcReg(0, rs1, RegType::Integer);
+        ibuffer.push_back(instr);
+      } break;
+      case 2: { // TC_FENCE
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        IntrTcuArgs args{};
+        // Encode fence mode in rd because funct7=3 reserves the funct2 bits.
+        args.fence_mode = (rd != 0) ? TcuFenceMode::After : TcuFenceMode::Before;
+        instr->setOpType(TcuType::TC_FENCE);
+        instr->setArgs(args);
+        ibuffer.push_back(instr);
+      } break;
+      case 3: { // TMEM_SHIFT
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::TMEM_SHIFT);
+        instr->setArgs(IntrTcuArgs{});
+        if (rd != 0) {
+          instr->setDestReg(rd, RegType::Integer);
+        }
+        instr->setSrcReg(0, rs1, RegType::Integer);
+        ibuffer.push_back(instr);
+      } break;
+      case 4: { // MBAR_INIT
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::MBAR_INIT);
+        instr->setArgs(IntrTcuArgs{});
+        instr->setSrcReg(0, rs1, RegType::Integer);
+        instr->setSrcReg(1, rs2, RegType::Integer);
+        ibuffer.push_back(instr);
+      } break;
+      case 5: { // MBAR_ARRIVE
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::MBAR_ARRIVE);
+        instr->setArgs(IntrTcuArgs{});
+        instr->setSrcReg(0, rs1, RegType::Integer);
+        ibuffer.push_back(instr);
+      } break;
+      case 6: { // MBAR_WAIT
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::MBAR_WAIT);
+        instr->setArgs(IntrTcuArgs{});
+        instr->setSrcReg(0, rs1, RegType::Integer);
+        ibuffer.push_back(instr);
+      } break;
+      case 7: { // TC_WAIT
+        auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
+        instr->setOpType(TcuType::TC_WAIT);
+        instr->setArgs(IntrTcuArgs{});
         ibuffer.push_back(instr);
       } break;
       default:

@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <vector>
 #include <simobject.h>
+#include <tensor_cfg.h>
 #include "types.h"
 #include "emulator.h"
 #include "pipeline.h"
@@ -127,7 +128,11 @@ public:
 
   bool running() const;
 
+  void suspend(uint32_t wid, WarpStallReason reason);
+
   void resume(uint32_t wid);
+
+  void set_stall_reason(uint32_t wid, WarpStallReason reason);
 
   bool barrier(uint32_t bar_id, uint32_t count, uint32_t wid);
 
@@ -166,6 +171,14 @@ public:
     return tensor_unit_;
   }
 
+  // 16 banks is enough to keep two resident fp16->fp32 tiles without overdriving shared tensor/TMA resources.
+  static constexpr uint32_t kTmemNumBanks = 16;
+  static constexpr uint32_t kTmemBankSize = 256;
+  // Model TMA loads as off-chip bulk transfers instead of immediate next-cycle completion.
+  static constexpr uint32_t kTmaLoadBaseLatency = 24;
+  static constexpr uint32_t kTmaLoadBytesPerCycle = 64;
+  static constexpr uint32_t kTmaTransposePenalty = 8;
+
   struct TmemPacket {
     std::array<uint8_t, 64> bytes;
 
@@ -182,16 +195,47 @@ public:
     uint16_t cols = 0;
     uint16_t elem_bytes = 0;
     uint16_t flags = 0;
+    uint16_t tmem_base = 0;
+    uint16_t meta_tmem_base = 0;
+    uint16_t bank_span = 0;
+    uint16_t meta_bank_span = 0;
+    uint8_t tile_role = static_cast<uint8_t>(TcuTarget::None);
+    uint8_t payload_kind = static_cast<uint8_t>(TcuPayloadKind::Dense);
+    uint8_t reserved[14] = {};
+  } __attribute__((packed));
+
+  struct MmaDescriptor {
+    uint32_t fmt_a = 0;
+    uint32_t fmt_b = 0;
+    uint32_t fmt_c = 0;
+    uint8_t ws = 0;
+    uint8_t sp = 0;
+    uint8_t sparse_mode = 0;
+    uint8_t reserved = 0;
   } __attribute__((packed));
 
   uint32_t tmem_alloc(uint32_t bank_span);
   bool tmem_free(uint32_t handle);
-  uint32_t tma_load(uint32_t handle, uint64_t desc_addr, bool transpose_b);
-  uint32_t tma_store(uint32_t handle, uint64_t desc_addr);
-  bool tma_wait(uint32_t async_id);
+  void tmem_rel_permit();
+  uint32_t tma_load(uint32_t wid, uint32_t handle, uint32_t desc_id, bool transpose_b);
+  uint32_t tma_store(uint32_t wid, uint32_t handle, uint32_t desc_id);
+  uint32_t tmem_shift(uint32_t wid, uint32_t handle);
+  uint32_t mma_load_async_issue(uint32_t wid, uint32_t handle, uint32_t desc_id);
+  uint32_t mma_store_async_issue(uint32_t wid, uint32_t handle, uint32_t desc_id);
+  uint32_t wmma_async_issue(uint32_t wid);
+  void async_tensor_complete(uint32_t async_id);
+  uint32_t tc_commit(uint32_t wid, uint32_t barrier_id);
+  bool tc_fence(uint32_t wid, TcuFenceMode mode);
+  bool tc_wait(uint32_t wid);
+  bool mbarrier_init(uint32_t barrier_id, uint32_t count);
+  void mbarrier_arrive(uint32_t barrier_id);
+  bool mbarrier_wait(uint32_t wid, uint32_t barrier_id);
+  bool tma_wait(uint32_t wid, uint32_t async_id);
   bool tmem_read_packet(uint32_t handle, uint32_t packet_idx, TmemPacket* out);
   bool tmem_write_packet(uint32_t handle, uint32_t packet_idx, const TmemPacket& in);
   bool tmem_query(uint32_t handle, uint32_t* bank_span, uint32_t* size_bytes) const;
+  bool read_mma_descriptor(uint32_t desc_id, MmaDescriptor* out);
+  bool read_tma_descriptor(uint32_t desc_id, TmaDescriptor* out);
 #endif
 
 #ifdef EXT_V_ENABLE
@@ -258,28 +302,86 @@ private:
   PoolAllocator<instr_trace_t, 64> trace_pool_;
 
 #ifdef EXT_TCU_ENABLE
-  struct TmaRequest {
-    uint32_t async_id = 0;
-    uint32_t handle = 0;
-    uint64_t desc_addr = 0;
-    uint64_t ready_cycle = 0;
-    bool transpose_b = false;
-    bool is_store = false;
-    bool completed = false;
+  struct TmemAllocation {
+    bool valid = false;
+    uint32_t start_bank = 0;
+    uint32_t bank_span = 0;
+    uint32_t row_bytes = 64;
   };
 
-  std::array<std::array<uint8_t, 256>, 8> tmem_banks_;
-  std::array<bool, 8> tmem_bank_allocs_;
-  std::unordered_map<uint32_t, TmaRequest> pending_tma_reqs_;
+  enum class AsyncTensorOpType : uint8_t {
+    TmaLoad = 0,
+    TmaStore,
+    TmemShift,
+    MmaLoad,
+    MmaStore,
+    Wmma,
+  };
+
+  struct AsyncTensorOp {
+    uint32_t async_id = 0;
+    AsyncTensorOpType type = AsyncTensorOpType::TmaLoad;
+    uint32_t wid = 0;
+    uint32_t handle = 0;
+    uint32_t descriptor_id = 0;
+    uint64_t ready_cycle = 0;
+    bool transpose_b = false;
+    bool completed = false;
+    bool committed = false;
+    uint32_t barrier_id = 0;
+  };
+
+  struct MBarrierEntry {
+    bool valid = false;
+    bool phase_done = false;
+    uint32_t phase = 0;
+    uint32_t expected_arrivals = 0;
+    uint32_t pending_arrivals = 0;
+    uint32_t pending_tx = 0;
+    WarpMask waiters_bitmap;
+  };
+
+  struct FenceWaitState {
+    bool active = false;
+    TcuFenceMode mode = TcuFenceMode::Before;
+  };
+
+  std::array<std::array<uint8_t, kTmemBankSize>, kTmemNumBanks> tmem_banks_;
+  std::array<bool, kTmemNumBanks> tmem_bank_allocs_;
+  std::unordered_map<uint32_t, TmemAllocation> tmem_allocations_;
+  std::vector<TmaDescriptor> tma_desc_table_;
+  std::vector<MmaDescriptor> mma_desc_table_;
+  std::unordered_map<uint32_t, AsyncTensorOp> async_tensor_ops_;
+  std::unordered_map<uint32_t, WarpMask> async_tensor_waiters_;
+  std::vector<MBarrierEntry> mbarriers_;
+  std::vector<std::unordered_map<uint32_t, uint32_t>> mbarrier_wait_targets_;
+  std::vector<FenceWaitState> fence_wait_states_;
   uint32_t next_async_id_;
+  bool descriptor_tables_loaded_;
+  bool tmem_allocator_sealed_;
+  bool realistic_tma_load_;
 
   static uint32_t pack_tmem_handle(uint32_t start_bank, uint32_t bank_span);
   static bool unpack_tmem_handle(uint32_t handle, uint32_t* start_bank, uint32_t* bank_span);
-  bool read_tma_descriptor(uint64_t desc_addr, TmaDescriptor* out);
-  void advance_tma_requests();
-  void process_tma_request(TmaRequest& req);
+  bool ensure_descriptor_tables_loaded();
+  uint32_t estimate_tma_load_latency(const TmaDescriptor& desc, bool transpose_b) const;
+  void advance_async_tensor_ops();
+  void process_async_tensor_op(AsyncTensorOp& op);
+  void finalize_async_tensor_op(AsyncTensorOp& op);
+  void resume_async_waiters(uint32_t async_id);
+  void try_resume_fence_waiters();
+  bool has_pending_async_ops(uint32_t wid, bool committed_only) const;
+  bool has_pending_local_tensor_ops(uint32_t wid) const;
+  void try_complete_mbarrier(uint32_t barrier_id);
+  void mark_mbarrier_phase_active(uint32_t barrier_id);
+  bool tmem_region_query(uint32_t start_bank, uint32_t bank_span, uint32_t* size_bytes) const;
+  bool tmem_region_copy_in(uint32_t start_bank, uint32_t bank_span, const uint8_t* data, uint32_t size_bytes);
+  bool tmem_region_copy_out(uint32_t start_bank, uint32_t bank_span, uint8_t* data, uint32_t size_bytes) const;
+  bool tmem_region_shift_down(uint32_t start_bank, uint32_t bank_span, uint32_t row_bytes);
   bool tmem_copy_in(uint32_t handle, const uint8_t* data, uint32_t size_bytes);
   bool tmem_copy_out(uint32_t handle, uint8_t* data, uint32_t size_bytes) const;
+  bool lookup_tmem_allocation(uint32_t handle, TmemAllocation** allocation);
+  bool lookup_tmem_allocation(uint32_t handle, const TmemAllocation** allocation) const;
 #endif
 
   friend class LsuUnit;

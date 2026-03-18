@@ -28,9 +28,10 @@ typedef vortex::tensor::descriptor_table_arg_t descriptor_table_arg_t;
 
 typedef struct {
   descriptor_table_arg_t desc_tables;
-  uint32_t grid_dim[2];
   uint32_t block_dim[2];
-  uint32_t bank_span;
+  uint32_t a_bank_span;
+  uint32_t b_bank_span;
+  uint32_t c_bank_span;
 } kernel_arg_t;
 
 typedef struct __attribute__((packed)) {

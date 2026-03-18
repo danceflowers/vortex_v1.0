@@ -82,6 +82,7 @@ Emulator::Emulator(const Arch &arch, const DCRS &dcrs, Core* core)
     , dcrs_(dcrs)
     , core_(core)
     , warps_(arch.num_warps(), arch.num_threads())
+    , stall_reasons_(arch.num_warps(), WarpStallReason::None)
     , barriers_(arch.num_barriers(), 0)
     , ipdom_size_(arch.num_threads()-1)
   #ifdef EXT_TCU_ENABLE
@@ -93,6 +94,7 @@ Emulator::Emulator(const Arch &arch, const DCRS &dcrs, Core* core)
 {
   std::srand(50);
   last_instr_retired_ = true;
+  next_warp_rr_ = 0;
   this->reset();
 }
 
@@ -123,11 +125,14 @@ void Emulator::reset() {
   vec_unit_->reset();
 #endif
 
+  startup_arg_ = startup_arg;
   csr_mscratch_ = startup_arg;
 
   stalled_warps_.reset();
+  std::fill(stall_reasons_.begin(), stall_reasons_.end(), WarpStallReason::None);
   active_warps_.reset();
   last_instr_retired_ = true;
+  next_warp_rr_ = 0;
 
   // activate first warp and thread
   active_warps_.set(0);
@@ -170,20 +175,43 @@ instr_trace_t* Emulator::step() {
     }
     wspawn_.valid = false;
     stalled_warps_.reset(0);
+    stall_reasons_.at(0) = WarpStallReason::None;
   }
 
-  // find next ready warp
-  for (size_t wid = 0, nw = arch_.num_warps(); wid < nw; ++wid) {
-    bool warp_active = active_warps_.test(wid);
-    bool warp_stalled = stalled_warps_.test(wid);
-    if (warp_active && !warp_stalled) {
+  uint32_t best_score = 0;
+  const auto nw = arch_.num_warps();
+
+  // round-robin over non-stalled warps, but prefer warps that can make forward
+  // progress on tensor macro-ops in the current cycle.
+  for (uint32_t offset = 0; offset < nw; ++offset) {
+    uint32_t wid = (next_warp_rr_ + offset) % nw;
+    if (!active_warps_.test(wid) || stalled_warps_.test(wid)) {
+      continue;
+    }
+
+    uint32_t score = 1;
+#ifdef EXT_TCU_ENABLE
+    auto& warp = warps_.at(wid);
+    if (!warp.ibuffer.empty()) {
+      const auto& instr = *warp.ibuffer.front();
+      if (std::holds_alternative<TcuType>(instr.getOpType())
+       && std::holds_alternative<IntrTcuArgs>(instr.getArgs())) {
+        auto tcu_type = std::get<TcuType>(instr.getOpType());
+        auto tcu_args = std::get<IntrTcuArgs>(instr.getArgs());
+        score = tensor_unit_->scheduler_score(wid, tcu_type, tcu_args);
+      }
+    }
+#endif
+    if (score > best_score) {
+      best_score = score;
       scheduled_warp = wid;
-      break;
     }
   }
 
   if (scheduled_warp == -1)
     return nullptr;
+
+  next_warp_rr_ = (scheduled_warp + 1) % nw;
 
   // get scheduled warp
   auto& warp = warps_.at(scheduled_warp);
@@ -236,18 +264,29 @@ int Emulator::get_exitcode() const {
   return warps_.at(0).ireg_file.at(3).at(0);
 }
 
-void Emulator::suspend(uint32_t wid) {
+void Emulator::suspend(uint32_t wid, WarpStallReason reason) {
   assert(!stalled_warps_.test(wid));
   stalled_warps_.set(wid);
+  stall_reasons_.at(wid) = reason;
 }
 
 void Emulator::resume(uint32_t wid) {
   if (wid != 0xffffffff) {
     assert(stalled_warps_.test(wid));
     stalled_warps_.reset(wid);
+    stall_reasons_.at(wid) = WarpStallReason::None;
   } else {
     stalled_warps_.reset();
+    std::fill(stall_reasons_.begin(), stall_reasons_.end(), WarpStallReason::None);
   }
+}
+
+void Emulator::set_stall_reason(uint32_t wid, WarpStallReason reason) {
+  stall_reasons_.at(wid) = reason;
+}
+
+WarpStallReason Emulator::stall_reason(uint32_t wid) const {
+  return stall_reasons_.at(wid);
 }
 
 bool Emulator::wspawn(uint32_t num_warps, Word nextPC) {
@@ -269,6 +308,7 @@ bool Emulator::barrier(uint32_t bar_id, uint32_t count, uint32_t wid) {
 
   auto& barrier = barriers_.at(bar_idx);
   barrier.set(wid);
+  stall_reasons_.at(wid) = WarpStallReason::Barrier;
   DP(3, "*** Suspend core #" << core_->id() << ", warp #" << wid << " at barrier #" << bar_idx);
 
   if (is_global) {
@@ -285,6 +325,7 @@ bool Emulator::barrier(uint32_t bar_id, uint32_t count, uint32_t wid) {
         if (barrier.test(i)) {
           DP(3, "*** Resume core #" << core_->id() << ", warp #" << i << " at barrier #" << bar_idx);
           stalled_warps_.reset(i);
+          stall_reasons_.at(i) = WarpStallReason::None;
         }
       }
       barrier.reset();

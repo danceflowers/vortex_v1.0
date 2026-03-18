@@ -77,6 +77,14 @@ struct wspawn_t {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+enum class WarpStallReason : uint8_t {
+  None = 0,
+  Pipeline,
+  Barrier,
+  MBarrier,
+  AsyncTensor,
+};
+
 class Emulator {
 public:
   Emulator(const Arch &arch, const DCRS &dcrs, Core* core);
@@ -95,13 +103,21 @@ public:
 
   bool running() const;
 
-  void suspend(uint32_t wid);
+  void suspend(uint32_t wid, WarpStallReason reason = WarpStallReason::Pipeline);
 
   void resume(uint32_t wid);
+
+  void set_stall_reason(uint32_t wid, WarpStallReason reason);
+
+  WarpStallReason stall_reason(uint32_t wid) const;
 
   bool barrier(uint32_t bar_id, uint32_t count, uint32_t wid);
 
   bool wspawn(uint32_t num_warps, Word nextPC);
+
+  Word startup_arg() const {
+    return startup_arg_;
+  }
 
   int get_exitcode() const;
 
@@ -149,12 +165,15 @@ private:
   std::vector<warp_t> warps_;
   WarpMask    active_warps_;
   WarpMask    stalled_warps_;
+  std::vector<WarpStallReason> stall_reasons_;
   std::vector<WarpMask> barriers_;
   std::unordered_map<int, std::stringstream> print_bufs_;
   MemoryUnit  mmu_;
   uint32_t    ipdom_size_;
+  Word        startup_arg_;
   Word        csr_mscratch_;
   wspawn_t    wspawn_;
+  uint32_t    next_warp_rr_;
 
 #ifdef EXT_TCU_ENABLE
   TensorUnit::Ptr tensor_unit_;

@@ -17,11 +17,14 @@ sim/simx/*.stamp
 sim/simx/tensor_unit.cpp.backup
 
 tests/**/.config_stamp
+tests/**/.depend
 tests/**/*.bin
 tests/**/*.dump
 tests/**/*.elf
+tests/**/*.log
 tests/**/*.vxbin
 tests/**/trace/
+tests/**/ramulator.stats.log
 
 third_party/ramulator/build/
 vortex_v1.0/third_party/ramulator/build/
