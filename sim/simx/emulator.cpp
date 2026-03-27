@@ -30,6 +30,15 @@
 
 using namespace vortex;
 
+namespace {
+
+uint32_t effective_tmem_window_id(uint32_t tagged_handle, uint32_t explicit_window_id) {
+  auto tagged_window_id = tmem_tagged_handle_window(tagged_handle);
+  return (explicit_window_id != 0) ? explicit_window_id : tagged_window_id;
+}
+
+}
+
 warp_t::warp_t(uint32_t num_threads)
   : ireg_file(MAX_NUM_REGS, std::vector<Word>(num_threads))
   , freg_file(MAX_NUM_REGS, std::vector<uint64_t>(num_threads))
@@ -180,6 +189,11 @@ instr_trace_t* Emulator::step() {
 
   uint32_t best_score = 0;
   const auto nw = arch_.num_warps();
+#ifdef EXT_TCU_ENABLE
+  TensorUnit::IssueBlockReason best_tcu_block = TensorUnit::IssueBlockReason::None;
+  bool saw_tensor_candidate = false;
+#endif
+  bool saw_runnable_warp = false;
 
   // round-robin over non-stalled warps, but prefer warps that can make forward
   // progress on tensor macro-ops in the current cycle.
@@ -188,6 +202,7 @@ instr_trace_t* Emulator::step() {
     if (!active_warps_.test(wid) || stalled_warps_.test(wid)) {
       continue;
     }
+    saw_runnable_warp = true;
 
     uint32_t score = 1;
 #ifdef EXT_TCU_ENABLE
@@ -196,9 +211,27 @@ instr_trace_t* Emulator::step() {
       const auto& instr = *warp.ibuffer.front();
       if (std::holds_alternative<TcuType>(instr.getOpType())
        && std::holds_alternative<IntrTcuArgs>(instr.getArgs())) {
+        saw_tensor_candidate = true;
         auto tcu_type = std::get<TcuType>(instr.getOpType());
         auto tcu_args = std::get<IntrTcuArgs>(instr.getArgs());
+        if (tcu_type == TcuType::MMA_LOAD || tcu_type == TcuType::MMA_STORE) {
+          auto src0 = instr.getSrcReg(0);
+          if (src0.type == RegType::Integer) {
+            for (uint32_t t = 0; t < warp.tmask.size(); ++t) {
+              if (!warp.tmask.test(t)) {
+                continue;
+              }
+              auto tagged_handle = warp.ireg_file.at(src0.idx).at(t);
+              tcu_args.runtime_handle = tmem_tagged_handle_base(tagged_handle);
+              tcu_args.window_id = effective_tmem_window_id(tagged_handle, tcu_args.window_id);
+              break;
+            }
+          }
+        }
         score = tensor_unit_->scheduler_score(wid, tcu_type, tcu_args);
+        if (score == 0 && best_tcu_block == TensorUnit::IssueBlockReason::None) {
+          best_tcu_block = tensor_unit_->classify_issue_block(wid, tcu_type, tcu_args);
+        }
       }
     }
 #endif
@@ -207,6 +240,16 @@ instr_trace_t* Emulator::step() {
       scheduled_warp = wid;
     }
   }
+
+#ifdef EXT_TCU_ENABLE
+  if (best_score <= 1) {
+    if (best_tcu_block != TensorUnit::IssueBlockReason::None) {
+      tensor_unit_->record_issue_stall(best_tcu_block);
+    } else if (saw_runnable_warp && !saw_tensor_candidate) {
+      tensor_unit_->record_no_tensor_instr_candidate_stall();
+    }
+  }
+#endif
 
   if (scheduled_warp == -1)
     return nullptr;
@@ -482,6 +525,9 @@ void Emulator::cout_flush() {
 
 Word Emulator::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
   auto core_perf = core_->perf_stats();
+#ifdef EXT_TCU_ENABLE
+  auto tensor_perf = core_->tensor_unit()->perf_stats();
+#endif
   switch (addr) {
   case VX_CSR_SATP:
 #ifdef VM_ENABLE
@@ -525,8 +571,8 @@ Word Emulator::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
     if (vec_unit_->get_csr(addr, wid, tid, &value))
       return value;
   #endif
-    if ((addr >= VX_CSR_MPM_BASE && addr < (VX_CSR_MPM_BASE + 32))
-     || (addr >= VX_CSR_MPM_BASE_H && addr < (VX_CSR_MPM_BASE_H + 32))) {
+    if ((addr >= VX_CSR_MPM_BASE && addr < (VX_CSR_MPM_BASE + 64))
+     || (addr >= VX_CSR_MPM_BASE_H && addr < (VX_CSR_MPM_BASE_H + 64))) {
       // user-defined MPM CSRs
       auto perf_class = dcrs_.base_dcrs.read(VX_DCR_BASE_MPM_CLASS);
       switch (perf_class) {
@@ -607,6 +653,76 @@ Word Emulator::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
         CSR_READ_64(VX_CSR_MPM_LMEM_BANK_ST, lmem_perf.bank_stalls);
         }
       } break;
+#ifdef EXT_TCU_ENABLE
+      case VX_DCR_MPM_CLASS_TCU: {
+        uint64_t total_cycles = core_perf.cycles;
+        uint64_t active_cycles = std::min<uint64_t>(tensor_perf.tc_active_cycles, total_cycles);
+        uint64_t idle_cycles = (total_cycles > active_cycles) ? (total_cycles - active_cycles) : 0;
+        uint64_t first_issue = tensor_perf.first_tc_issue_cycle;
+        uint64_t last_retire = tensor_perf.last_tc_retire_cycle;
+        uint64_t stall_setup = (tensor_perf.issued_primitive_tiles == 0)
+                             ? total_cycles
+                             : first_issue;
+        uint64_t stall_epilogue = (tensor_perf.retired_primitive_tiles == 0 || total_cycles == 0)
+                                ? 0
+                                : ((total_cycles - 1 > last_retire) ? ((total_cycles - 1) - last_retire) : 0);
+        switch (addr) {
+        CSR_READ_64(VX_CSR_MPM_TCU_TOTAL_CYCLES, total_cycles);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_SETUP, stall_setup);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_EPILOGUE, stall_epilogue);
+        CSR_READ_64(VX_CSR_MPM_TCU_ACTIVE_CYCLES, active_cycles);
+        CSR_READ_64(VX_CSR_MPM_TCU_IDLE_CYCLES, idle_cycles);
+        CSR_READ_64(VX_CSR_MPM_TCU_ISSUED_PRIMITIVES, tensor_perf.issued_primitive_tiles);
+        CSR_READ_64(VX_CSR_MPM_TCU_RETIRED_PRIMITIVES, tensor_perf.retired_primitive_tiles);
+        CSR_READ_64(VX_CSR_MPM_TCU_FIRST_ISSUE, tensor_perf.first_tc_issue_cycle);
+        CSR_READ_64(VX_CSR_MPM_TCU_LAST_ISSUE, tensor_perf.last_tc_issue_cycle);
+        CSR_READ_64(VX_CSR_MPM_TCU_FIRST_RETIRE, tensor_perf.first_tc_retire_cycle);
+        CSR_READ_64(VX_CSR_MPM_TCU_LAST_RETIRE, tensor_perf.last_tc_retire_cycle);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_A_NOT_READY, tensor_perf.stall_a_not_ready);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_B_NOT_READY, tensor_perf.stall_b_not_ready);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_C_NOT_READY, tensor_perf.stall_c_not_ready);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_TC_BUSY, tensor_perf.stall_tc_busy);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_WAIT_BARRIER, core_perf.stall_wait_barrier);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_HANDLE_REUSE, tensor_perf.stall_handle_reuse);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_SLOT_BUSY, tensor_perf.stall_slot_busy);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_NO_TENSOR_CANDIDATE, tensor_perf.stall_no_tensor_instr_candidate);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_MMA_LOAD_HANDLE_NOT_READY, tensor_perf.stall_mma_load_handle_not_ready);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_HANDLE_BUSY_TMA_LOAD, tensor_perf.stall_handle_busy_due_to_tma_load);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_HANDLE_BUSY_TMA_STORE_SHIFT, tensor_perf.stall_handle_busy_due_to_tma_store_or_shift);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_NO_WMMA_JOB_BUILDER_EMPTY, tensor_perf.stall_no_wmma_job_builder_empty);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_NO_WMMA_WAIT_MMA_LOAD, tensor_perf.stall_no_wmma_waiting_for_mma_load);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_NO_WMMA_WAIT_HANDLE_ALLOC, tensor_perf.stall_no_wmma_waiting_for_handle_alloc);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_NO_WMMA_WAIT_SLOT_RELEASE, tensor_perf.stall_no_wmma_waiting_for_slot_release);
+        CSR_READ_64(VX_CSR_MPM_TCU_PENDING_WMMA_DEPTH0, tensor_perf.pending_wmma_depth_cycles_0);
+        CSR_READ_64(VX_CSR_MPM_TCU_PENDING_WMMA_DEPTH1, tensor_perf.pending_wmma_depth_cycles_1);
+        CSR_READ_64(VX_CSR_MPM_TCU_PENDING_WMMA_DEPTH2, tensor_perf.pending_wmma_depth_cycles_2);
+        CSR_READ_64(VX_CSR_MPM_TCU_PENDING_WMMA_DEPTH3PLUS, tensor_perf.pending_wmma_depth_cycles_3plus);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_NO_WMMA_WAIT_C_WMMA_DRAIN, tensor_perf.stall_no_wmma_waiting_for_c_wmma_inflight_drain);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_NO_WMMA_WAIT_ACCUM_LIVE_ONLY, tensor_perf.stall_no_wmma_waiting_for_accum_live_only);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_NO_WMMA_WAIT_DIRTY_FLUSH_ONLY, tensor_perf.stall_no_wmma_waiting_for_dirty_flush_only);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_NO_WMMA_WAIT_STORE_PENDING, tensor_perf.stall_no_wmma_waiting_for_store_pending);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_NO_WMMA_WAIT_AB_PENDING_CLEAR, tensor_perf.stall_no_wmma_waiting_for_ab_wmma_pending_clear);
+        CSR_READ_64(VX_CSR_MPM_TCU_TMA_LOAD_COUNT, core_perf.tma_load_count);
+        CSR_READ_64(VX_CSR_MPM_TCU_TMA_LOAD_LT_SUM, core_perf.tma_load_latency_sum);
+        CSR_READ_64(VX_CSR_MPM_TCU_TMA_STORE_COUNT, core_perf.tma_store_count);
+        CSR_READ_64(VX_CSR_MPM_TCU_TMA_STORE_LT_SUM, core_perf.tma_store_latency_sum);
+        CSR_READ_64(VX_CSR_MPM_TCU_ISSUED_MACRO_WMMA, tensor_perf.issued_macro_wmma);
+        CSR_READ_64(VX_CSR_MPM_TCU_RETIRED_MACRO_WMMA, tensor_perf.retired_macro_wmma);
+        CSR_READ_64(VX_CSR_MPM_TCU_PENDING_WMMA_MAX, tensor_perf.pending_wmma_jobs_max);
+        CSR_READ_64(VX_CSR_MPM_TCU_MEM_QUEUE_MAX, tensor_perf.mem_queue_max);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_A_META_NOT_READY, tensor_perf.stall_a_meta_not_ready);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_NO_WMMA_READY, tensor_perf.stall_no_wmma_job_ready);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_TMEM_READ_BUSY, tensor_perf.stall_tmem_read_port_busy);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_TMEM_WRITE_BUSY, tensor_perf.stall_tmem_write_port_busy);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_AMEM_BUSY, tensor_perf.stall_amem_port_busy);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_BMEM_BUSY, tensor_perf.stall_bmem_port_busy);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_CMEM_BUSY, tensor_perf.stall_cmem_port_busy);
+        CSR_READ_64(VX_CSR_MPM_TCU_STALL_META_BUSY, tensor_perf.stall_meta_port_busy);
+        CSR_READ_64(VX_CSR_MPM_TCU_TMEM_READ_PACKETS, core_perf.tmem_read_packets);
+        CSR_READ_64(VX_CSR_MPM_TCU_TMEM_WRITE_PACKETS, core_perf.tmem_write_packets);
+        }
+      } break;
+#endif
       default:
         std::cerr << "Error: invalid MPM CLASS: value=" << perf_class << std::endl;
         std::abort();

@@ -90,6 +90,20 @@ struct TensorCoreTop {
         return true;
     }
 
+    bool active() const {
+        if (staged_valid || retired.valid) {
+            return true;
+        }
+        for (int i = 0; i < M; ++i) {
+            for (int j = 0; j < N; ++j) {
+                if (tc_dot_product[i][j].active()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     void push_uop(const uint16_t a[M][K],
                   const uint16_t b[K][N],
                   const uint32_t c[M][N],

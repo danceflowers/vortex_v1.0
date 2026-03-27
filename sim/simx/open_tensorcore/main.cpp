@@ -21,6 +21,38 @@ inline double rand_double(double lo, double hi) {
     return lo + (hi - lo) * (double)(xorshift32() & 0xFFFF) / 65535.0;
 }
 
+inline uint32_t reference_mul_fp22(uint16_t a_fp9, uint16_t b_fp9, RoundingMode rm) {
+    const uint32_t a_padded = (uint32_t)a_fp9 << 4;
+    const uint32_t b_padded = (uint32_t)b_fp9 << 4;
+    const auto s1 = fmul_s1(a_padded, b_padded, 5, 8, rm);
+    const auto s2 = fmul_s2(a_padded, b_padded, 5, 8, s1);
+    return fp13_to_fp22((uint16_t)(fmul_s3(s2, 5, 8) & 0x1FFF));
+}
+
+inline uint32_t reference_add4_fp22(uint32_t in0, uint32_t in1, uint32_t in2, uint32_t in3, RoundingMode rm) {
+    const uint32_t sum0 = fp22_add_bits(in0, in1, rm);
+    const uint32_t sum1 = fp22_add_bits(in2, in3, rm);
+    return fp22_add_bits(sum0, sum1, rm);
+}
+
+inline void reference_matmul_fp22_tree(const uint16_t a_fp9[8][8], const uint16_t b_fp9[8][8],
+                                       const uint32_t c_raw[8][8], PrecisionType c_prec,
+                                       uint32_t d_fp22[8][8],
+                                       RoundingMode rm = RNE) {
+    for (int i = 0; i < 8; ++i) {
+        for (int j = 0; j < 8; ++j) {
+            uint32_t products[8];
+            for (int k = 0; k < 8; ++k) {
+                products[k] = reference_mul_fp22(a_fp9[i][k], b_fp9[k][j], rm);
+            }
+            const uint32_t lo = reference_add4_fp22(products[0], products[1], products[2], products[3], rm);
+            const uint32_t hi = reference_add4_fp22(products[4], products[5], products[6], products[7], rm);
+            const uint32_t tree_sum = fp22_add_bits(lo, hi, rm);
+            d_fp22[i][j] = fp22_add_bits(tree_sum, convert_c_to_fp22(c_raw[i][j], c_prec), rm);
+        }
+    }
+}
+
 struct MatrixSet {
     uint16_t a_fp9[8][8];
     uint16_t b_fp9[8][8];
@@ -198,26 +230,32 @@ void test_pipelined_throughput() {
 
     struct JobResult {
         uint32_t d_out[8][8];
+        uint32_t fp22_out[8][8];
+        uint32_t ref_fp22[8][8];
         double ref[8][8];
         int cycles;
     };
     
      int num_jobs = 8;
     std::vector<JobResult> results;
-    int total_cycles = 0;
+    const auto out_prec = g_cfg.out_precisions.empty() ? PREC_FP16 : g_cfg.out_precisions.at(0);
     sim.reset();
      for (int job = 0; job < num_jobs; job++) {
         MatrixSet ms = generate_random_matrices(g_cfg.precisions[0]);
         JobResult jr;
         reference_matmul(ms.a_fp9, ms.b_fp9, ms.c_fp22, jr.ref, g_cfg.rm);
+        reference_matmul_fp22_tree(ms.a_fp9, ms.b_fp9, ms.c_raw, out_prec, jr.ref_fp22, g_cfg.rm);
         results.push_back(jr);
 
-        sim.load_inputs(ms.a_raw, ms.b_raw, ms.c_raw);
+        sim.load_inputs(ms.a_fp9, ms.b_fp9, ms.c_raw);
         if (sim.run()) {
             auto& done_jr = results[sim.jobs_completed - 1];
             for (int i = 0; i < 8; i++)
                 for (int j = 0; j < 8; j++)
                     done_jr.d_out[i][j] = sim.d_out[i][j];
+            for (int i = 0; i < 8; i++)
+                for (int j = 0; j < 8; j++)
+                    done_jr.fp22_out[i][j] = sim.fp22_out[i][j];
         }
      }
      sim.load_invalid();
@@ -228,13 +266,31 @@ void test_pipelined_throughput() {
              for (int i = 0; i < 8; i++)
                  for (int j = 0; j < 8; j++)
                      jr.d_out[i][j] = sim.d_out[i][j];
+             for (int i = 0; i < 8; i++)
+                 for (int j = 0; j < 8; j++)
+                     jr.fp22_out[i][j] = sim.fp22_out[i][j];
         }
      }
+
+    for (int job = 0; job < num_jobs; ++job) {
+        auto& jr = results[job];
+        for (int i = 0; i < 8; ++i) {
+            for (int j = 0; j < 8; ++j) {
+                if (jr.fp22_out[i][j] != jr.ref_fp22[i][j]) {
+                    fprintf(stderr,
+                            "FP22 mismatch job=%d row=%d col=%d got=0x%06x ref=0x%06x got_val=%f ref_val=%f\n",
+                            job, i, j, jr.fp22_out[i][j], jr.ref_fp22[i][j],
+                            fp22_to_double(jr.fp22_out[i][j]), fp22_to_double(jr.ref_fp22[i][j]));
+                    std::exit(1);
+                }
+            }
+        }
+    }
 
     for (int job = 0; job < num_jobs; job++) {
         auto& jr = results[job];
         print_matrix_double("REF", jr.ref);
-        print_matrix_output("OUTPUT", jr.d_out, PREC_FP8_E5M2);
+        print_matrix_output("OUTPUT", jr.d_out, out_prec);
     }
         
 

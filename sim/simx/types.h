@@ -709,6 +709,33 @@ enum class TcuType {
   WMMA,
 };
 
+static constexpr uint32_t kTmemTaggedHandleWindowBits = 8;
+static constexpr uint32_t kTmemTaggedHandleBaseBits = 32 - kTmemTaggedHandleWindowBits;
+static constexpr uint32_t kTmemTaggedHandleWindowShift = kTmemTaggedHandleBaseBits;
+static constexpr uint32_t kTmemTaggedHandleBaseMask = (1u << kTmemTaggedHandleBaseBits) - 1;
+static constexpr uint32_t kTmemShiftRefillFlag = 0x80000000u;
+
+inline uint32_t tmem_tagged_handle_base(uint32_t tagged_handle) {
+  return tagged_handle & kTmemTaggedHandleBaseMask;
+}
+
+inline uint32_t tmem_tagged_handle_window(uint32_t tagged_handle) {
+  return tagged_handle >> kTmemTaggedHandleWindowShift;
+}
+
+inline uint32_t tmem_make_tagged_handle(uint32_t base_handle, uint32_t window_id) {
+  return (base_handle & kTmemTaggedHandleBaseMask)
+       | ((window_id & ((1u << kTmemTaggedHandleWindowBits) - 1)) << kTmemTaggedHandleWindowShift);
+}
+
+inline bool tmem_shift_has_refill(uint32_t control) {
+  return (control & kTmemShiftRefillFlag) != 0;
+}
+
+inline uint32_t tmem_shift_refill_desc_id(uint32_t control) {
+  return control & ~kTmemShiftRefillFlag;
+}
+
 struct IntrTcuArgs {
   uint32_t fmt_ab = 0;
   uint32_t fmt_a = 0;
@@ -718,12 +745,16 @@ struct IntrTcuArgs {
   uint32_t step_n = 0;
   uint32_t step_k = 0;
   uint32_t bank_span = 0;
-  uint32_t meta_bank_span = 0;
+  uint32_t meta_col_span = 0;
   uint32_t packet_count = 0;
   uint32_t async_id = 0;
   uint32_t descriptor = 0xffffffffu;
+  uint32_t runtime_handle = 0;
+  uint32_t window_id = 0;
   uint32_t sparse_mode = 0;
   uint32_t barrier_id = 0;
+  uint32_t slot_id = 0;
+  uint32_t c_slot_id = 0;
   uint8_t ws = 0;
   uint8_t sp = 0;
   uint8_t macro_op = 0;

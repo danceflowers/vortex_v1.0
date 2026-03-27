@@ -182,8 +182,13 @@ void Processor::attach_ram(RAM* mem) {
 }
 
 int Processor::run() {
+  return impl_->run();
+}
+
+int Processor::run_checked() {
   try {
-    return impl_->run();
+    impl_->run();
+    return 0;
   } catch (const std::exception& e) {
     std::cerr << "Error: exception: " << e.what() << std::endl;
   } catch (...) {

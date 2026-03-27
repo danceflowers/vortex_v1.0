@@ -6,6 +6,7 @@ ITYPE ?= fp16
 ATYPE ?= $(ITYPE)
 BTYPE ?= $(ITYPE)
 OTYPE ?= fp32
+SPARSE_MODE ?= 0
 
 SRC_DIR := $(VORTEX_HOME)/tests/regression/$(PROJECT)
 HW_NUM_THREADS ?= $(shell awk '/^#define NUM_THREADS/{print $$3; exit}' $(ROOT_DIR)/hw/VX_config.h)
@@ -19,6 +20,6 @@ CXXFLAGS += -I$(VORTEX_HOME)/kernel/include
 
 LDFLAGS += $(THIRD_PARTY_DIR)/softfloat/build/Linux-x86_64-GCC/softfloat.a
 
-override CONFIGS += -DNUM_THREADS=$(HW_NUM_THREADS) -DITYPE=$(ITYPE) -DATYPE=$(ATYPE) -DBTYPE=$(BTYPE) -DOTYPE=$(OTYPE)
+override CONFIGS += -DNUM_THREADS=$(HW_NUM_THREADS) -DITYPE=$(ITYPE) -DATYPE=$(ATYPE) -DBTYPE=$(BTYPE) -DOTYPE=$(OTYPE) -DSPARSE_MODE=$(SPARSE_MODE)
 
 include ../common.mk

@@ -37,7 +37,7 @@ else
 endif
 # Add TCU extension sources
 ifneq ($(findstring -DEXT_TCU_ENABLE, $(CONFIGS)),)
-  	SRCS += $(SRC_DIR)/tensor_unit.cpp
+	SRCS += $(SRC_DIR)/tensor_unit.cpp $(SRC_DIR)/tmem.cpp $(SRC_DIR)/tma.cpp $(SRC_DIR)/tmem_window_planner.cpp
 endif
 
 # Debugging

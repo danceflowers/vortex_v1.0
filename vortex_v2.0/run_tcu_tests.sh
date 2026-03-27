@@ -14,9 +14,12 @@ JOBS=${JOBS:-$(nproc)}
 ALL_TESTS=(
   sgemm_tcu
   sgemm_tcu_tmem
+  sgemm_tcu_tmem_dualwarp
   tcu_mbarrier_async
   tcu_tmem_chain
   tcu_tmem_shift_fence
+  tcu_tmem_shift_refill
+  tcu_wmma_dualwarp
   tcu_wmma_overlap
 )
 
@@ -35,7 +38,7 @@ select_tests() {
   local test
   for test in "$@"; do
     case "$test" in
-      sgemm_tcu|sgemm_tcu_tmem|tcu_mbarrier_async|tcu_tmem_chain|tcu_tmem_shift_fence|tcu_wmma_overlap)
+      sgemm_tcu|sgemm_tcu_tmem|sgemm_tcu_tmem_dualwarp|tcu_mbarrier_async|tcu_tmem_chain|tcu_tmem_shift_fence|tcu_tmem_shift_refill|tcu_wmma_dualwarp|tcu_wmma_overlap)
         requested+=("$test")
         ;;
       *)

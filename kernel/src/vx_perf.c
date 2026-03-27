@@ -32,7 +32,7 @@ extern "C" {
 
 void vx_perf_dump() {
     int core_id = vx_core_id();
-    uint32_t * const csr_mem = (uint32_t*)(IO_MPM_ADDR + 64 * sizeof(uint32_t) * core_id);
+    uint32_t * const csr_mem = (uint32_t*)(IO_MPM_ADDR + 64 * sizeof(uint64_t) * core_id);
     DUMP_CSRS(0);
     //DUMP_CSRS(1); reserved for exitcode
     DUMP_CSRS(2);
@@ -65,6 +65,38 @@ void vx_perf_dump() {
     DUMP_CSRS(29);
     DUMP_CSRS(30);
     DUMP_CSRS(31);
+    DUMP_CSRS(32);
+    DUMP_CSRS(33);
+    DUMP_CSRS(34);
+    DUMP_CSRS(35);
+    DUMP_CSRS(36);
+    DUMP_CSRS(37);
+    DUMP_CSRS(38);
+    DUMP_CSRS(39);
+    DUMP_CSRS(40);
+    DUMP_CSRS(41);
+    DUMP_CSRS(42);
+    DUMP_CSRS(43);
+    DUMP_CSRS(44);
+    DUMP_CSRS(45);
+    DUMP_CSRS(46);
+    DUMP_CSRS(47);
+    DUMP_CSRS(48);
+    DUMP_CSRS(49);
+    DUMP_CSRS(50);
+    DUMP_CSRS(51);
+    DUMP_CSRS(52);
+    DUMP_CSRS(53);
+    DUMP_CSRS(54);
+    DUMP_CSRS(55);
+    DUMP_CSRS(56);
+    DUMP_CSRS(57);
+    DUMP_CSRS(58);
+    DUMP_CSRS(59);
+    DUMP_CSRS(60);
+    DUMP_CSRS(61);
+    DUMP_CSRS(62);
+    DUMP_CSRS(63);
 }
 
 #ifdef __cplusplus

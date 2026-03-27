@@ -111,6 +111,112 @@ struct TileHostUtils {
     }
   }
 
+  template <typename TileT>
+  static void gather_tile(TileT tile[TileDim][TileDim],
+                          const std::vector<TileT>& matrix,
+                          uint32_t matrix_cols,
+                          uint32_t tile_row,
+                          uint32_t tile_col) {
+    uint32_t row_base = tile_row * TileDim;
+    uint32_t col_base = tile_col * TileDim;
+    for (uint32_t i = 0; i < TileDim; ++i) {
+      for (uint32_t j = 0; j < TileDim; ++j) {
+        tile[i][j] = matrix[(row_base + i) * matrix_cols + (col_base + j)];
+      }
+    }
+  }
+
+  static void gather_a_phase_tile(InputAT tile[TileDim][TileDim],
+                                  const std::vector<InputAT>& matrix,
+                                  uint32_t matrix_k,
+                                  uint32_t tile_row,
+                                  uint32_t k_phase,
+                                  uint32_t k_slice) {
+    uint32_t row_base = tile_row * TileDim;
+    uint32_t col_base = k_phase * k_slice;
+    for (uint32_t i = 0; i < TileDim; ++i) {
+      for (uint32_t j = 0; j < TileDim; ++j) {
+        tile[i][j] = matrix[(row_base + i) * matrix_k + (col_base + j)];
+      }
+    }
+  }
+
+  static void gather_b_phase_tile(InputBT tile[TileDim][TileDim],
+                                  const std::vector<InputBT>& matrix,
+                                  uint32_t matrix_n,
+                                  uint32_t k_phase,
+                                  uint32_t tile_col,
+                                  uint32_t k_slice) {
+    uint32_t row_base = k_phase * k_slice;
+    uint32_t col_base = tile_col * TileDim;
+    for (uint32_t i = 0; i < TileDim; ++i) {
+      for (uint32_t j = 0; j < TileDim; ++j) {
+        tile[i][j] = matrix[(row_base + i) * matrix_n + (col_base + j)];
+      }
+    }
+  }
+
+  static void store_output_tile(std::vector<OutputT>& matrix,
+                                const float tile[TileDim][TileDim],
+                                uint32_t matrix_cols,
+                                uint32_t tile_row,
+                                uint32_t tile_col) {
+    uint32_t row_base = tile_row * TileDim;
+    uint32_t col_base = tile_col * TileDim;
+    for (uint32_t i = 0; i < TileDim; ++i) {
+      for (uint32_t j = 0; j < TileDim; ++j) {
+        matrix[(row_base + i) * matrix_cols + (col_base + j)] = encode_output(tile[i][j]);
+      }
+    }
+  }
+
+  static void scatter_c_tile_to_matrix(std::vector<OutputT>& matrix,
+                                       const uint8_t* tile_bytes,
+                                       uint32_t matrix_cols,
+                                       uint32_t tile_row,
+                                       uint32_t tile_col) {
+    std::vector<OutputT> tile(TileDim * TileDim, encode_output(0.0f));
+    scatter_c_tile(tile, tile_bytes, 0, 0);
+    uint32_t row_base = tile_row * TileDim;
+    uint32_t col_base = tile_col * TileDim;
+    for (uint32_t i = 0; i < TileDim; ++i) {
+      for (uint32_t j = 0; j < TileDim; ++j) {
+        matrix[(row_base + i) * matrix_cols + (col_base + j)] = tile[i * TileDim + j];
+      }
+    }
+  }
+
+  static void build_phase_input(std::vector<uint8_t>& a_bytes,
+                                std::vector<uint8_t>& b_bytes,
+                                std::vector<uint8_t>& c_bytes,
+                                const std::vector<InputAT>& a_matrix,
+                                const std::vector<InputBT>& b_matrix,
+                                const std::vector<OutputT>& c_matrix,
+                                uint32_t tile_rows,
+                                uint32_t tile_cols,
+                                uint32_t matrix_n,
+                                uint32_t matrix_k,
+                                uint32_t k_slice,
+                                uint32_t k_phase) {
+    a_bytes.assign(tile_rows * tile_cols * kABytes, 0);
+    b_bytes.assign(tile_rows * tile_cols * kBBytes, 0);
+    c_bytes.assign(tile_rows * tile_cols * kCBytes, 0);
+    for (uint32_t tile_row = 0; tile_row < tile_rows; ++tile_row) {
+      for (uint32_t tile_col = 0; tile_col < tile_cols; ++tile_col) {
+        uint32_t tile_id = tile_row * tile_cols + tile_col;
+        InputAT a_tile[TileDim][TileDim];
+        InputBT b_tile[TileDim][TileDim];
+        OutputT c_tile[TileDim][TileDim];
+        gather_a_phase_tile(a_tile, a_matrix, matrix_k, tile_row, k_phase, k_slice);
+        gather_b_phase_tile(b_tile, b_matrix, matrix_n, k_phase, tile_col, k_slice);
+        gather_tile(c_tile, c_matrix, matrix_n, tile_row, tile_col);
+        pack_ab_tile(a_bytes, tile_id * kABytes, a_tile, false);
+        pack_ab_tile(b_bytes, tile_id * kBBytes, b_tile, true);
+        pack_c_tile(c_bytes, tile_id * kCBytes, c_tile);
+      }
+    }
+  }
+
   template <typename InputT>
   static void pack_ab_tile(std::vector<uint8_t>& composite,
                            uint32_t byte_offset,
@@ -237,58 +343,25 @@ struct TileHostUtils {
     }
   }
 
-  static void run_open_tensorcore_primitive_fp16(const uint16_t a_in[8][8],
-                                                 const uint16_t b_in[8][8],
-                                                 uint16_t d_out[8][8],
-                                                 const uint16_t (*c_in)[8]) {
-    TensorCoreTop tc;
-    uint32_t c_raw[8][8] = {};
-
-    g_cfg.precisions.clear();
-    g_cfg.out_precisions.clear();
-    g_cfg.precisions.push_back(PREC_FP9);
-    g_cfg.out_precisions.push_back(PREC_FP16);
-
-    for (uint32_t i = 0; i < 8; ++i) {
-      for (uint32_t j = 0; j < 8; ++j) {
-        c_raw[i][j] = (c_in != nullptr) ? c_in[i][j] : 0;
-      }
-    }
-
-    tc.reset();
-    tc.load_inputs(a_in, b_in, c_raw);
-    tc.tick(true);
-    tc.load_invalid();
-
-    uint32_t spin_limit = 10000;
-    while (spin_limit-- > 0 && tc.jobs_completed < tc.set_jobs) {
-      tc.run();
-    }
-
-    for (uint32_t i = 0; i < 8; ++i) {
-      for (uint32_t j = 0; j < 8; ++j) {
-        d_out[i][j] = tc.d_out[i][j];
-      }
-    }
+  static PrecisionType out_precision() {
+    return (output_fmt() == vortex::tensor::fp32::id) ? PREC_FP32 : PREC_FP16;
   }
 
-  static void run_open_tensorcore_primitive_fp32(const uint16_t a_in[8][8],
+  static uint32_t add_fp22_raw(uint32_t a, uint32_t b) {
+    auto s1 = fadd_s1(a, b, 8, 14, 14, g_cfg.rm);
+    return fadd_s2(s1, 8, 14);
+  }
+
+  static void run_open_tensorcore_primitive_fp22(const uint16_t a_in[8][8],
                                                  const uint16_t b_in[8][8],
-                                                 float d_out[8][8],
-                                                 const float (*c_in)[8]) {
+                                                 uint32_t fp22_out[8][8]) {
     TensorCoreTop tc;
     uint32_t c_raw[8][8] = {};
 
     g_cfg.precisions.clear();
     g_cfg.out_precisions.clear();
     g_cfg.precisions.push_back(PREC_FP9);
-    g_cfg.out_precisions.push_back(PREC_FP32);
-
-    for (uint32_t i = 0; i < 8; ++i) {
-      for (uint32_t j = 0; j < 8; ++j) {
-        c_raw[i][j] = (c_in != nullptr) ? vortex::bit_cast<uint32_t>(c_in[i][j]) : 0;
-      }
-    }
+    g_cfg.out_precisions.push_back(out_precision());
 
     tc.reset();
     tc.load_inputs(a_in, b_in, c_raw);
@@ -302,7 +375,7 @@ struct TileHostUtils {
 
     for (uint32_t i = 0; i < 8; ++i) {
       for (uint32_t j = 0; j < 8; ++j) {
-        d_out[i][j] = vortex::bit_cast<float>(tc.d_out[i][j]);
+        fp22_out[i][j] = tc.fp22_out[i][j];
       }
     }
   }
@@ -337,25 +410,69 @@ struct TileHostUtils {
     bmem.fill_tile(input_fmt<InputBT>(), b_packets);
     cmem.fill_tile(output_fmt(), c_packets);
 
+    std::array<std::array<std::array<uint32_t, 8>, 8>, 4> accum_fp22 = {};
+    for (uint32_t subtile = 0; subtile < 4; ++subtile) {
+      uint32_t storage_m = subtile / 2;
+      uint32_t storage_n = subtile % 2;
+      if constexpr (std::is_same_v<OutputT, float>) {
+        float c_block[8][8] = {};
+        cmem.load_block_fp32(storage_m, storage_n, c_block);
+        for (uint32_t i = 0; i < 8; ++i) {
+          for (uint32_t j = 0; j < 8; ++j) {
+            accum_fp22.at(subtile).at(i).at(j) =
+              convert_c_to_fp22(vortex::bit_cast<uint32_t>(c_block[i][j]), out_precision());
+          }
+        }
+      } else {
+        uint16_t c_block[8][8] = {};
+        cmem.load_block_fp16(storage_m, storage_n, c_block);
+        for (uint32_t i = 0; i < 8; ++i) {
+          for (uint32_t j = 0; j < 8; ++j) {
+            accum_fp22.at(subtile).at(i).at(j) = convert_c_to_fp22(c_block[i][j], out_precision());
+          }
+        }
+      }
+    }
+
     for (uint32_t storage_k = 0; storage_k < 2; ++storage_k) {
       for (uint32_t storage_m = 0; storage_m < 2; ++storage_m) {
         for (uint32_t storage_n = 0; storage_n < 2; ++storage_n) {
           uint16_t a_block[8][8] = {};
           uint16_t b_block[8][8] = {};
+          uint32_t partial_fp22[8][8] = {};
+          uint32_t subtile = storage_m * 2 + storage_n;
           amem.read_primitive(storage_m, storage_k, a_block);
           bmem.read_primitive(storage_k, storage_n, b_block);
-          if constexpr (std::is_same_v<OutputT, float>) {
-            float c_block[8][8] = {};
-            cmem.load_block_fp32(storage_m, storage_n, c_block);
-            run_open_tensorcore_primitive_fp32(a_block, b_block, c_block, c_block);
-            cmem.store_block_fp32(storage_m, storage_n, c_block);
-          } else {
-            uint16_t c_block[8][8] = {};
-            cmem.load_block_fp16(storage_m, storage_n, c_block);
-            run_open_tensorcore_primitive_fp16(a_block, b_block, c_block, c_block);
-            cmem.store_block_fp16(storage_m, storage_n, c_block);
+          run_open_tensorcore_primitive_fp22(a_block, b_block, partial_fp22);
+          for (uint32_t i = 0; i < 8; ++i) {
+            for (uint32_t j = 0; j < 8; ++j) {
+              accum_fp22.at(subtile).at(i).at(j) =
+                add_fp22_raw(accum_fp22.at(subtile).at(i).at(j), partial_fp22[i][j]);
+            }
           }
         }
+      }
+    }
+
+    for (uint32_t subtile = 0; subtile < 4; ++subtile) {
+      uint32_t storage_m = subtile / 2;
+      uint32_t storage_n = subtile % 2;
+      if constexpr (std::is_same_v<OutputT, float>) {
+        float c_block[8][8] = {};
+        for (uint32_t i = 0; i < 8; ++i) {
+          for (uint32_t j = 0; j < 8; ++j) {
+            c_block[i][j] = vortex::bit_cast<float>(fp22_to_fp32(accum_fp22.at(subtile).at(i).at(j)));
+          }
+        }
+        cmem.store_block_fp32(storage_m, storage_n, c_block);
+      } else {
+        uint16_t c_block[8][8] = {};
+        for (uint32_t i = 0; i < 8; ++i) {
+          for (uint32_t j = 0; j < 8; ++j) {
+            c_block[i][j] = fp22_to_fp16(accum_fp22.at(subtile).at(i).at(j));
+          }
+        }
+        cmem.store_block_fp16(storage_m, storage_n, c_block);
       }
     }
 

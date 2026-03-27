@@ -8,9 +8,10 @@ using ctx = vt::wmma_context_ab<NUM_THREADS, vt::ATYPE, vt::BTYPE, vt::OTYPE>;
 static constexpr uint32_t kTmaInDescId = 0;
 static constexpr uint32_t kTmaOutDescId = 1;
 static constexpr uint32_t kMmaDescId = 0;
-static constexpr uint32_t kMmaLoadBarrierId = 2;
-static constexpr uint32_t kWmmaBarrierId = 3;
-static constexpr uint32_t kMmaStoreBarrierId = 4;
+// The waits are fully sequential, so one local mbarrier is sufficient here.
+static constexpr uint32_t kMmaLoadBarrierId = 0;
+static constexpr uint32_t kWmmaBarrierId = 0;
+static constexpr uint32_t kMmaStoreBarrierId = 0;
 
 static inline void wait_tensor_async(uint32_t barrier_id) {
   (void)vt::tc_commit(barrier_id);

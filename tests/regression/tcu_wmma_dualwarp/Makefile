@@ -1,14 +1,14 @@
 ROOT_DIR := $(realpath ../../..)
 include $(ROOT_DIR)/config.mk
 
-PROJECT := sgemm_tcu_tmem
+PROJECT := tcu_wmma_dualwarp
 ITYPE ?= fp16
 ATYPE ?= $(ITYPE)
 BTYPE ?= $(ITYPE)
 OTYPE ?= fp32
 SPARSE_MODE ?= 0
 
-SRC_DIR := $(VORTEX_HOME)/tests/regression/$(PROJECT)
+SRC_DIR := $(VORTEX_HOME)/tests/regression/tcu_wmma_overlap
 HW_NUM_THREADS ?= $(shell awk '/^#define NUM_THREADS/{print $$3; exit}' $(ROOT_DIR)/hw/VX_config.h)
 
 SRCS := $(SRC_DIR)/main.cpp $(SW_COMMON_DIR)/rvfloats.cpp $(SW_COMMON_DIR)/softfloat_ext.cpp
@@ -20,6 +20,6 @@ CXXFLAGS += -I$(VORTEX_HOME)/kernel/include
 
 LDFLAGS += $(THIRD_PARTY_DIR)/softfloat/build/Linux-x86_64-GCC/softfloat.a
 
-override CONFIGS += -DNUM_THREADS=$(HW_NUM_THREADS) -DITYPE=$(ITYPE) -DATYPE=$(ATYPE) -DBTYPE=$(BTYPE) -DOTYPE=$(OTYPE) -DSPARSE_MODE=$(SPARSE_MODE)
+override CONFIGS += -DNUM_THREADS=$(HW_NUM_THREADS) -DITYPE=$(ITYPE) -DATYPE=$(ATYPE) -DBTYPE=$(BTYPE) -DOTYPE=$(OTYPE) -DSPARSE_MODE=$(SPARSE_MODE) -DWORKER_WARPS=2 -DTILE_COUNT=2
 
 include ../common.mk

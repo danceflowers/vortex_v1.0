@@ -24,6 +24,18 @@
 #define OTYPE fp32
 #endif
 
+#ifndef SPARSE_MODE
+#define SPARSE_MODE 0
+#endif
+
+#ifndef WORKER_WARPS
+#define WORKER_WARPS 1
+#endif
+
+#ifndef TILE_COUNT
+#define TILE_COUNT WORKER_WARPS
+#endif
+
 typedef vortex::tensor::descriptor_table_arg_t descriptor_table_arg_t;
 
 typedef struct {
@@ -32,6 +44,7 @@ typedef struct {
   uint32_t a_bank_span;
   uint32_t b_bank_span;
   uint32_t c_bank_span;
+  uint32_t meta_col_span;
 } kernel_arg_t;
 
 typedef struct __attribute__((packed)) {
@@ -42,13 +55,15 @@ typedef struct __attribute__((packed)) {
   uint16_t cols;
   uint16_t elem_bytes;
   uint16_t flags;
+  uint64_t meta_addr;
+  uint32_t meta_size_bytes;
   uint16_t tmem_base;
   uint16_t meta_tmem_base;
   uint16_t bank_span;
-  uint16_t meta_bank_span;
+  uint16_t meta_col_span;
   uint8_t tile_role;
   uint8_t payload_kind;
-  uint8_t reserved[14];
+  uint8_t reserved[2];
 } tma_descriptor_t;
 
 typedef struct __attribute__((packed)) {
@@ -59,6 +74,12 @@ typedef struct __attribute__((packed)) {
   uint8_t sp;
   uint8_t sparse_mode;
   uint8_t reserved;
+  uint16_t a_rows;
+  uint16_t a_cols;
+  uint16_t b_rows;
+  uint16_t b_cols;
+  uint16_t c_rows;
+  uint16_t c_cols;
 } mma_descriptor_t;
 
 #endif

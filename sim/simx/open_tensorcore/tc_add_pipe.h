@@ -3,6 +3,11 @@
 #include "config_register.h"
 #include "fadd_s1.h"
 #include "fadd_s2.h"
+
+inline uint32_t fp22_add_bits(uint32_t a_bits, uint32_t b_bits, RoundingMode rm) {
+    return fadd_s2(fadd_s1(a_bits, b_bits, 8, 14, 14, rm), 8, 14);
+}
+
 struct  add_pipe{
 struct {
     uint32_t a_in;
@@ -42,6 +47,10 @@ void reset(){
 // ===================================
 bool out_valid() const{
     return r2.valid;
+}
+
+bool active() const{
+    return add_input.input_valid || r1.valid || r2.valid;
 }
 
 bool in_ready(bool out_ready) const{
@@ -105,6 +114,7 @@ struct {
 
 struct {
 fadd_s1_out s1_result;
+uint32_t passthrough;
 bool valid;
 TensorCoreMeta meta;
 } r1;
@@ -112,13 +122,16 @@ TensorCoreMeta meta;
 // register 2
 struct {
 uint32_t result;
+uint32_t passthrough;
 bool valid;
 TensorCoreMeta meta;
 } r2;
 
 void reset(){
     r1.valid = false;
+    r1.passthrough = 0;
     r2.valid = false;
+    r2.passthrough = 0;
     add_input.input_valid = false;
     add_input.meta = {};
 }
@@ -128,6 +141,10 @@ void reset(){
 // ===================================
 bool out_valid() const{
     return r2.valid;
+}
+
+bool active() const{
+    return add_input.input_valid || r1.valid || r2.valid;
 }
 
 bool in_ready(bool out_ready) const{
@@ -145,16 +162,22 @@ const TensorCoreMeta& out_meta() const{
     return r2.meta;
 }
 
-void tick(bool out_ready  ,const Config& g_cfg){
+uint32_t out_passthrough() const{
+    return r2.passthrough;
+}
+
+void tick(bool out_ready  ,const Config& g_cfg, uint32_t passthrough = 0){
 bool s2_ready = out_ready || !r2.valid;
 bool s1_ready = s2_ready || !r1.valid;
 
 if (s2_ready){
     if (r1.valid){
         r2.result = fadd_s2( r1.s1_result, 8, 14);
+        r2.passthrough = r1.passthrough;
         r2.valid = true;
         r2.meta = r1.meta;
     }else{
+        r2.passthrough = 0;
         r2.valid = false;
         r2.meta = {};
     }
@@ -163,9 +186,11 @@ if (s2_ready){
 if (s1_ready){
     if (add_input.input_valid){
         r1.s1_result = fadd_s1(add_input.a_in, add_input.b_in, 8, 14, 14, g_cfg.rm);
+        r1.passthrough = passthrough;
         r1.valid = true;
         r1.meta = add_input.meta;
     }else{
+        r1.passthrough = 0;
         r1.valid = false;
         r1.meta = {};
     }

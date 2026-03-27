@@ -58,6 +58,10 @@ bool out_valid() const{
     return r3.valid;
 }
 
+bool active() const{
+    return mul_input.input_valid || r1.valid || r2.valid || r3.valid;
+}
+
 bool in_ready(bool out_ready) const{
     bool s3_ready = out_ready || !r3.valid;
     bool s2_ready = s3_ready || !r2.valid;
@@ -80,7 +84,8 @@ bool s2_ready = s3_ready || !r2.valid;
 bool s1_ready = s2_ready || !r1.valid;
 if (s3_ready){
     if (r2.valid){
-        r3.result = fmul_s3(r2.s2_result, 5, 8);
+        const uint16_t fp13 = (uint16_t)(fmul_s3(r2.s2_result, 5, 8) & 0x1FFF);
+        r3.result = fp13_to_fp22(fp13);
         r3.c_in = r2.c_in;
         r3.valid = true;
         r3.meta = r2.meta;

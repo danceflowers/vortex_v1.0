@@ -1079,6 +1079,9 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
       ibuffer.push_back(instr);
     } break;
   #ifdef EXT_TCU_ENABLE
+
+
+  //================旧版本指令（不使用descriptor）================================================
     case 2: {
       switch (funct3) {
       case 0: { // WMMA
@@ -1218,9 +1221,10 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
         std::abort();
       }
     } break;
+    //================旧版本指令（不使用descriptor）================================================
     case 4: {
       auto decode_macro_target = [&](uint32_t reg) {
-        switch (reg) {
+        switch (reg & 0x3) {
         case 0:
           return TcuTarget::None;
         case 1:
@@ -1233,12 +1237,24 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
           std::abort();
         }
       };
+      auto decode_macro_slot = [&](uint32_t reg) {
+        auto slot_id = reg >> 2;
+        if (slot_id >= 2) {
+          std::abort();
+        }
+        return slot_id;
+      };
       switch (funct3) {
       case 0: { // WMMA using preloaded desc_id
         auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::TCU);
         IntrTcuArgs args{};
         args.descriptor = rd;
         args.macro_op = 1;
+        if (rs1 >= 2 || rs2 >= 2) {
+          std::abort();
+        }
+        args.slot_id = rs1;
+        args.c_slot_id = rs2;
         instr->setOpType(TcuType::WMMA);
         instr->setArgs(args);
         ibuffer.push_back(instr);
@@ -1248,7 +1264,8 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
         IntrTcuArgs args{};
         args.descriptor = rd;
         args.macro_op = 1;
-        args.target = decode_macro_target(rs2);
+        args.target = decode_macro_target(rs2);//rs2's low 2 bits encode the target, the rest encode the slot_id
+        args.slot_id = decode_macro_slot(rs2);
         instr->setOpType(TcuType::MMA_LOAD);
         instr->setArgs(args);
         instr->setSrcReg(0, rs1, RegType::Integer);
@@ -1260,6 +1277,7 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
         args.descriptor = rd;
         args.macro_op = 1;
         args.target = decode_macro_target(rs2);
+        args.slot_id = decode_macro_slot(rs2);
         instr->setOpType(TcuType::MMA_STORE);
         instr->setArgs(args);
         instr->setSrcReg(0, rs1, RegType::Integer);
@@ -1333,6 +1351,7 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
           instr->setDestReg(rd, RegType::Integer);
         }
         instr->setSrcReg(0, rs1, RegType::Integer);
+        instr->setSrcReg(1, rs2, RegType::Integer);
         ibuffer.push_back(instr);
       } break;
       case 4: { // MBAR_INIT

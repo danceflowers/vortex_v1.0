@@ -31,10 +31,27 @@ enum tcu_target : uint8_t {
   tcu_target_c = 3,
 };
 
+static constexpr uint32_t max_operand_slots = 2;
+static constexpr uint32_t tmem_window_id_bits = 8;
+static constexpr uint32_t tmem_handle_base_bits = 32 - tmem_window_id_bits;
+static constexpr uint32_t tmem_window_id_shift = tmem_handle_base_bits;
+static constexpr uint32_t tmem_handle_base_mask = (1u << tmem_handle_base_bits) - 1;
+static constexpr uint32_t tmem_shift_refill_flag = 0x80000000u;
+
+inline __attribute__((always_inline)) constexpr uint32_t encode_macro_operand(tcu_target target, uint32_t slot_id) {
+  return (slot_id << 2) | static_cast<uint32_t>(target);
+}
+
 enum tcu_payload_kind : uint8_t {
   tcu_payload_dense = 0,
   tcu_payload_sparse_payload = 1,
   tcu_payload_sparse_meta = 2,
+};
+
+enum tcu_sparse_mode : uint8_t {
+  tcu_sparse_none = sparse_none,
+  tcu_sparse_2_4 = sparse_2_4,
+  tcu_sparse_1_4 = sparse_1_4,
 };
 
 struct tma_descriptor_t {
@@ -45,13 +62,15 @@ struct tma_descriptor_t {
   uint16_t cols;
   uint16_t elem_bytes;
   uint16_t flags;
+  uint64_t meta_addr;
+  uint32_t meta_size_bytes;
   uint16_t tmem_base;
   uint16_t meta_tmem_base;
   uint16_t bank_span;
-  uint16_t meta_bank_span;
+  uint16_t meta_col_span;
   uint8_t tile_role;
   uint8_t payload_kind;
-  uint8_t reserved[14];
+  uint8_t reserved[2];
 } __attribute__((packed));
 
 struct mma_descriptor_t {
@@ -62,31 +81,59 @@ struct mma_descriptor_t {
   uint8_t sp;
   uint8_t sparse_mode;
   uint8_t reserved;
+  uint16_t a_rows;
+  uint16_t a_cols;
+  uint16_t b_rows;
+  uint16_t b_cols;
+  uint16_t c_rows;
+  uint16_t c_cols;
 } __attribute__((packed));
 
 template <typename At, typename Bt, typename Ot>
 inline __attribute__((always_inline)) constexpr mma_descriptor_t make_mma_descriptor(uint8_t ws = 0,
                                                                                      uint8_t sp = 0,
-                                                                                     uint8_t sparse_mode = 0) {
-  return mma_descriptor_t{At::id, Bt::id, Ot::id, ws, sp, sparse_mode, 0};
+                                                                                     uint8_t sparse_mode = 0,
+                                                                                     uint16_t a_rows = 0,
+                                                                                     uint16_t a_cols = 0,
+                                                                                     uint16_t b_rows = 0,
+                                                                                     uint16_t b_cols = 0,
+                                                                                     uint16_t c_rows = 0,
+                                                                                     uint16_t c_cols = 0) {
+  return mma_descriptor_t{At::id, Bt::id, Ot::id, ws, sp, sparse_mode, 0,
+                          a_rows, a_cols, b_rows, b_cols, c_rows, c_cols};
 }
 
 inline __attribute__((always_inline)) uint16_t tmem_handle_base(uint32_t handle) {
+  handle &= tmem_handle_base_mask;
   return handle & 0xff;
 }
 
 inline __attribute__((always_inline)) uint16_t tmem_handle_span(uint32_t handle) {
+  handle &= tmem_handle_base_mask;
   return (handle >> 8) & 0xff;
 }
 
+inline __attribute__((always_inline)) constexpr uint32_t tmem_untag_handle(uint32_t handle) {
+  return handle & tmem_handle_base_mask;
+}
+
+inline __attribute__((always_inline)) constexpr uint32_t tmem_window_id(uint32_t handle) {
+  return handle >> tmem_window_id_shift;
+}
+
+inline __attribute__((always_inline)) constexpr uint32_t bind_window(uint32_t handle, uint32_t window_id) {
+  return (tmem_untag_handle(handle))
+       | ((window_id & ((1u << tmem_window_id_bits) - 1)) << tmem_window_id_shift);
+}
+
 inline __attribute__((always_inline)) void bind_tmem_payload_region(tma_descriptor_t* desc, uint32_t handle) {
-  desc->tmem_base = tmem_handle_base(handle);
-  desc->bank_span = tmem_handle_span(handle);
+  desc->tmem_base = tmem_handle_base(tmem_untag_handle(handle));
+  desc->bank_span = tmem_handle_span(tmem_untag_handle(handle));
 }
 
 inline __attribute__((always_inline)) void bind_tmem_meta_region(tma_descriptor_t* desc, uint32_t handle) {
-  desc->meta_tmem_base = tmem_handle_base(handle);
-  desc->meta_bank_span = tmem_handle_span(handle);
+  desc->meta_tmem_base = tmem_handle_base(tmem_untag_handle(handle));
+  desc->meta_col_span = tmem_handle_span(tmem_untag_handle(handle));
 }
 
 inline __attribute__((always_inline)) uint32_t tmem_alloc(uint32_t bank_span) {
@@ -101,7 +148,7 @@ inline __attribute__((always_inline)) uint32_t tmem_alloc(uint32_t bank_span) {
 inline __attribute__((always_inline)) void tmem_free(uint32_t handle) {
   __asm__ volatile (".insn r %1, 2, 2, x0, %0, x0"
     :
-    : "r"(handle), "i"(RISCV_CUSTOM0)
+    : "r"(tmem_untag_handle(handle)), "i"(RISCV_CUSTOM0)
     : "memory");
 }
 
@@ -121,6 +168,10 @@ inline __attribute__((always_inline)) uint32_t tma_load(uint32_t handle, uint32_
   return async_id;
 }
 
+inline __attribute__((always_inline)) uint32_t tma_load(uint32_t handle, uint32_t desc_id, uint32_t window_id) {
+  return tma_load(bind_window(handle, window_id), desc_id);
+}
+
 inline __attribute__((always_inline)) uint32_t tma_store(uint32_t handle, uint32_t desc_id) {
   uint32_t async_id;
   __asm__ volatile (".insn r %3, 4, 2, %0, %1, %2"
@@ -128,6 +179,10 @@ inline __attribute__((always_inline)) uint32_t tma_store(uint32_t handle, uint32
     : "r"(handle), "r"(desc_id), "i"(RISCV_CUSTOM0)
     : "memory");
   return async_id;
+}
+
+inline __attribute__((always_inline)) uint32_t tma_store(uint32_t handle, uint32_t desc_id, uint32_t window_id) {
+  return tma_store(bind_window(handle, window_id), desc_id);
 }
 
 inline __attribute__((always_inline)) void tma_wait(uint32_t async_id) {
@@ -180,6 +235,24 @@ inline __attribute__((always_inline)) uint32_t tmem_shift(uint32_t handle) {
   return async_id;
 }
 
+inline __attribute__((always_inline)) uint32_t tmem_shift(uint32_t handle, uint32_t window_id) {
+  return tmem_shift(bind_window(handle, window_id));
+}
+
+inline __attribute__((always_inline)) uint32_t tmem_shift_refill(uint32_t handle, uint32_t refill_desc_id) {
+  uint32_t async_id;
+  uint32_t control = refill_desc_id | tmem_shift_refill_flag;
+  __asm__ volatile (".insn r %3, 3, 3, %0, %1, %2"
+    : "=r"(async_id)
+    : "r"(handle), "r"(control), "i"(RISCV_CUSTOM0)
+    : "memory");
+  return async_id;
+}
+
+inline __attribute__((always_inline)) uint32_t tmem_shift_refill(uint32_t handle, uint32_t window_id, uint32_t refill_desc_id) {
+  return tmem_shift_refill(bind_window(handle, window_id), refill_desc_id);
+}
+
 inline __attribute__((always_inline)) void mbarrier_init(uint32_t barrier_id, uint32_t count) {
   __asm__ volatile (".insn r %2, 4, 3, x0, %0, %1"
     :
@@ -224,40 +297,110 @@ inline __attribute__((always_inline)) void mma_load(uint32_t handle) {
   mma_load_component<Ot, 98>(handle);
 }
 
-template <uint32_t DescId>
+template <uint32_t DescId, uint32_t SlotId = 0>
 inline __attribute__((always_inline)) void mma_load(uint32_t handle) {
   static_assert(DescId < max_static_descriptor_id, "desc_id must fit in the encoded desc_id field");
-  __asm__ volatile (".insn r %[insn], 5, 4, x%[desc_id], %[handle], x0"
+  static_assert(SlotId < max_operand_slots, "slot_id out of range");
+  __asm__ volatile (".insn r %[insn], 5, 4, x%[desc_id], %[handle], x%[target]"
     :
-    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle)
+    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle),
+      [target]"i"(encode_macro_operand(tcu_target_none, SlotId))
     : "memory");
 }
 
-template <uint32_t DescId>
+template <uint32_t DescId, uint32_t SlotId = 0>
+inline __attribute__((always_inline)) void mma_load(uint32_t handle, uint32_t window_id) {
+  mma_load<DescId, SlotId>(bind_window(handle, window_id));
+}
+
+template <uint32_t DescId, uint32_t SlotId = 0>
 inline __attribute__((always_inline)) void mma_load_a(uint32_t handle) {
   static_assert(DescId < max_static_descriptor_id, "desc_id must fit in the encoded desc_id field");
-  __asm__ volatile (".insn r %[insn], 5, 4, x%[desc_id], %[handle], x1"
+  static_assert(SlotId < max_operand_slots, "slot_id out of range");
+  __asm__ volatile (".insn r %[insn], 5, 4, x%[desc_id], %[handle], x%[target]"
     :
-    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle)
+    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle),
+      [target]"i"(encode_macro_operand(tcu_target_a, SlotId))
     : "memory");
 }
 
-template <uint32_t DescId>
+template <uint32_t DescId, uint32_t SlotId = 0>
+inline __attribute__((always_inline)) void mma_load_a(uint32_t handle, uint32_t window_id) {
+  mma_load_a<DescId, SlotId>(bind_window(handle, window_id));
+}
+
+template <uint32_t DescId, uint32_t SlotId = 0>
 inline __attribute__((always_inline)) void mma_load_b(uint32_t handle) {
   static_assert(DescId < max_static_descriptor_id, "desc_id must fit in the encoded desc_id field");
-  __asm__ volatile (".insn r %[insn], 5, 4, x%[desc_id], %[handle], x2"
+  static_assert(SlotId < max_operand_slots, "slot_id out of range");
+  __asm__ volatile (".insn r %[insn], 5, 4, x%[desc_id], %[handle], x%[target]"
     :
-    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle)
+    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle),
+      [target]"i"(encode_macro_operand(tcu_target_b, SlotId))
     : "memory");
 }
 
-template <uint32_t DescId>
+template <uint32_t DescId, uint32_t SlotId = 0>
+inline __attribute__((always_inline)) void mma_load_b(uint32_t handle, uint32_t window_id) {
+  mma_load_b<DescId, SlotId>(bind_window(handle, window_id));
+}
+
+template <uint32_t DescId, uint32_t SlotId = 0>
 inline __attribute__((always_inline)) void mma_load_c(uint32_t handle) {
   static_assert(DescId < max_static_descriptor_id, "desc_id must fit in the encoded desc_id field");
-  __asm__ volatile (".insn r %[insn], 5, 4, x%[desc_id], %[handle], x3"
+  static_assert(SlotId < max_operand_slots, "slot_id out of range");
+  __asm__ volatile (".insn r %[insn], 5, 4, x%[desc_id], %[handle], x%[target]"
     :
-    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle)
+    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle),
+      [target]"i"(encode_macro_operand(tcu_target_c, SlotId))
     : "memory");
+}
+
+template <uint32_t DescId, uint32_t SlotId = 0>
+inline __attribute__((always_inline)) void mma_load_c(uint32_t handle, uint32_t window_id) {
+  mma_load_c<DescId, SlotId>(bind_window(handle, window_id));
+}
+
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_load_a_slot(uint32_t handle, uint32_t slot_id) {
+  switch (slot_id) {
+  case 0: mma_load_a<DescId, 0>(handle); break;
+  case 1: mma_load_a<DescId, 1>(handle); break;
+  default: __builtin_trap();
+  }
+}
+
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_load_a_slot(uint32_t handle, uint32_t window_id, uint32_t slot_id) {
+  mma_load_a_slot<DescId>(bind_window(handle, window_id), slot_id);
+}
+
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_load_b_slot(uint32_t handle, uint32_t slot_id) {
+  switch (slot_id) {
+  case 0: mma_load_b<DescId, 0>(handle); break;
+  case 1: mma_load_b<DescId, 1>(handle); break;
+  default: __builtin_trap();
+  }
+}
+
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_load_b_slot(uint32_t handle, uint32_t window_id, uint32_t slot_id) {
+  mma_load_b_slot<DescId>(bind_window(handle, window_id), slot_id);
+}
+
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_load_c_slot(uint32_t handle, uint32_t slot_id) {
+  switch (slot_id) {
+  case 0: mma_load_c<DescId, 0>(handle); break;
+  case 1: mma_load_c<DescId, 1>(handle); break;
+  default: __builtin_trap();
+  }
+}
+
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_load_c_slot(uint32_t handle, uint32_t window_id, uint32_t slot_id) {
+  mma_load_c_slot<DescId>(bind_window(handle, window_id), slot_id);
 }
 
 template <typename It, typename Ot>
@@ -274,22 +417,50 @@ inline __attribute__((always_inline)) void mma_store(uint32_t handle) {
   mma_store<At, Ot>(handle);
 }
 
-template <uint32_t DescId>
+template <uint32_t DescId, uint32_t SlotId = 0>
 inline __attribute__((always_inline)) void mma_store(uint32_t handle) {
   static_assert(DescId < max_static_descriptor_id, "desc_id must fit in the encoded desc_id field");
-  __asm__ volatile (".insn r %[insn], 6, 4, x%[desc_id], %[handle], x0"
+  static_assert(SlotId < max_operand_slots, "slot_id out of range");
+  __asm__ volatile (".insn r %[insn], 6, 4, x%[desc_id], %[handle], x%[target]"
     :
-    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle)
+    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle),
+      [target]"i"(encode_macro_operand(tcu_target_none, SlotId))
     : "memory");
 }
 
-template <uint32_t DescId>
+template <uint32_t DescId, uint32_t SlotId = 0>
+inline __attribute__((always_inline)) void mma_store(uint32_t handle, uint32_t window_id) {
+  mma_store<DescId, SlotId>(bind_window(handle, window_id));
+}
+
+template <uint32_t DescId, uint32_t SlotId = 0>
 inline __attribute__((always_inline)) void mma_store_c(uint32_t handle) {
   static_assert(DescId < max_static_descriptor_id, "desc_id must fit in the encoded desc_id field");
-  __asm__ volatile (".insn r %[insn], 6, 4, x%[desc_id], %[handle], x3"
+  static_assert(SlotId < max_operand_slots, "slot_id out of range");
+  __asm__ volatile (".insn r %[insn], 6, 4, x%[desc_id], %[handle], x%[target]"
     :
-    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle)
+    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle),
+      [target]"i"(encode_macro_operand(tcu_target_c, SlotId))
     : "memory");
+}
+
+template <uint32_t DescId, uint32_t SlotId = 0>
+inline __attribute__((always_inline)) void mma_store_c(uint32_t handle, uint32_t window_id) {
+  mma_store_c<DescId, SlotId>(bind_window(handle, window_id));
+}
+
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_store_c_slot(uint32_t handle, uint32_t slot_id) {
+  switch (slot_id) {
+  case 0: mma_store_c<DescId, 0>(handle); break;
+  case 1: mma_store_c<DescId, 1>(handle); break;
+  default: __builtin_trap();
+  }
+}
+
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_store_c_slot(uint32_t handle, uint32_t window_id, uint32_t slot_id) {
+  mma_store_c_slot<DescId>(bind_window(handle, window_id), slot_id);
 }
 
 namespace detail {
@@ -756,9 +927,11 @@ public:
     }
   }
 
-  template <uint32_t DescId, typename FragD, typename FragA, typename FragB, typename FragC>
+  template <uint32_t DescId, uint32_t AbSlotId = 0, uint32_t CSlotId = AbSlotId, typename FragD, typename FragA, typename FragB, typename FragC>
   static __attribute__((always_inline)) void mma_sync(FragD &fragD, const FragA &fragA, const FragB &fragB, const FragC &fragC) {
     static_assert(DescId < max_static_descriptor_id, "desc_id must fit in the encoded desc_id field");
+    static_assert(AbSlotId < max_operand_slots, "ab_slot_id out of range");
+    static_assert(CSlotId < max_operand_slots, "c_slot_id out of range");
     static_assert(FragA::Use == matrix_a, "A must be matrix_a");
     static_assert(FragB::Use == matrix_b, "B must be matrix_b");
     static_assert(FragC::Use == accumulator, "C must be accumulator");
@@ -809,9 +982,9 @@ public:
       register float fd6 __asm__("f30");
       register float fd7 __asm__("f31");
 
-      __asm__ volatile (".insn r %[insn], 0, 4, x%[desc_id], x0, x0"
+      __asm__ volatile (".insn r %[insn], 0, 4, x%[desc_id], x%[ab_slot_id], x%[c_slot_id]"
         : "=f"(fd0), "=f"(fd1), "=f"(fd2), "=f"(fd3), "=f"(fd4), "=f"(fd5), "=f"(fd6), "=f"(fd7)
-        : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId),
+        : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [ab_slot_id]"i"(AbSlotId), [c_slot_id]"i"(CSlotId),
           "f"(fa0), "f"(fa1), "f"(fa2), "f"(fa3), "f"(fa4), "f"(fa5), "f"(fa6), "f"(fa7),
           "f"(fb0), "f"(fb1), "f"(fb2), "f"(fb3), "f"(fb4), "f"(fb5), "f"(fb6), "f"(fb7),
           "f"(fc0), "f"(fc1), "f"(fc2), "f"(fc3), "f"(fc4), "f"(fc5), "f"(fc6), "f"(fc7)
@@ -856,9 +1029,9 @@ public:
       register float fd6 __asm__("f16");
       register float fd7 __asm__("f17");
 
-      __asm__ volatile (".insn r %[insn], 0, 4, x%[desc_id], x0, x0"
+      __asm__ volatile (".insn r %[insn], 0, 4, x%[desc_id], x%[ab_slot_id], x%[c_slot_id]"
         : "=f"(fd0), "=f"(fd1), "=f"(fd2), "=f"(fd3), "=f"(fd4), "=f"(fd5), "=f"(fd6), "=f"(fd7)
-        : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId),
+        : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [ab_slot_id]"i"(AbSlotId), [c_slot_id]"i"(CSlotId),
           "f"(fa0), "f"(fa1), "f"(fa2), "f"(fa3), "f"(fa4), "f"(fa5), "f"(fa6), "f"(fa7),
           "f"(fb0), "f"(fb1), "f"(fb2), "f"(fb3),
           "f"(fc0), "f"(fc1), "f"(fc2), "f"(fc3), "f"(fc4), "f"(fc5), "f"(fc6), "f"(fc7)
@@ -870,6 +1043,35 @@ public:
         static_assert(FragD::NR == 4, "Unsupported accumulator register count");
         fragD.data = {fd0, fd1, fd2, fd3};
       }
+    }
+  }
+
+  template <uint32_t DescId, typename FragD, typename FragA, typename FragB, typename FragC>
+  static __attribute__((always_inline)) void mma_sync_slots(uint32_t ab_slot_id,
+                                                            uint32_t c_slot_id,
+                                                            FragD &fragD,
+                                                            const FragA &fragA,
+                                                            const FragB &fragB,
+                                                            const FragC &fragC) {
+    switch ((ab_slot_id << 1) | c_slot_id) {
+    case 0: mma_sync<DescId, 0, 0>(fragD, fragA, fragB, fragC); break;
+    case 1: mma_sync<DescId, 0, 1>(fragD, fragA, fragB, fragC); break;
+    case 2: mma_sync<DescId, 1, 0>(fragD, fragA, fragB, fragC); break;
+    case 3: mma_sync<DescId, 1, 1>(fragD, fragA, fragB, fragC); break;
+    default: __builtin_trap();
+    }
+  }
+
+  template <uint32_t DescId, typename FragD, typename FragA, typename FragB, typename FragC>
+  static __attribute__((always_inline)) void mma_sync_slot(uint32_t slot_id,
+                                                           FragD &fragD,
+                                                           const FragA &fragA,
+                                                           const FragB &fragB,
+                                                           const FragC &fragC) {
+    switch (slot_id) {
+    case 0: mma_sync<DescId, 0, 0>(fragD, fragA, fragB, fragC); break;
+    case 1: mma_sync<DescId, 1, 1>(fragD, fragA, fragB, fragC); break;
+    default: __builtin_trap();
     }
   }
 };

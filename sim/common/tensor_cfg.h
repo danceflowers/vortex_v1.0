@@ -23,7 +23,7 @@ namespace vortex {
 namespace tensor {
 
 static constexpr uint32_t descriptor_table_magic = 0x54435544u;
-static constexpr uint16_t descriptor_table_version = 1;
+static constexpr uint16_t descriptor_table_version = 2;
 static constexpr uint32_t max_static_descriptor_id = 32;
 
 struct descriptor_table_arg_t {
@@ -124,6 +124,10 @@ inline const char* fmt_string(uint32_t fmt) {
   default:        return "";
   }
 }
+
+static constexpr uint8_t sparse_none = 0;
+static constexpr uint8_t sparse_2_4 = 1;
+static constexpr uint8_t sparse_1_4 = 2;
 
 template <uint32_t NT,      // number of threads per warp
           typename It = fp32, // input type (A,B)

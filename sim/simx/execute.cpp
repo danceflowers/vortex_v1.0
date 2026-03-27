@@ -18,6 +18,8 @@
 #include <math.h>
 #include <bitset>
 #include <climits>
+#include <stdexcept>
+#include <string>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <assert.h>
@@ -49,6 +51,11 @@ inline int64_t check_boxing(int64_t a) {
 }
 
 #ifdef EXT_TCU_ENABLE
+static inline uint32_t effective_tmem_window_id(uint32_t tagged_handle, uint32_t explicit_window_id) {
+  auto tagged_window_id = tmem_tagged_handle_window(tagged_handle);
+  return (explicit_window_id != 0) ? explicit_window_id : tagged_window_id;
+}
+
 static inline void resolve_mma_descriptor(Core* core, IntrTcuArgs* args) {
   if (args->descriptor == 0xffffffffu) {
     return;
@@ -1478,7 +1485,14 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       trace->data = trace_data;
       switch (tcu_type) {
       case TcuType::TMEM_ALLOC: {
-        auto handle = core_->tmem_alloc(std::max<uint32_t>(1, rs1_data.at(thread_start).u32));//rs1_data stored the number of contiguous banks to allocate
+        auto col_span = std::max<uint32_t>(1, rs1_data.at(thread_start).u32);
+        auto handle = core_->tmem_alloc(col_span); // rs1_data stores the requested logical TMEM column span
+        if (handle == 0) {
+          throw std::runtime_error(
+            "TMEM allocation failed: requested " + std::to_string(col_span)
+          + " logical columns, but simx provides only "
+          + std::to_string(Core::kTmemPayloadCols) + " payload columns");
+        }
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t))
             continue;
@@ -1488,16 +1502,18 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         rd_write = true;
       } break;
       case TcuType::TMEM_FREE: {
-        auto handle = rs1_data.at(thread_start).u32;
+        auto handle = tmem_tagged_handle_base(rs1_data.at(thread_start).u32);
         core_->tmem_free(handle);
       } break;
       case TcuType::TMEM_REL_PERMIT: {
         core_->tmem_rel_permit();
       } break;
       case TcuType::TMA_LOAD: {
-        auto handle = rs1_data.at(thread_start).u32;
+        auto tagged_handle = rs1_data.at(thread_start).u32;
+        auto handle = tmem_tagged_handle_base(tagged_handle);
+        tpuArgs.window_id = effective_tmem_window_id(tagged_handle, tpuArgs.window_id);
         auto desc_id = rs2_data.at(thread_start).u32;
-        auto async_id = core_->tma_load(wid, handle, desc_id, tpuArgs.transpose_b);
+        auto async_id = core_->tma_load(wid, handle, desc_id, tpuArgs.transpose_b, tpuArgs.window_id);
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t))
             continue;
@@ -1507,9 +1523,11 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         rd_write = true;
       } break;
       case TcuType::TMA_STORE: {
-        auto handle = rs1_data.at(thread_start).u32;
+        auto tagged_handle = rs1_data.at(thread_start).u32;
+        auto handle = tmem_tagged_handle_base(tagged_handle);
+        tpuArgs.window_id = effective_tmem_window_id(tagged_handle, tpuArgs.window_id);
         auto desc_id = rs2_data.at(thread_start).u32;
-        auto async_id = core_->tma_store(wid, handle, desc_id);
+        auto async_id = core_->tma_store(wid, handle, desc_id, tpuArgs.window_id);
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t))
             continue;
@@ -1543,8 +1561,14 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         }
       } break;
       case TcuType::TMEM_SHIFT: {
-        auto handle = rs1_data.at(thread_start).u32;
-        auto async_id = core_->tmem_shift(wid, handle);
+        auto tagged_handle = rs1_data.at(thread_start).u32;
+        auto handle = tmem_tagged_handle_base(tagged_handle);
+        tpuArgs.window_id = effective_tmem_window_id(tagged_handle, tpuArgs.window_id);
+        auto shift_control = rs2_data.at(thread_start).u32;
+        auto refill_desc_id = tmem_shift_has_refill(shift_control)
+                            ? tmem_shift_refill_desc_id(shift_control)
+                            : 0;
+        auto async_id = core_->tmem_shift(wid, handle, tpuArgs.window_id, refill_desc_id);
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t))
             continue;
@@ -1555,7 +1579,9 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       } break;
       case TcuType::MMA_LOAD: {
         resolve_mma_descriptor(core_, &tpuArgs);
-        auto handle = rs1_data.at(thread_start).u32;
+        auto tagged_handle = rs1_data.at(thread_start).u32;
+        auto handle = tmem_tagged_handle_base(tagged_handle);
+        tpuArgs.window_id = effective_tmem_window_id(tagged_handle, tpuArgs.window_id);
         tensor_unit_->mma_load(wid, handle, tpuArgs, trace_data.get());
         if (trace_data->retry) {
           core_->set_stall_reason(wid, WarpStallReason::AsyncTensor);
@@ -1565,7 +1591,9 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       } break;
       case TcuType::MMA_STORE: {
         resolve_mma_descriptor(core_, &tpuArgs);
-        auto handle = rs1_data.at(thread_start).u32;
+        auto tagged_handle = rs1_data.at(thread_start).u32;
+        auto handle = tmem_tagged_handle_base(tagged_handle);
+        tpuArgs.window_id = effective_tmem_window_id(tagged_handle, tpuArgs.window_id);
         tensor_unit_->mma_store(wid, handle, tpuArgs, trace_data.get());
         if (trace_data->retry) {
           core_->set_stall_reason(wid, WarpStallReason::AsyncTensor);
@@ -1618,7 +1646,6 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
     core_->trace_pool().deallocate(trace, 1);
     return nullptr;
   }
-
   if (rd_write) {
     trace->wb = true;
     switch (rdest.type) {
