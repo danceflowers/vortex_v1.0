@@ -49,8 +49,17 @@ public:
     }
   }
 
-  static uint32_t packet_count(uint32_t fmt_c) {
-    return (fmt_c == vortex::tensor::fp32::id) ? 16 : 8;
+  static uint32_t packet_count(uint32_t fmt) {
+    switch (fmt) {
+    case vortex::tensor::fp8::id:
+      return 4;
+    case vortex::tensor::fp16::id:
+      return 8;
+    case vortex::tensor::fp32::id:
+      return 16;
+    default:
+      return 0;
+    }
   }
 
   static constexpr uint32_t fill_beats(uint32_t) {
@@ -62,7 +71,16 @@ public:
   }
 
   static uint32_t packets_per_fill_group(uint32_t fmt_c) {
-    return (fmt_c == vortex::tensor::fp32::id) ? 8 : 4;
+    switch (fmt_c) {
+    case vortex::tensor::fp8::id:
+      return 2;
+    case vortex::tensor::fp16::id:
+      return 4;
+    case vortex::tensor::fp32::id:
+      return 8;
+    default:
+      return 0;
+    }
   }
 
   bool write_fill_beat(uint32_t slot_id,
@@ -94,7 +112,7 @@ public:
           store_elem(row, row_in_subtile * kPrimitiveDim + col_in_subtile, convert_c_to_fp22(bits, PREC_FP32));
         }
       }
-    } else {
+    } else if (fmt_c == vortex::tensor::fp16::id) {
       for (uint32_t packet_idx = 0; packet_idx < packets.size(); ++packet_idx) {
         const auto& p = packets.at(packet_idx);
         for (uint32_t row_pair = 0; row_pair < 2; ++row_pair) {
@@ -109,6 +127,22 @@ public:
           }
         }
       }
+    } else if (fmt_c == vortex::tensor::fp8::id) {
+      for (uint32_t packet_idx = 0; packet_idx < packets.size(); ++packet_idx) {
+        const auto& p = packets.at(packet_idx);
+        for (uint32_t row_quad = 0; row_quad < 4; ++row_quad) {
+          auto row_in_subtile = packet_idx * 4 + row_quad;
+          for (uint32_t col_in_subtile = 0; col_in_subtile < kPrimitiveDim; ++col_in_subtile) {
+            auto src_col = storage_n * kPrimitiveDim + col_in_subtile;
+            auto off = row_quad * kDim + src_col;
+            store_elem(row,
+                       row_in_subtile * kPrimitiveDim + col_in_subtile,
+                       convert_c_to_fp22(p.at(off), PREC_FP8_E4M3));
+          }
+        }
+      }
+    } else {
+      return false;
     }
 
     row_valid_.at(row_idx) = true;
@@ -159,7 +193,7 @@ public:
           p.at(off + 3) = (bits >> 24) & 0xff;
         }
       }
-    } else {
+    } else if (fmt_c == vortex::tensor::fp16::id) {
       for (uint32_t packet = 0; packet < packets->size(); ++packet) {
         auto& p = packets->at(packet);
         for (uint32_t elem = 0; elem < 32; ++elem) {
@@ -171,6 +205,17 @@ public:
           p.at(off + 1) = (bits >> 8) & 0xff;
         }
       }
+    } else if (fmt_c == vortex::tensor::fp8::id) {
+      for (uint32_t packet = 0; packet < packets->size(); ++packet) {
+        auto& p = packets->at(packet);
+        for (uint32_t elem = 0; elem < 64; ++elem) {
+          auto row = packet * 4 + (elem / 16);
+          auto col = elem % 16;
+          p.at(elem) = fp22_to_fp8_e4m3(load_matrix_elem(slot_id, row, col));
+        }
+      }
+    } else {
+      return false;
     }
     return true;
   }

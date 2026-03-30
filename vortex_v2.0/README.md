@@ -72,7 +72,7 @@ Run all current TCU-related regressions in one shot:
 Run a subset:
 
 ```bash
-./vortex_v2.0/run_tcu_tests.sh sgemm_tcu sgemm_tcu_tmem_dualwarp tcu_tmem_shift_refill
+./vortex_v2.0/run_tcu_tests.sh sgemm_tcu tcu_tmem_window_d tcu_warpgroup_collective
 ```
 
 ## Individual TCU Tests
@@ -121,6 +121,18 @@ TMEM shift refill:
 make -C /mnt/d/wode_code_trunk/vortex/tests/regression/tcu_tmem_shift_refill clean all run-simx
 ```
 
+TMEM window-D store:
+
+```bash
+make -C /mnt/d/wode_code_trunk/vortex/tests/regression/tcu_tmem_window_d clean all run-simx
+```
+
+Warpgroup collective MMA:
+
+```bash
+make -C /mnt/d/wode_code_trunk/vortex/tests/regression/tcu_warpgroup_collective clean all run-simx
+```
+
 WMMA dual-warp:
 
 ```bash
@@ -136,5 +148,5 @@ make -C /mnt/d/wode_code_trunk/vortex/tests/regression/tcu_wmma_overlap clean al
 ## Notes
 
 - The image installs the same dependency/toolchain flow used by `vortex_v1.0`: `ci/install_dependencies.sh` and `ci/toolchain_install.sh`.
-- The current TCU regression set is `sgemm_tcu`, `sgemm_tcu_tmem`, `sgemm_tcu_tmem_dualwarp`, `tcu_mbarrier_async`, `tcu_tmem_chain`, `tcu_tmem_shift_fence`, `tcu_tmem_shift_refill`, `tcu_wmma_dualwarp`, and `tcu_wmma_overlap`.
+- The current TCU regression set is `sgemm_tcu`, `sgemm_tcu_tmem`, `sgemm_tcu_tmem_dualwarp`, `tcu_mbarrier_async`, `tcu_tmem_chain`, `tcu_tmem_shift_fence`, `tcu_tmem_shift_refill`, `tcu_tmem_window_d`, `tcu_warpgroup_collective`, `tcu_wmma_dualwarp`, and `tcu_wmma_overlap`.
 - The default flow assumes the current repository defaults: `NUM_THREADS=32` and `EXT_TCU_ENABLE=1`.

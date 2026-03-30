@@ -746,6 +746,7 @@ int main() {
   mma_descs[0].fmt_a = vt::ATYPE::id;
   mma_descs[0].fmt_b = vt::BTYPE::id;
   mma_descs[0].fmt_c = vt::OTYPE::id;
+  mma_descs[0].fmt_d = vt::OTYPE::id;
   mma_descs[0].sparse_mode = kSparse2To4 ? vt::sparse_2_4 : (kSparse1To4 ? vt::sparse_1_4 : vt::sparse_none);
   mma_descs[0].a_rows = kTileDim;
   mma_descs[0].a_cols = kAKDim;

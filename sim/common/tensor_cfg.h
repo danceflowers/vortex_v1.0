@@ -23,7 +23,7 @@ namespace vortex {
 namespace tensor {
 
 static constexpr uint32_t descriptor_table_magic = 0x54435544u;
-static constexpr uint16_t descriptor_table_version = 2;
+static constexpr uint16_t descriptor_table_version = 3;
 static constexpr uint32_t max_static_descriptor_id = 32;
 
 struct descriptor_table_arg_t {

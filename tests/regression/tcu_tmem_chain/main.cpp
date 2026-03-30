@@ -34,12 +34,21 @@ static constexpr uint32_t kABytes = kTileDim * kTileDim * sizeof(input_a_t);
 static constexpr uint32_t kBBytes = kTileDim * kTileDim * sizeof(input_b_t);
 static constexpr uint32_t kCBytes = kTileDim * kTileDim * sizeof(output_t);
 static constexpr uint32_t kCompositeBytes = kABytes + kBBytes + kCBytes;
-static constexpr uint32_t kBankSizeBytes = 256;
-static constexpr uint32_t kBankSpan = kCompositeBytes / kBankSizeBytes;
-static constexpr uint8_t kTileRoleNone = 0;
+static constexpr uint32_t align_up(uint32_t value, uint32_t align) {
+  return ((value + align - 1) / align) * align;
+}
+static constexpr uint32_t max3(uint32_t a, uint32_t b, uint32_t c) {
+  return std::max(a, std::max(b, c));
+}
+static constexpr uint32_t kABankSpan = align_up(kTileDim * sizeof(input_a_t), 16);
+static constexpr uint32_t kBBankSpan = align_up(kTileDim * sizeof(input_b_t), 16);
+static constexpr uint32_t kCBankSpan = align_up(kTileDim * sizeof(output_t), 16);
+static constexpr uint32_t kBankSpan = max3(kABankSpan, kBBankSpan, kCBankSpan);
+static constexpr uint8_t kTileRoleA = 1;
+static constexpr uint8_t kTileRoleB = 2;
 static constexpr uint8_t kTileRoleC = 3;
+static constexpr uint8_t kTileRoleD = 4;
 static constexpr uint8_t kPayloadDense = 0;
-static_assert((kCompositeBytes % kBankSizeBytes) == 0, "TMEM composite tile must be bank aligned");
 
 vx_device_h device = nullptr;
 vx_buffer_h input_buffer = nullptr;
@@ -104,17 +113,42 @@ int main() {
   host_utils::pack_ab_tile(h_composite, kABytes, b_tile, true);
   host_utils::pack_c_tile(h_composite, kABytes + kBBytes, c_tile);
 
-  tma_descriptor_t tma_descs[2] = {};
+  tma_descriptor_t tma_descs[4] = {};
   mma_descriptor_t mma_descs[1] = {};
-  tma_descs[0].size_bytes = kCompositeBytes;
-  tma_descs[0].tile_role = kTileRoleNone;
+  tma_descs[0].size_bytes = kABytes;
+  tma_descs[0].rows = kTileDim;
+  tma_descs[0].cols = kTileDim;
+  tma_descs[0].elem_bytes = sizeof(input_a_t);
+  tma_descs[0].tile_role = kTileRoleA;
   tma_descs[0].payload_kind = kPayloadDense;
-  tma_descs[1].size_bytes = kCBytes;
-  tma_descs[1].tile_role = kTileRoleC;
+  tma_descs[1].size_bytes = kBBytes;
+  tma_descs[1].rows = kTileDim;
+  tma_descs[1].cols = kTileDim;
+  tma_descs[1].elem_bytes = sizeof(input_b_t);
+  tma_descs[1].tile_role = kTileRoleB;
   tma_descs[1].payload_kind = kPayloadDense;
+  tma_descs[2].size_bytes = kCBytes;
+  tma_descs[2].rows = kTileDim;
+  tma_descs[2].cols = kTileDim;
+  tma_descs[2].elem_bytes = sizeof(output_t);
+  tma_descs[2].tile_role = kTileRoleC;
+  tma_descs[2].payload_kind = kPayloadDense;
+  tma_descs[3].size_bytes = kCBytes;
+  tma_descs[3].rows = kTileDim;
+  tma_descs[3].cols = kTileDim;
+  tma_descs[3].elem_bytes = sizeof(output_t);
+  tma_descs[3].tile_role = kTileRoleD;
+  tma_descs[3].payload_kind = kPayloadDense;
   mma_descs[0].fmt_a = vt::ATYPE::id;
   mma_descs[0].fmt_b = vt::BTYPE::id;
   mma_descs[0].fmt_c = vt::OTYPE::id;
+  mma_descs[0].fmt_d = vt::OTYPE::id;
+  mma_descs[0].a_rows = kTileDim;
+  mma_descs[0].a_cols = kTileDim;
+  mma_descs[0].b_rows = kTileDim;
+  mma_descs[0].b_cols = kTileDim;
+  mma_descs[0].c_rows = kTileDim;
+  mma_descs[0].c_cols = kTileDim;
 
   RT_CHECK(vx_mem_alloc(device, kCompositeBytes, VX_MEM_READ, &input_buffer));
   RT_CHECK(vx_mem_alloc(device, kCBytes, VX_MEM_WRITE, &output_buffer));
@@ -128,7 +162,9 @@ int main() {
   RT_CHECK(vx_mem_address(input_buffer, &input_addr));
   RT_CHECK(vx_mem_address(output_buffer, &output_addr));
   tma_descs[0].addr = input_addr;
-  tma_descs[1].addr = output_addr;
+  tma_descs[1].addr = input_addr + kABytes;
+  tma_descs[2].addr = input_addr + kABytes + kBBytes;
+  tma_descs[3].addr = output_addr;
 
   RT_CHECK(vx_copy_to_dev(input_buffer, h_composite.data(), 0, h_composite.size()));
   RT_CHECK(vx_copy_to_dev(tma_desc_buffer, tma_descs, 0, sizeof(tma_descs)));
@@ -138,7 +174,7 @@ int main() {
   RT_CHECK(vx_mem_address(mma_desc_buffer, &mma_desc_table_addr));
   kernel_arg.desc_tables.magic = vt::descriptor_table_magic;
   kernel_arg.desc_tables.version = vt::descriptor_table_version;
-  kernel_arg.desc_tables.tma_desc_count = 2;
+  kernel_arg.desc_tables.tma_desc_count = 4;
   kernel_arg.desc_tables.mma_desc_count = 1;
   kernel_arg.desc_tables.tma_desc_addr = tma_desc_table_addr;
   kernel_arg.desc_tables.mma_desc_addr = mma_desc_table_addr;
@@ -146,7 +182,9 @@ int main() {
   kernel_arg.grid_dim[1] = 1;
   kernel_arg.block_dim[0] = NUM_THREADS;
   kernel_arg.block_dim[1] = 1;
-  kernel_arg.bank_span = kBankSpan;
+  kernel_arg.a_bank_span = kABankSpan;
+  kernel_arg.b_bank_span = kBBankSpan;
+  kernel_arg.c_bank_span = kCBankSpan;
 
   RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
   RT_CHECK(vx_upload_bytes(device, &kernel_arg, sizeof(kernel_arg), &args_buffer));

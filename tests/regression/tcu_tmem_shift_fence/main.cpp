@@ -27,8 +27,7 @@ static constexpr uint32_t kCols = 16;
 static constexpr uint32_t kElemBytes = sizeof(uint16_t);
 static constexpr uint32_t kRowBytes = kCols * kElemBytes;
 static constexpr uint32_t kTileBytes = kRows * kRowBytes;
-static constexpr uint32_t kBankSizeBytes = 256;
-static constexpr uint32_t kBankSpan = kTileBytes / kBankSizeBytes;
+static constexpr uint32_t kBankSpan = kRowBytes;
 static constexpr uint8_t kTileRoleNone = 0;
 static constexpr uint8_t kPayloadDense = 0;
 

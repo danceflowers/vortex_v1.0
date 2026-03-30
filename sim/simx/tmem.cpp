@@ -13,10 +13,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <cstdlib>
 #include <numeric>
 #include <sstream>
 #include <vector>
+#include "tensor_cfg.h"
 #include "tmem.h"
 
 using namespace vortex;
@@ -63,6 +65,31 @@ uint32_t choose_coprime_stride(uint32_t count, uint32_t preferred) {
   }
 
   return 1;
+}
+
+uint32_t fmt_bytes(uint32_t fmt) {
+  switch (fmt) {
+  case vortex::tensor::fp8::id:
+  case vortex::tensor::uint8::id:
+    return 1;
+  case vortex::tensor::fp16::id:
+  case vortex::tensor::bf16::id:
+    return 2;
+  case vortex::tensor::fp32::id:
+    return 4;
+  default:
+    return 0;
+  }
+}
+
+bool uses_single_legacy_linear_window(const TmemAllocation& allocation) {
+  if (!allocation.layout_valid || allocation.windows.size() != 1) {
+    return false;
+  }
+  const auto& window = allocation.windows.front();
+  return window.window_id == 0
+      && window.logical_col_span != 0
+      && window.logical_line_span != 0;
 }
 
 } // namespace
@@ -158,8 +185,10 @@ bool Tmem::query(uint32_t handle, uint32_t* col_span, uint32_t* size_bytes) cons
 }
 
 uint32_t Tmem::line_chunk_bank(uint32_t logical_line, uint32_t chunk_idx) const {
-  auto base = (logical_line * bank_swizzle_base_stride_) % num_physical_banks_;
-  return (base + chunk_idx * bank_swizzle_lane_stride_) % num_physical_banks_;
+  auto physical_row = logical_line / 2;
+  auto line_slot = logical_line % 2;
+  auto base = (physical_row * bank_swizzle_base_stride_) % num_physical_banks_;
+  return (base + line_slot * kPacketLanes + chunk_idx) % num_physical_banks_;
 }
 
 uint32_t Tmem::packet_lane_bank(uint32_t logical_col,
@@ -179,7 +208,7 @@ void Tmem::logical_byte_to_physical(uint32_t logical_col,
     *bank = line_chunk_bank(logical_line, chunk_idx);
   }
   if (row) {
-    *row = logical_line;
+    *row = logical_line / 2;
   }
   if (bank_byte) {
     *bank_byte = logical_col % kPhysicalBankBytes;
@@ -417,6 +446,9 @@ bool Tmem::read_packet(uint32_t handle, uint32_t packet_idx, TmemPacket* out) co
   const TmemAllocation* allocation = nullptr;
   if (!lookup_allocation(handle, &allocation)) {
     return false;
+  }
+  if (uses_single_legacy_linear_window(*allocation)) {
+    return read_window_linear_packet(handle, 0, packet_idx, out);
   }
   return region_read_packet(allocation->payload_col_base, allocation->col_span, packet_idx, out);
 }
@@ -735,10 +767,116 @@ bool Tmem::shift_window_down(uint32_t handle, uint32_t window_id) {
   return true;
 }
 
+bool Tmem::shift_window_math_row_down(uint32_t handle,
+                                      uint32_t window_id,
+                                      const uint8_t* refill_row,
+                                      uint32_t refill_size_bytes) {
+  const TmemAllocation* allocation = nullptr;
+  const TmemWindowPlan* window = nullptr;
+  if (!lookup_allocation(handle, &allocation) || !lookup_window(handle, window_id, &window)) {
+    return false;
+  }
+
+  auto elem_bytes = fmt_bytes(window->fmt);
+  if (0 == elem_bytes || window->elem_shape.empty() || window->packet_cols == 0 || window->packet_rows == 0) {
+    if (!shift_window_down(handle, window_id)) {
+      return false;
+    }
+    if (refill_row != nullptr && refill_size_bytes != 0) {
+      auto col_base = resolve_window_col_base(*allocation, *window);
+      auto top_line = window->logical_line_base;
+      auto copy_bytes = std::min<uint32_t>(window->logical_col_span, refill_size_bytes);
+      for (uint32_t i = 0; i < copy_bytes; ++i) {
+        write_logical_byte(col_base + i, top_line, refill_row[i]);
+      }
+    }
+    assert_valid();
+    return true;
+  }
+
+  auto rows = std::max<uint32_t>(1, window->elem_shape.rows);
+  auto cols = std::max<uint32_t>(1, window->elem_shape.cols);
+  auto row_bytes = cols * elem_bytes;
+  std::vector<uint8_t> math_bytes(rows * row_bytes, 0);
+
+  auto packet_cols_per_tile = ceil_div(TmemWindowPlanner::kTileCols, window->packet_cols);
+  for (uint32_t tile_idx = 0; tile_idx < window->tile_count; ++tile_idx) {
+    auto tile_row = tile_idx / std::max<uint32_t>(1, window->tile_cols);
+    auto tile_col = tile_idx % std::max<uint32_t>(1, window->tile_cols);
+    for (uint32_t local_packet_idx = 0; local_packet_idx < window->packets_per_tile; ++local_packet_idx) {
+      auto packet_row_group = local_packet_idx / packet_cols_per_tile;
+      auto packet_col_group = local_packet_idx % packet_cols_per_tile;
+      auto packet_idx = tile_idx * window->packets_per_tile + local_packet_idx;
+      TmemPacket packet;
+      if (!read_window_packet(handle, window_id, packet_idx, &packet)) {
+        return false;
+      }
+      uint32_t offset = 0;
+      for (uint32_t pr = 0; pr < window->packet_rows; ++pr) {
+        auto math_row = tile_row * TmemWindowPlanner::kTileRows + packet_row_group * window->packet_rows + pr;
+        for (uint32_t pc = 0; pc < window->packet_cols; ++pc) {
+          auto math_col = tile_col * TmemWindowPlanner::kTileCols + packet_col_group * window->packet_cols + pc;
+          for (uint32_t b = 0; b < elem_bytes; ++b) {
+            if (math_row < rows && math_col < cols) {
+              math_bytes.at(math_row * row_bytes + math_col * elem_bytes + b) = packet.bytes.at(offset);
+            }
+            ++offset;
+          }
+        }
+      }
+    }
+  }
+
+  if (rows > 1) {
+    std::memmove(math_bytes.data() + row_bytes, math_bytes.data(), (rows - 1) * row_bytes);
+  }
+  std::fill_n(math_bytes.data(), row_bytes, 0);
+  if (refill_row != nullptr && refill_size_bytes != 0) {
+    std::copy_n(refill_row, std::min<uint32_t>(row_bytes, refill_size_bytes), math_bytes.data());
+  }
+
+  for (uint32_t tile_idx = 0; tile_idx < window->tile_count; ++tile_idx) {
+    auto tile_row = tile_idx / std::max<uint32_t>(1, window->tile_cols);
+    auto tile_col = tile_idx % std::max<uint32_t>(1, window->tile_cols);
+    for (uint32_t local_packet_idx = 0; local_packet_idx < window->packets_per_tile; ++local_packet_idx) {
+      auto packet_row_group = local_packet_idx / packet_cols_per_tile;
+      auto packet_col_group = local_packet_idx % packet_cols_per_tile;
+      auto packet_idx = tile_idx * window->packets_per_tile + local_packet_idx;
+      TmemPacket packet;
+      uint32_t offset = 0;
+      for (uint32_t pr = 0; pr < window->packet_rows; ++pr) {
+        auto math_row = tile_row * TmemWindowPlanner::kTileRows + packet_row_group * window->packet_rows + pr;
+        for (uint32_t pc = 0; pc < window->packet_cols; ++pc) {
+          auto math_col = tile_col * TmemWindowPlanner::kTileCols + packet_col_group * window->packet_cols + pc;
+          for (uint32_t b = 0; b < elem_bytes; ++b) {
+            if (math_row < rows && math_col < cols) {
+              packet.bytes.at(offset) = math_bytes.at(math_row * row_bytes + math_col * elem_bytes + b);
+            }
+            ++offset;
+          }
+        }
+      }
+      if (!write_window_packet(handle, window_id, packet_idx, packet)) {
+        return false;
+      }
+    }
+  }
+
+  assert_valid();
+  return true;
+}
+
 bool Tmem::write_packet(uint32_t handle, uint32_t packet_idx, const TmemPacket& in) {
   TmemAllocation* allocation = nullptr;
   if (!lookup_allocation(handle, &allocation)) {
     return false;
+  }
+  if (uses_single_legacy_linear_window(*allocation)) {
+    if (!write_window_linear_packet(handle, 0, packet_idx, in)) {
+      return false;
+    }
+    allocation->payload_ready = true;
+    return true;
   }
   if (!region_write_packet(allocation->payload_col_base, allocation->col_span, packet_idx, in)) {
     return false;
@@ -1222,6 +1360,9 @@ bool Tmem::try_acquire_read_packet(uint64_t cycle, uint32_t handle, uint32_t pac
   if (!lookup_allocation(handle, &allocation)) {
     return false;
   }
+  if (uses_single_legacy_linear_window(*allocation)) {
+    return try_acquire_window_linear_read_packet(cycle, handle, 0, packet_idx);
+  }
   return try_acquire_region_read_packet(cycle, allocation->payload_col_base, allocation->col_span, packet_idx);
 }
 
@@ -1237,6 +1378,9 @@ bool Tmem::try_acquire_write_packet(uint64_t cycle, uint32_t handle, uint32_t pa
   const TmemAllocation* allocation = nullptr;
   if (!lookup_allocation(handle, &allocation)) {
     return false;
+  }
+  if (uses_single_legacy_linear_window(*allocation)) {
+    return try_acquire_window_linear_write_packet(cycle, handle, 0, packet_idx);
   }
   return try_acquire_region_write_packet(cycle, allocation->payload_col_base, allocation->col_span, packet_idx);
 }

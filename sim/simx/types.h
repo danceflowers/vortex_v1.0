@@ -709,31 +709,97 @@ enum class TcuType {
   WMMA,
 };
 
-static constexpr uint32_t kTmemTaggedHandleWindowBits = 8;
-static constexpr uint32_t kTmemTaggedHandleBaseBits = 32 - kTmemTaggedHandleWindowBits;
-static constexpr uint32_t kTmemTaggedHandleWindowShift = kTmemTaggedHandleBaseBits;
-static constexpr uint32_t kTmemTaggedHandleBaseMask = (1u << kTmemTaggedHandleBaseBits) - 1;
-static constexpr uint32_t kTmemShiftRefillFlag = 0x80000000u;
+static constexpr uint32_t kInvalidTcuDescriptorId = 0xffffffffu;
+static constexpr uint32_t kTcuTmemOpCtlWindowBits = 8;
+static constexpr uint32_t kTcuTmemOpCtlDescBits = 16;
+static constexpr uint32_t kTcuTmemOpCtlFlagsBits = 8;
+static constexpr uint32_t kTcuTmemOpCtlWindowShift = 0;
+static constexpr uint32_t kTcuTmemOpCtlDescShift =
+    kTcuTmemOpCtlWindowShift + kTcuTmemOpCtlWindowBits;
+static constexpr uint32_t kTcuTmemOpCtlFlagsShift =
+    kTcuTmemOpCtlDescShift + kTcuTmemOpCtlDescBits;
+static constexpr uint32_t kTcuTmemOpFlagRefill = 0x1u;
+static constexpr uint32_t kTcuMmaMemCtlTargetBits = 2;
+static constexpr uint32_t kTcuMmaMemCtlWindowBits = 8;
+static constexpr uint32_t kTcuMmaMemCtlTileBits = 16;
+static constexpr uint32_t kTcuMmaMemCtlSlotBits = 2;
+static constexpr uint32_t kTcuWmmaSlotCtlSlotBits = 2;
+static constexpr uint32_t kTcuWmmaSlotCtlAShift = 0;
+static constexpr uint32_t kTcuWmmaSlotCtlBShift = kTcuWmmaSlotCtlAShift + kTcuWmmaSlotCtlSlotBits;
+static constexpr uint32_t kTcuMmaMemCtlTargetShift = 0;
+static constexpr uint32_t kTcuMmaMemCtlWindowShift = kTcuMmaMemCtlTargetShift + kTcuMmaMemCtlTargetBits;
+static constexpr uint32_t kTcuMmaMemCtlTileShift = kTcuMmaMemCtlWindowShift + kTcuMmaMemCtlWindowBits;
+static constexpr uint32_t kTcuMmaMemCtlSlotShift = kTcuMmaMemCtlTileShift + kTcuMmaMemCtlTileBits;
 
-inline uint32_t tmem_tagged_handle_base(uint32_t tagged_handle) {
-  return tagged_handle & kTmemTaggedHandleBaseMask;
+inline uint32_t tcu_mma_mem_ctl_mask(uint32_t bits) {
+  return (bits >= 32) ? 0xffffffffu : ((1u << bits) - 1);
 }
 
-inline uint32_t tmem_tagged_handle_window(uint32_t tagged_handle) {
-  return tagged_handle >> kTmemTaggedHandleWindowShift;
+inline uint32_t tcu_tmem_op_make_control(uint32_t window_id,
+                                         uint32_t desc_id = 0,
+                                         uint32_t flags = 0) {
+  return ((window_id & tcu_mma_mem_ctl_mask(kTcuTmemOpCtlWindowBits)) << kTcuTmemOpCtlWindowShift)
+       | ((desc_id & tcu_mma_mem_ctl_mask(kTcuTmemOpCtlDescBits)) << kTcuTmemOpCtlDescShift)
+       | ((flags & tcu_mma_mem_ctl_mask(kTcuTmemOpCtlFlagsBits)) << kTcuTmemOpCtlFlagsShift);
 }
 
-inline uint32_t tmem_make_tagged_handle(uint32_t base_handle, uint32_t window_id) {
-  return (base_handle & kTmemTaggedHandleBaseMask)
-       | ((window_id & ((1u << kTmemTaggedHandleWindowBits) - 1)) << kTmemTaggedHandleWindowShift);
+inline uint32_t tcu_tmem_op_ctl_window_id(uint32_t control) {
+  return (control >> kTcuTmemOpCtlWindowShift) & tcu_mma_mem_ctl_mask(kTcuTmemOpCtlWindowBits);
 }
 
-inline bool tmem_shift_has_refill(uint32_t control) {
-  return (control & kTmemShiftRefillFlag) != 0;
+inline uint32_t tcu_tmem_op_ctl_desc_id(uint32_t control) {
+  return (control >> kTcuTmemOpCtlDescShift) & tcu_mma_mem_ctl_mask(kTcuTmemOpCtlDescBits);
 }
 
-inline uint32_t tmem_shift_refill_desc_id(uint32_t control) {
-  return control & ~kTmemShiftRefillFlag;
+inline uint32_t tcu_tmem_op_ctl_flags(uint32_t control) {
+  return (control >> kTcuTmemOpCtlFlagsShift) & tcu_mma_mem_ctl_mask(kTcuTmemOpCtlFlagsBits);
+}
+
+inline uint32_t tcu_mma_mem_make_control(TcuTarget target,
+                                         uint32_t slot_id,
+                                         uint32_t window_id,
+                                         uint32_t tile_id) {
+  return ((static_cast<uint32_t>(target) & tcu_mma_mem_ctl_mask(kTcuMmaMemCtlTargetBits)) << kTcuMmaMemCtlTargetShift)
+       | ((window_id & tcu_mma_mem_ctl_mask(kTcuMmaMemCtlWindowBits)) << kTcuMmaMemCtlWindowShift)
+       | ((tile_id & tcu_mma_mem_ctl_mask(kTcuMmaMemCtlTileBits)) << kTcuMmaMemCtlTileShift)
+       | ((slot_id & tcu_mma_mem_ctl_mask(kTcuMmaMemCtlSlotBits)) << kTcuMmaMemCtlSlotShift);
+}
+
+inline TcuTarget tcu_mma_mem_ctl_target(uint32_t control) {
+  auto raw = (control >> kTcuMmaMemCtlTargetShift) & tcu_mma_mem_ctl_mask(kTcuMmaMemCtlTargetBits);
+  switch (raw) {
+  case 0: return TcuTarget::None;
+  case 1: return TcuTarget::A;
+  case 2: return TcuTarget::B;
+  case 3: return TcuTarget::C;
+  default:
+    std::abort();
+  }
+}
+
+inline uint32_t tcu_mma_mem_ctl_window_id(uint32_t control) {
+  return (control >> kTcuMmaMemCtlWindowShift) & tcu_mma_mem_ctl_mask(kTcuMmaMemCtlWindowBits);
+}
+
+inline uint32_t tcu_mma_mem_ctl_tile_id(uint32_t control) {
+  return (control >> kTcuMmaMemCtlTileShift) & tcu_mma_mem_ctl_mask(kTcuMmaMemCtlTileBits);
+}
+
+inline uint32_t tcu_mma_mem_ctl_slot_id(uint32_t control) {
+  return (control >> kTcuMmaMemCtlSlotShift) & tcu_mma_mem_ctl_mask(kTcuMmaMemCtlSlotBits);
+}
+
+inline uint32_t tcu_wmma_make_slot_control(uint32_t a_slot_id, uint32_t b_slot_id) {
+  return ((a_slot_id & tcu_mma_mem_ctl_mask(kTcuWmmaSlotCtlSlotBits)) << kTcuWmmaSlotCtlAShift)
+       | ((b_slot_id & tcu_mma_mem_ctl_mask(kTcuWmmaSlotCtlSlotBits)) << kTcuWmmaSlotCtlBShift);
+}
+
+inline uint32_t tcu_wmma_ctl_a_slot_id(uint32_t control) {
+  return (control >> kTcuWmmaSlotCtlAShift) & tcu_mma_mem_ctl_mask(kTcuWmmaSlotCtlSlotBits);
+}
+
+inline uint32_t tcu_wmma_ctl_b_slot_id(uint32_t control) {
+  return (control >> kTcuWmmaSlotCtlBShift) & tcu_mma_mem_ctl_mask(kTcuWmmaSlotCtlSlotBits);
 }
 
 struct IntrTcuArgs {
@@ -741,6 +807,7 @@ struct IntrTcuArgs {
   uint32_t fmt_a = 0;
   uint32_t fmt_b = 0;
   uint32_t fmt_c = 0;
+  uint32_t fmt_d = 0;
   uint32_t step_m = 0;
   uint32_t step_n = 0;
   uint32_t step_k = 0;
@@ -748,16 +815,20 @@ struct IntrTcuArgs {
   uint32_t meta_col_span = 0;
   uint32_t packet_count = 0;
   uint32_t async_id = 0;
-  uint32_t descriptor = 0xffffffffu;
+  uint32_t descriptor = kInvalidTcuDescriptorId;
   uint32_t runtime_handle = 0;
   uint32_t window_id = 0;
-  uint32_t sparse_mode = 0;
+  uint32_t tile_id = 0;
+  uint32_t a_sparse_mode = 0;
   uint32_t barrier_id = 0;
   uint32_t slot_id = 0;
+  uint32_t a_slot_id = 0;
+  uint32_t b_slot_id = 0;
   uint32_t c_slot_id = 0;
   uint8_t ws = 0;
   uint8_t sp = 0;
   uint8_t macro_op = 0;
+  uint8_t transpose_a = 0;
   uint8_t transpose_b = 0;
   TcuTarget target = TcuTarget::None;
   TcuPayloadKind payload_kind = TcuPayloadKind::Dense;

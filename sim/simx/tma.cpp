@@ -86,17 +86,13 @@ bool TmaModel::read_mma_descriptor(uint64_t startup_arg,
   return true;
 }
 
-uint32_t TmaModel::estimate_load_latency(const TmaDescriptor& desc, bool transpose_b) const {
+uint32_t TmaModel::estimate_load_latency(const TmaDescriptor& desc) const {
   uint32_t size_bytes = payload_size_bytes(desc);
   if (desc.meta_addr != 0 && desc.meta_size_bytes != 0 && desc.meta_col_span != 0) {
     size_bytes += desc.meta_size_bytes;
   }
   uint32_t transfer_cycles = std::max<uint32_t>(1, (size_bytes + kLoadBytesPerCycle - 1) / kLoadBytesPerCycle);
-  uint32_t latency = kLoadBaseLatency + transfer_cycles;
-  if (transpose_b || ((desc.flags & 0x1) != 0)) {
-    latency += kTransposePenalty;
-  }
-  return latency;
+  return kLoadBaseLatency + transfer_cycles;
 }
 
 uint32_t TmaModel::payload_size_bytes(const TmaDescriptor& desc) const {
@@ -118,7 +114,6 @@ uint32_t TmaModel::meta_packet_count(const TmaDescriptor& desc) const {
 }
 
 bool TmaModel::load_payload(const TmaDescriptor& desc,
-                            bool transpose_b,
                             uint32_t capacity,
                             std::vector<uint8_t>* out,
                             const ReadCallback& dcache_read) const {
@@ -132,23 +127,7 @@ bool TmaModel::load_payload(const TmaDescriptor& desc,
     return true;
   }
 
-  bool do_transpose = transpose_b || ((desc.flags & 0x1) != 0);
-  uint32_t matrix_bytes = desc.rows * desc.cols * desc.elem_bytes;
-  if (desc.rows > 0 && desc.cols > 0 && desc.elem_bytes > 0 && do_transpose) {
-    std::vector<uint8_t> src(matrix_bytes, 0);
-    dcache_read(src.data(), desc.addr, matrix_bytes);
-    for (uint32_t r = 0; r < desc.rows; ++r) {
-      for (uint32_t c = 0; c < desc.cols; ++c) {
-        auto src_off = (r * desc.cols + c) * desc.elem_bytes;
-        auto dst_off = (c * desc.rows + r) * desc.elem_bytes;
-        if (dst_off + desc.elem_bytes <= out->size() && src_off + desc.elem_bytes <= src.size()) {
-          std::copy_n(src.data() + src_off, desc.elem_bytes, out->data() + dst_off);
-        }
-      }
-    }
-  } else {
-    dcache_read(out->data(), desc.addr, size_bytes);
-  }
+  dcache_read(out->data(), desc.addr, size_bytes);
   return true;
 }
 

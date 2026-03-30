@@ -16,7 +16,8 @@ struct Config {
 struct TensorCoreMeta {
     uint32_t wid = 0;
     uint32_t async_id = 0;
-    uint32_t ab_slot_id = 0;
+    uint32_t a_slot_id = 0;
+    uint32_t b_slot_id = 0;
     uint32_t c_slot_id = 0;
     uint32_t c_subtile_id = 0;
     bool valid = false;

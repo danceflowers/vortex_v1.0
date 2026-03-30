@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <iostream>
 #include <limits>
 #include <unordered_map>
 #include <vector>
@@ -40,29 +41,6 @@ inline uint64_t nan_box(uint32_t value) {
   return value | 0xffffffff00000000;
 }
 
-inline float fp16_to_float(uint16_t input) {
-  return bit_cast<float>(rv_htof_s(input, 0, nullptr));
-}
-
-inline uint16_t float_to_fp16(float input) {
-  return rv_ftoh_s(bit_cast<uint32_t>(input), 0, nullptr);
-}
-
-uint16_t unpack_word_lane(uint32_t fmt_ab, uint32_t word, uint32_t lane) {
-  switch (fmt_ab) {
-  case vt::fp16::id:
-    if (lane > 1)
-      return 0;
-    return (word >> (lane * 16)) & 0xffff;
-  case vt::fp8::id:
-    if (lane > 3)
-      return 0;
-    return (word >> (lane * 8)) & 0xff;
-  default:
-    return 0;
-  }
-}
-
 bool use_open_tensorcore(uint32_t fmt_a, uint32_t fmt_b, uint32_t fmt_c) {
   if constexpr (NUM_THREADS != 32) {
     return false;
@@ -74,19 +52,10 @@ bool use_open_tensorcore(uint32_t fmt_a, uint32_t fmt_b, uint32_t fmt_c) {
   return supported_a && supported_b;
 }
 
-uint32_t legacy_k_passes(uint32_t fmt_ab) {
-  switch (fmt_ab) {
-  case vt::fp16::id:
-    return 1;
+PrecisionType map_out_precision(uint32_t fmt_out) {
+  switch (fmt_out) {
   case vt::fp8::id:
-    return 2;
-  default:
-    std::abort();
-  }
-}
-
-PrecisionType map_out_precision(uint32_t fmt_c) {
-  switch (fmt_c) {
+    return PREC_FP8_E4M3;
   case vt::fp16::id:
     return PREC_FP16;
   case vt::fp32::id:
@@ -100,38 +69,64 @@ uint32_t a_packet_count(uint32_t fmt_a) {
   return (fmt_a == vt::fp16::id) ? 8 : 4;
 }
 
-uint32_t b_packet_count(uint32_t fmt_b, uint32_t sparse_mode) {
-  uint32_t dense = (fmt_b == vt::fp16::id) ? 8 : 4;
-  if (sparse_mode == vt::sparse_2_4) {
-    return dense * 2;
-  }
-  if (sparse_mode == vt::sparse_1_4) {
-    return dense * 4;
-  }
-  return dense;
+uint32_t b_packet_count(uint32_t fmt_b) {
+  return (fmt_b == vt::fp16::id) ? 8 : 4;
 }
 
-uint32_t meta_packet_count(uint32_t sparse_mode) {
-  return (sparse_mode == vt::sparse_none) ? 0 : MetaMem::packet_count();
+uint32_t meta_packet_count(uint32_t a_sparse_mode) {
+  return (a_sparse_mode == vt::sparse_none) ? 0 : MetaMem::packet_count();
 }
 
 uint32_t meta_shadow_window_id(uint32_t window_id) {
   return window_id | 0x80000000u;
 }
 
-uint32_t ab_packet_count(uint32_t fmt_ab) {
-  return (fmt_ab == vt::fp16::id) ? 8 : 4;
+static constexpr uint32_t kUnsetPayloadFmt = 0xffffffffu;
+
+uint32_t c_load_packet_count(uint32_t fmt_c) {
+  switch (fmt_c) {
+  case vt::fp8::id:
+    return 4;
+  case vt::fp16::id:
+    return 8;
+  case vt::fp32::id:
+    return 16;
+  default:
+    return 0;
+  }
 }
 
-uint32_t c_packet_count(uint32_t fmt_c) {
-  return (fmt_c == vt::fp32::id) ? 16 : 8;
+uint32_t d_store_packet_count(uint32_t fmt_d) {
+  switch (fmt_d) {
+  case vt::fp8::id:
+    return 4;
+  case vt::fp16::id:
+    return 8;
+  case vt::fp32::id:
+    return 16;
+  default:
+    return 0;
+  }
+}
+
+bool window_matches_load_target(TcuTarget load_target, TmemWindowTarget window_target) {
+  switch (load_target) {
+  case TcuTarget::A:
+    return window_target == TmemWindowTarget::A;
+  case TcuTarget::B:
+    return window_target == TmemWindowTarget::B;
+  case TcuTarget::C:
+    return window_target == TmemWindowTarget::C || window_target == TmemWindowTarget::D;
+  default:
+    return false;
+  }
 }
 
 uint32_t target_packet_offset(const IntrTcuArgs& args) {
   auto fmt_a = args.fmt_a ? args.fmt_a : args.fmt_ab;
   auto fmt_b = args.fmt_b ? args.fmt_b : args.fmt_ab;
   auto a_packets = a_packet_count(fmt_a);
-  auto b_packets = b_packet_count(fmt_b, args.sparse_mode);
+  auto b_packets = b_packet_count(fmt_b);
   switch (args.target) {
   case TcuTarget::A:
     return 0;
@@ -160,254 +155,6 @@ void configure_open_tensorcore_precision(uint32_t fmt_c) {
   g_cfg.out_precisions.push_back(map_out_precision(fmt_c));
 }
 
-void init_open_tensorcore_job(TensorCoreTop* tc,
-                              uint32_t fmt_c,
-                              const uint16_t a_in[8][8],
-                              const uint16_t b_in[8][8],
-                              const uint32_t c_in[8][8]) {
-  configure_open_tensorcore_precision(fmt_c);
-  tc->reset();
-  tc->load_inputs(a_in, b_in, c_in);
-  tc->tick(true);
-  tc->load_invalid();
-}
-
-bool step_open_tensorcore_job(TensorCoreTop* tc, uint32_t fmt_c) {
-  configure_open_tensorcore_precision(fmt_c);
-  return tc->run();
-}
-
-void run_open_tensorcore_primitive_blocking(uint32_t fmt_a,
-                                            uint32_t fmt_b,
-                                            uint32_t fmt_c,
-                                            const uint16_t a_in[8][8],
-                                            const uint16_t b_in[8][8],
-                                            uint32_t d_out[8][8],
-                                            const uint32_t (*c_in)[8] = nullptr) {
-  TensorCoreTop tc;
-  uint32_t c_raw[8][8] = {};
-  (void)fmt_a;
-  (void)fmt_b;
-  if (c_in != nullptr) {
-    for (uint32_t i = 0; i < 8; ++i) {
-      for (uint32_t j = 0; j < 8; ++j) {
-        c_raw[i][j] = c_in[i][j];
-      }
-    }
-  }
-
-  init_open_tensorcore_job(&tc, fmt_c, a_in, b_in, c_raw);
-
-  bool completed = false;
-  uint32_t spin_limit = 10000;
-  while (spin_limit-- > 0) {
-    if (step_open_tensorcore_job(&tc, fmt_c)) {
-      completed = true;
-      break;
-    }
-  }
-  if (!completed) {
-    std::abort();
-  }
-
-  for (uint32_t i = 0; i < 8; ++i) {
-    for (uint32_t j = 0; j < 8; ++j) {
-      d_out[i][j] = tc.d_out[i][j];
-    }
-  }
-}
-
-void encode_c_block_fp16(const uint16_t in[8][8], uint32_t out[8][8]) {
-  for (uint32_t i = 0; i < 8; ++i) {
-    for (uint32_t j = 0; j < 8; ++j) {
-      out[i][j] = in[i][j];
-    }
-  }
-}
-
-void decode_c_block_fp16(const uint32_t in[8][8], uint16_t out[8][8]) {
-  for (uint32_t i = 0; i < 8; ++i) {
-    for (uint32_t j = 0; j < 8; ++j) {
-      out[i][j] = in[i][j] & 0xffff;
-    }
-  }
-}
-
-void encode_c_block_fp32(const float in[8][8], uint32_t out[8][8]) {
-  for (uint32_t i = 0; i < 8; ++i) {
-    for (uint32_t j = 0; j < 8; ++j) {
-      out[i][j] = bit_cast<uint32_t>(in[i][j]);
-    }
-  }
-}
-
-void decode_c_block_fp32(const uint32_t in[8][8], float out[8][8]) {
-  for (uint32_t i = 0; i < 8; ++i) {
-    for (uint32_t j = 0; j < 8; ++j) {
-      out[i][j] = bit_cast<float>(in[i][j]);
-    }
-  }
-}
-
-void pack_fp16_block_to_rd(const uint16_t block[8][8], std::vector<reg_data_t>& rd_data) {
-  for (uint32_t lane = 0; lane < 32; ++lane) {
-    uint32_t i = lane / 4;
-    uint32_t j = (lane % 4) * 2;
-    uint32_t d0 = block[i][j + 0];
-    uint32_t d1 = block[i][j + 1];
-    rd_data.at(lane).u64 = nan_box(d0 | (d1 << 16));
-  }
-}
-
-void pack_fp32_block_to_rd(const uint32_t block[8][8], std::vector<reg_data_t>& rd_data) {
-  for (uint32_t lane = 0; lane < 32; ++lane) {
-    uint32_t i = lane / 4;
-    uint32_t j = lane % 4;
-    rd_data.at(lane).u64 = nan_box(block[i][j]);
-  }
-}
-
-uint32_t fedp_fp16_fp16(const reg_data_t* a_row, const reg_data_t* b_col, uint32_t c_val) {
-  auto acc = c_val & 0xffff;
-  for (uint32_t z = 0; z < vt::wmma_config_t<NUM_THREADS, vt::fp16, vt::fp16>::tcK; ++z) {
-    auto a0 = a_row[z].u32 & 0xffff;
-    auto a1 = (a_row[z].u32 >> 16) & 0xffff;
-    auto b0 = b_col[z].u32 & 0xffff;
-    auto b1 = (b_col[z].u32 >> 16) & 0xffff;
-    auto x0 = rv_fmul_s(rv_htof_s(a0, 0, nullptr), rv_htof_s(b0, 0, nullptr), 0, nullptr);
-    auto x1 = rv_fmul_s(rv_htof_s(a1, 0, nullptr), rv_htof_s(b1, 0, nullptr), 0, nullptr);
-    auto sum = rv_fadd_s(x0, x1, 0, nullptr);
-    auto accf = rv_htof_s(acc, 0, nullptr);
-    acc = rv_ftoh_s(rv_fadd_s(sum, accf, 0, nullptr), 0, nullptr);
-  }
-  return acc;
-}
-
-uint32_t fedp_fp16_fp32(const reg_data_t* a_row, const reg_data_t* b_col, uint32_t c_val) {
-  float acc = bit_cast<float>(c_val);
-  for (uint32_t z = 0; z < vt::wmma_config_t<NUM_THREADS, vt::fp16, vt::fp32>::tcK; ++z) {
-    auto a0 = a_row[z].u32 & 0xffff;
-    auto a1 = (a_row[z].u32 >> 16) & 0xffff;
-    auto b0 = b_col[z].u32 & 0xffff;
-    auto b1 = (b_col[z].u32 >> 16) & 0xffff;
-    acc += fp16_to_float(a0) * fp16_to_float(b0);
-    acc += fp16_to_float(a1) * fp16_to_float(b1);
-  }
-  return bit_cast<uint32_t>(acc);
-}
-
-void legacy_wmma(uint32_t fmt_a,
-                 uint32_t fmt_b,
-                 uint32_t fmt_c,
-                 uint32_t step_m,
-                 uint32_t step_n,
-                 const std::vector<reg_data_t>& rs1_data,
-                 const std::vector<reg_data_t>& rs2_data,
-                 const std::vector<reg_data_t>& rs3_data,
-                 std::vector<reg_data_t>& rd_data) {
-  if (fmt_a != fmt_b) {
-    std::abort();
-  }
-
-  auto fmt_ab = fmt_a;
-  if (use_open_tensorcore(fmt_a, fmt_b, fmt_c)) {
-    uint16_t a_primitive[8][8] = {};
-    uint16_t b_primitive[8][8] = {};
-    uint32_t c_raw[8][8] = {};
-    uint32_t d_raw[8][8] = {};
-    uint32_t tcK_words = 8 / legacy_k_passes(fmt_ab);
-
-    if (fmt_c == vt::fp16::id) {
-      uint16_t c_block[8][8] = {};
-      for (uint32_t lane = 0; lane < 32; ++lane) {
-        uint32_t i = lane / 4;
-        uint32_t j = (lane % 4) * 2;
-        auto word = rs3_data.at(lane).u32;
-        c_block[i][j + 0] = word & 0xffff;
-        c_block[i][j + 1] = (word >> 16) & 0xffff;
-      }
-      encode_c_block_fp16(c_block, c_raw);
-    } else {
-      for (uint32_t lane = 0; lane < 32; ++lane) {
-        uint32_t i = lane / 4;
-        uint32_t j = lane % 4;
-        c_raw[i][j] = rs3_data.at(lane).u32;
-      }
-    }
-
-    for (uint32_t step_k = 0; step_k < legacy_k_passes(fmt_ab); ++step_k) {
-      uint32_t lanes_per_word = 2 * legacy_k_passes(fmt_ab);
-      uint32_t z_begin = step_k * tcK_words / legacy_k_passes(fmt_ab);
-      uint32_t z_end = (step_k + 1) * tcK_words / legacy_k_passes(fmt_ab);
-
-      for (uint32_t i = 0; i < 8; ++i) {
-        for (uint32_t z = z_begin; z < z_end; ++z) {
-          auto a_word = rs1_data.at(i * tcK_words + z).u32;
-          uint32_t z_local = z - z_begin;
-          for (uint32_t lane = 0; lane < lanes_per_word; ++lane) {
-            uint32_t k_idx = (z_local * lanes_per_word + lane) % 8;
-            a_primitive[i][k_idx] = unpack_word_lane(fmt_ab, a_word, lane);
-          }
-        }
-      }
-      for (uint32_t j = 0; j < 8; ++j) {
-        for (uint32_t z = z_begin; z < z_end; ++z) {
-          auto b_word = rs2_data.at(j * tcK_words + z).u32;
-          uint32_t z_local = z - z_begin;
-          for (uint32_t lane = 0; lane < lanes_per_word; ++lane) {
-            uint32_t k_idx = (z_local * lanes_per_word + lane) % 8;
-            b_primitive[k_idx][j] = unpack_word_lane(fmt_ab, b_word, lane);
-          }
-        }
-      }
-
-      run_open_tensorcore_primitive_blocking(fmt_a, fmt_b, fmt_c, a_primitive, b_primitive, d_raw, c_raw);
-      std::copy(&d_raw[0][0], &d_raw[0][0] + 64, &c_raw[0][0]);
-    }
-
-    if (fmt_c == vt::fp16::id) {
-      uint16_t c_block[8][8] = {};
-      decode_c_block_fp16(c_raw, c_block);
-      pack_fp16_block_to_rd(c_block, rd_data);
-    } else {
-      pack_fp32_block_to_rd(c_raw, rd_data);
-    }
-    return;
-  }
-
-  if (fmt_ab == vt::fp16::id && fmt_c == vt::fp16::id) {
-    using cfg = vt::wmma_config_t<NUM_THREADS, vt::fp16, vt::fp16>;
-    auto a_off = (step_m % cfg::a_sub_blocks) * cfg::a_block_size;
-    auto b_off = (step_n % cfg::b_sub_blocks) * cfg::b_block_size;
-    for (uint32_t i = 0; i < cfg::tcM; ++i) {
-      for (uint32_t j = 0; j < cfg::tcN; ++j) {
-        auto a_row = rs1_data.data() + a_off + i * cfg::tcK;
-        auto b_col = rs2_data.data() + b_off + j * cfg::tcK;
-        auto c_val = rs3_data.at(i * cfg::tcN + j).u32;
-        rd_data.at(i * cfg::tcN + j).u64 = nan_box(fedp_fp16_fp16(a_row, b_col, c_val));
-      }
-    }
-    return;
-  }
-
-  if (fmt_ab == vt::fp16::id && fmt_c == vt::fp32::id) {
-    using cfg = vt::wmma_config_t<NUM_THREADS, vt::fp16, vt::fp32>;
-    auto a_off = (step_m % cfg::a_sub_blocks) * cfg::a_block_size;
-    auto b_off = (step_n % cfg::b_sub_blocks) * cfg::b_block_size;
-    for (uint32_t i = 0; i < cfg::tcM; ++i) {
-      for (uint32_t j = 0; j < cfg::tcN; ++j) {
-        auto a_row = rs1_data.data() + a_off + i * cfg::tcK;
-        auto b_col = rs2_data.data() + b_off + j * cfg::tcK;
-        auto c_val = rs3_data.at(i * cfg::tcN + j).u32;
-        rd_data.at(i * cfg::tcN + j).u64 = nan_box(fedp_fp16_fp32(a_row, b_col, c_val));
-      }
-    }
-    return;
-  }
-
-  std::abort();
-}
-
 } // namespace
 
 class TensorUnit::Impl {
@@ -421,48 +168,86 @@ public:
   static constexpr uint32_t kCmemWriteBeatsPerCycle = 1;
   static constexpr uint32_t kCmemReadBeatsPerCycle = 1;
   static constexpr uint32_t kMetaWriteBeatsPerCycle = 1;
-  struct OperandSlot {
-    uint32_t owner_wid = 0;
+  struct ASlotState {
+    uint32_t owner_wgid = 0;
     uint32_t descriptor = 0xffffffffu;
     uint32_t fmt_a = 0;
-    uint32_t fmt_b = 0;
-    uint32_t fmt_c = 0;
-    uint32_t sparse_mode = 0;
+    uint32_t a_sparse_mode = 0;
     uint32_t wmma_async_id = 0;
+    bool transpose_a = false;
+    bool valid = false;
+    bool busy = false;
+    bool a_ready = false;
+    bool a_pending = false;
+    bool wmma_pending = false;
+
+    void reset() {
+      owner_wgid = 0;
+      descriptor = 0xffffffffu;
+      fmt_a = 0;
+      a_sparse_mode = 0;
+      wmma_async_id = 0;
+      transpose_a = false;
+      valid = false;
+      busy = false;
+      a_ready = false;
+      a_pending = false;
+      wmma_pending = false;
+    }
+  };
+
+  struct BSlotState {
+    uint32_t owner_wgid = 0;
+    uint32_t descriptor = 0xffffffffu;
+    uint32_t fmt_b = 0;
+    uint32_t wmma_async_id = 0;
+    bool transpose_b = false;
+    bool valid = false;
+    bool busy = false;
+    bool b_ready = false;
+    bool b_pending = false;
+    bool wmma_pending = false;
+
+    void reset() {
+      owner_wgid = 0;
+      descriptor = 0xffffffffu;
+      fmt_b = 0;
+      wmma_async_id = 0;
+      transpose_b = false;
+      valid = false;
+      busy = false;
+      b_ready = false;
+      b_pending = false;
+      wmma_pending = false;
+    }
+  };
+
+  struct CSlotState {
+    uint32_t owner_wgid = 0;
+    uint32_t descriptor = 0xffffffffu;
+    uint32_t fmt_c = 0;
+    uint32_t fmt_d = 0;
     uint32_t store_async_id = 0;
     uint32_t c_wmma_inflight = 0;
     bool valid = false;
     bool busy = false;
-    bool a_ready = false;
-    bool b_ready = false;
     bool c_ready = false;
-    bool a_pending = false;
-    bool b_pending = false;
     bool c_pending = false;
-    bool wmma_pending = false;
     bool cmem_final_valid = false;
     bool c_dirty = false;
     bool store_pending = false;
 
     void reset() {
-      owner_wid = 0;
+      owner_wgid = 0;
       descriptor = 0xffffffffu;
-      fmt_a = 0;
-      fmt_b = 0;
       fmt_c = 0;
-      sparse_mode = 0;
-      wmma_async_id = 0;
+      fmt_d = 0;
       store_async_id = 0;
       c_wmma_inflight = 0;
       valid = false;
       busy = false;
-      a_ready = false;
-      b_ready = false;
       c_ready = false;
-      a_pending = false;
-      b_pending = false;
       c_pending = false;
-      wmma_pending = false;
       cmem_final_valid = false;
       c_dirty = false;
       store_pending = false;
@@ -470,13 +255,14 @@ public:
   };
 
   struct PendingWmmaJob {
-    uint32_t wid = 0;
-    uint32_t ab_slot_id = 0;
+    uint32_t wgid = 0;
+    uint32_t a_slot_id = 0;
+    uint32_t b_slot_id = 0;
     uint32_t c_slot_id = 0;
     uint32_t fmt_a = 0;
     uint32_t fmt_b = 0;
     uint32_t fmt_c = 0;
-    uint32_t sparse_mode = 0;
+    uint32_t a_sparse_mode = 0;
     uint32_t async_id = 0;
     uint32_t next_uop = 0;
   };
@@ -490,12 +276,12 @@ public:
     };
 
     Kind kind = Kind::FillA;
-    uint32_t wid = 0;
+    uint32_t wgid = 0;
     uint32_t slot_id = 0;
     uint32_t handle = 0;
     uint32_t window_id = 0;
+    uint32_t payload_fmt = kUnsetPayloadFmt;
     uint32_t tile_idx = 0;
-    uint32_t packets_per_tile = 0;
     uint32_t async_id = 0;
     bool separate_handle = false;
     uint32_t remaining_tmem_reads = 0;
@@ -514,46 +300,6 @@ public:
     std::vector<Core::TmemPacket> staged_store_packets;
     std::array<std::array<uint32_t, kPrimitiveDim>, kPrimitiveDim> staged_store_left_subtile = {};
     bool staged_store_left_valid = false;
-  };
-
-  enum class WindowCursorRole : uint8_t {
-    LoadA = 0,
-    LoadB,
-    LoadC,
-    StoreC,
-  };
-
-  struct WindowCursorKey {
-    uint32_t handle = 0;
-    uint32_t window_id = 0;
-    WindowCursorRole role = WindowCursorRole::LoadA;
-
-    bool operator==(const WindowCursorKey& other) const {
-      return handle == other.handle
-          && window_id == other.window_id
-          && role == other.role;
-    }
-  };
-
-  struct WindowCursorKeyHash {
-    size_t operator()(const WindowCursorKey& key) const {
-      size_t h1 = std::hash<uint32_t>{}(key.handle);
-      size_t h2 = std::hash<uint32_t>{}(key.window_id);
-      size_t h3 = std::hash<uint32_t>{}(static_cast<uint32_t>(key.role));
-      return h1 ^ (h2 << 1) ^ (h3 << 2);
-    }
-  };
-
-  struct WindowCursorState {
-    uint32_t epoch = 0;
-    uint32_t next_tile_idx = 0;
-    uint32_t next_packet_idx_in_tile = 0;
-
-    void reset(uint32_t new_epoch) {
-      epoch = new_epoch;
-      next_tile_idx = 0;
-      next_packet_idx_in_tile = 0;
-    }
   };
 
   enum class NoWmmaReadyReason : uint8_t {
@@ -586,7 +332,13 @@ public:
     bmem_.reset();
     cmem_.reset();
     metamem_.reset();
-    for (auto& slot : operand_slots_) {
+    for (auto& slot : a_slots_) {
+      slot.reset();
+    }
+    for (auto& slot : b_slots_) {
+      slot.reset();
+    }
+    for (auto& slot : c_slots_) {
       slot.reset();
     }
     mem_ops_.clear();
@@ -595,51 +347,14 @@ public:
     pending_wmma_jobs_.clear();
     active_wmma_job_ = {};
     active_wmma_job_valid_ = false;
-    window_cursors_.clear();
     tensorcore_.reset();
-    tensorcore_fmt_c_ = vt::fp16::id;
+    tensorcore_fmt_out_ = vt::fp16::id;
     mem_port_cycle_ = std::numeric_limits<uint64_t>::max();
     amem_write_budget_ = 0;
     bmem_write_budget_ = 0;
     cmem_write_budget_ = 0;
     cmem_read_budget_ = 0;
     meta_write_budget_ = 0;
-  }
-
-  bool reserve_window_cursor(uint32_t handle,
-                             uint32_t window_id,
-                             WindowCursorRole role,
-                             uint32_t* tile_idx,
-                             uint32_t* packets_per_tile) {
-    const TmemWindowPlan* window = nullptr;
-    if (!core_->lookup_tmem_window(handle, window_id, &window)) {
-      if (tile_idx) {
-        *tile_idx = 0;
-      }
-      if (packets_per_tile) {
-        *packets_per_tile = 0;
-      }
-      return false;
-    }
-
-    uint32_t epoch = 0;
-    if (!core_->tmem_window_epoch(handle, &epoch)) {
-      epoch = 0;
-    }
-
-    auto& state = window_cursors_[WindowCursorKey{handle, window_id, role}];
-    if (state.epoch != epoch) {
-      state.reset(epoch);
-    }
-    if (tile_idx) {
-      *tile_idx = state.next_tile_idx;
-    }
-    if (packets_per_tile) {
-      *packets_per_tile = window->packets_per_tile;
-    }
-    ++state.next_tile_idx;
-    state.next_packet_idx_in_tile = 0;
-    return true;
   }
 
   void tick() {
@@ -681,36 +396,10 @@ public:
       trace_data->rd_write = false;
       trace_data->retry = false;
     }
-    if (args.macro_op) {
-      enqueue_async_mma_load(wid, handle, args, trace_data);
-      return;
+    if (!args.macro_op) {
+      std::abort();
     }
-    int32_t slot_id = -1;
-    if (args.target == TcuTarget::None) {
-      slot_id = find_free_slot();
-    } else {
-      slot_id = find_free_slot();
-    }
-    if (slot_id < 0) {
-      if (trace_data) {
-        trace_data->retry = true;
-      }
-      return;
-    }
-    auto& slot = operand_slots_.at(slot_id);
-    if (!slot.valid) {
-      init_slot_for_descriptor(slot_id, slot, wid, args);
-    } else {
-      ensure_slot_matches(slot, wid, args);
-    }
-    if (args.target != TcuTarget::None && !slot_target_available(slot, args.target)) {
-      if (trace_data) {
-        trace_data->retry = true;
-      }
-      return;
-    }
-    execute_fill(static_cast<uint32_t>(slot_id), slot, handle, args.window_id, args.target, false);
-    mark_target_ready(slot, args.target);
+    enqueue_async_mma_load(wid, handle, args, trace_data);
   }
 
   void mma_store(uint32_t wid, uint32_t handle, IntrTcuArgs args, ExeTraceData* trace_data) {
@@ -718,49 +407,10 @@ public:
       trace_data->rd_write = false;
       trace_data->retry = false;
     }
-    if (args.macro_op) {
-      enqueue_async_mma_store(wid, handle, args, trace_data);
-      return;
-    }
-    auto slot_id = find_slot_by_owner(wid);
-    if (slot_id < 0) {
+    if (!args.macro_op) {
       std::abort();
     }
-    auto& slot = operand_slots_.at(slot_id);
-    if (slot.wmma_pending || !slot.cmem_final_valid) {
-      if (trace_data) {
-        trace_data->retry = true;
-      }
-      return;
-    }
-    std::vector<CMem::packet_t> packets;
-    if (!cmem_.dump_tile(static_cast<uint32_t>(slot_id), slot.fmt_c, &packets)) {
-      std::abort();
-    }
-    IntrTcuArgs resolved_args{};
-    resolved_args.fmt_a = slot.fmt_a;
-    resolved_args.fmt_b = slot.fmt_b;
-    resolved_args.fmt_ab = (slot.fmt_a == slot.fmt_b) ? slot.fmt_a : 0;
-    resolved_args.fmt_c = slot.fmt_c;
-    resolved_args.sparse_mode = slot.sparse_mode;
-    resolved_args.target = TcuTarget::C;
-    auto packet_offset = (args.target == TcuTarget::None) ? target_packet_offset(resolved_args) : 0;
-    const TmemWindowPlan* window = nullptr;
-    bool use_window = (args.target != TcuTarget::None)
-                   && core_->lookup_tmem_window(handle, args.window_id, &window)
-                   && window->fmt != 0
-                   && window->packets_per_tile == packets.size();
-    for (uint32_t i = 0; i < packets.size(); ++i) {
-      Core::TmemPacket packet;
-      std::copy_n(packets.at(i).begin(), packets.at(i).size(), packet.bytes.begin());
-      if (use_window) {
-        if (!core_->tmem_write_window_packet(handle, args.window_id, i, packet)) {
-          std::abort();
-        }
-      } else if (!core_->tmem_write_packet(handle, packet_offset + i, packet)) {
-        std::abort();
-      }
-    }
+    enqueue_async_mma_store(wid, handle, args, trace_data);
   }
 
   void wmma(uint32_t wid,
@@ -772,21 +422,19 @@ public:
             ExeTraceData* trace_data) {
     auto fmt_a = args.fmt_a ? args.fmt_a : args.fmt_ab;
     auto fmt_b = args.fmt_b ? args.fmt_b : args.fmt_ab;
+    (void)rs1_data;
+    (void)rs2_data;
+    (void)rs3_data;
+    (void)rd_data;
     if (trace_data) {
       trace_data->rd_write = false;
       trace_data->retry = false;
     }
 
-    if (args.macro_op) {
-      enqueue_async_wmma(wid, args, fmt_a, fmt_b, args.fmt_c, trace_data);
-      return;
+    if (!args.macro_op) {
+      std::abort();
     }
-
-    if (trace_data) {
-      trace_data->rd_write = true;
-      trace_data->retry = false;
-    }
-    legacy_wmma(fmt_a, fmt_b, args.fmt_c, args.step_m, args.step_n, rs1_data, rs2_data, rs3_data, rd_data);
+    enqueue_async_wmma(wid, args, fmt_a, fmt_b, args.fmt_c, trace_data);
   }
 
   const PerfStats& perf_stats() const {
@@ -797,9 +445,7 @@ public:
     if (!args.macro_op) {
       return 1;
     }
-    if (args.slot_id >= operand_slots_.size()) {
-      return 0;
-    }
+    auto wgid = arch_.warpgroup_id(wid);
 
     switch (tcu_type) {
     case TcuType::WMMA: {
@@ -808,29 +454,39 @@ public:
       if (!use_open_tensorcore(fmt_a, fmt_b, args.fmt_c)) {
         return 0;
       }
-      if (args.c_slot_id >= operand_slots_.size()) {
+      if (args.a_slot_id >= a_slots_.size()
+       || args.b_slot_id >= b_slots_.size()
+       || args.c_slot_id >= c_slots_.size()) {
         return 0;
       }
-      const auto& ab_slot = operand_slots_.at(args.slot_id);
-      const auto& c_slot = operand_slots_.at(args.c_slot_id);
-      if (!ab_slot.valid || ab_slot.owner_wid != wid || ab_slot.descriptor != args.descriptor) {
+      const auto& a_slot = a_slots_.at(args.a_slot_id);
+      const auto& b_slot = b_slots_.at(args.b_slot_id);
+      const auto& c_slot = c_slots_.at(args.c_slot_id);
+      if (!a_slot.valid || a_slot.owner_wgid != wgid || a_slot.descriptor != args.descriptor) {
         return 0;
       }
-      if (!c_slot.valid || c_slot.owner_wid != wid || c_slot.descriptor != args.descriptor) {
+      if (!b_slot.valid || b_slot.owner_wgid != wgid || b_slot.descriptor != args.descriptor) {
         return 0;
       }
-      return (ab_slot.a_ready && ab_slot.b_ready && !ab_slot.wmma_pending
+      if (!c_slot.valid || c_slot.owner_wgid != wgid || c_slot.descriptor != args.descriptor) {
+        return 0;
+      }
+      return (a_slot.a_ready && !a_slot.wmma_pending
+           && b_slot.b_ready && !b_slot.wmma_pending
            && c_slot.c_ready && !c_slot.store_pending) ? 5 : 0;
     }
     case TcuType::MMA_LOAD:
-      return (core_->tmem_handle_ready_for_mma_load(args.runtime_handle, args.target, args.sparse_mode)
+      return (core_->tmem_handle_ready_for_mma_load(args.runtime_handle, args.target, args.a_sparse_mode)
            && can_issue_mma_load(wid, args)) ? 4 : 0;
     case TcuType::MMA_STORE: {
+      if (args.slot_id >= c_slots_.size()) {
+        return 0;
+      }
       if (!core_->tmem_handle_ready_for_mma_store(args.runtime_handle)) {
         return 0;
       }
-      const auto& slot = operand_slots_.at(args.slot_id);
-      if (!slot.valid || slot.owner_wid != wid || slot.descriptor != args.descriptor) {
+      const auto& slot = c_slots_.at(args.slot_id);
+      if (!slot.valid || slot.owner_wgid != wgid || slot.descriptor != args.descriptor) {
         return 0;
       }
       bool ready = !slot.store_pending && slot.cmem_final_valid;
@@ -845,37 +501,39 @@ public:
     if (!args.macro_op) {
       return TensorUnit::IssueBlockReason::None;
     }
-    if (args.slot_id >= operand_slots_.size()) {
-      return TensorUnit::IssueBlockReason::SlotBusy;
-    }
+    auto wgid = arch_.warpgroup_id(wid);
 
     switch (tcu_type) {
     case TcuType::WMMA: {
-      if (args.c_slot_id >= operand_slots_.size()) {
+      if (args.a_slot_id >= a_slots_.size()
+       || args.b_slot_id >= b_slots_.size()
+       || args.c_slot_id >= c_slots_.size()) {
         return TensorUnit::IssueBlockReason::SlotBusy;
       }
-      const auto& ab_slot = operand_slots_.at(args.slot_id);
-      const auto& c_slot = operand_slots_.at(args.c_slot_id);
-      if (!ab_slot.valid || ab_slot.owner_wid != wid || ab_slot.descriptor != args.descriptor
-       || !c_slot.valid || c_slot.owner_wid != wid || c_slot.descriptor != args.descriptor) {
+      const auto& a_slot = a_slots_.at(args.a_slot_id);
+      const auto& b_slot = b_slots_.at(args.b_slot_id);
+      const auto& c_slot = c_slots_.at(args.c_slot_id);
+      if (!a_slot.valid || a_slot.owner_wgid != wgid || a_slot.descriptor != args.descriptor
+       || !b_slot.valid || b_slot.owner_wgid != wgid || b_slot.descriptor != args.descriptor
+       || !c_slot.valid || c_slot.owner_wgid != wgid || c_slot.descriptor != args.descriptor) {
         return TensorUnit::IssueBlockReason::SlotBusy;
       }
-      if (!ab_slot.a_ready) {
+      if (!a_slot.a_ready) {
         return TensorUnit::IssueBlockReason::ANotReady;
       }
-      if (!ab_slot.b_ready) {
+      if (!b_slot.b_ready) {
         return TensorUnit::IssueBlockReason::BNotReady;
       }
       if (!c_slot.c_ready) {
         return TensorUnit::IssueBlockReason::CNotReady;
       }
-      if (ab_slot.wmma_pending || c_slot.store_pending) {
+      if (a_slot.wmma_pending || b_slot.wmma_pending || c_slot.store_pending) {
         return TensorUnit::IssueBlockReason::SlotBusy;
       }
       return TensorUnit::IssueBlockReason::None;
     }
     case TcuType::MMA_LOAD: {
-      auto handle_reason = core_->tmem_handle_load_block_reason(args.runtime_handle, args.target, args.sparse_mode);
+      auto handle_reason = core_->tmem_handle_load_block_reason(args.runtime_handle, args.target, args.a_sparse_mode);
       switch (handle_reason) {
       case Core::TmemHandleBlockReason::MetaNotReady:
         return TensorUnit::IssueBlockReason::AMetaNotReady;
@@ -906,8 +564,11 @@ public:
       if (handle_reason == Core::TmemHandleBlockReason::Invalid) {
         return TensorUnit::IssueBlockReason::HandleReuse;
       }
-      const auto& slot = operand_slots_.at(args.slot_id);
-      bool ready = slot.valid && slot.owner_wid == wid && slot.descriptor == args.descriptor
+      if (args.slot_id >= c_slots_.size()) {
+        return TensorUnit::IssueBlockReason::SlotBusy;
+      }
+      const auto& slot = c_slots_.at(args.slot_id);
+      bool ready = slot.valid && slot.owner_wgid == wgid && slot.descriptor == args.descriptor
                 && !slot.store_pending
                 && slot.cmem_final_valid;
       return ready ? TensorUnit::IssueBlockReason::None
@@ -968,72 +629,41 @@ private:
     return fadd_s2(s1, 8, 14);
   }
 
-  int32_t find_slot_by_owner(uint32_t wid) const {
-    for (uint32_t i = 0; i < operand_slots_.size(); ++i) {
-      const auto& slot = operand_slots_.at(i);
-      if (slot.valid && slot.owner_wid == wid) {
-        return i;
-      }
-    }
-    return -1;
+  static bool a_slot_has_pending_work(const ASlotState& slot) {
+    return slot.a_pending || slot.wmma_pending;
   }
 
-  int32_t find_free_slot() const {
-    for (uint32_t i = 0; i < operand_slots_.size(); ++i) {
-      if (!operand_slots_.at(i).valid) {
-        return i;
-      }
-    }
-    return -1;
+  static bool b_slot_has_pending_work(const BSlotState& slot) {
+    return slot.b_pending || slot.wmma_pending;
   }
 
-  void release_slot(uint32_t slot_id) {
-    clear_slot_storage(slot_id);
-    operand_slots_.at(slot_id).reset();
-  }
-
-  static bool slot_can_rebind(const OperandSlot& slot) {
-    return !slot.valid || (!slot_has_pending_work(slot) && !slot.c_dirty);
-  }
-
-  static bool slot_has_pending_work(const OperandSlot& slot) {
-    return ab_side_has_pending(slot) || c_side_has_pending(slot);
-  }
-
-  static bool ab_side_has_pending(const OperandSlot& slot) {
-    return slot.a_pending || slot.b_pending || slot.wmma_pending;
-  }
-
-  static bool c_side_has_pending(const OperandSlot& slot) {
+  static bool c_slot_has_pending_work(const CSlotState& slot) {
     return slot.c_pending || slot.store_pending || slot.c_wmma_inflight != 0;
   }
 
-  static bool ab_side_target_available(const OperandSlot& slot, TcuTarget target) {
-    switch (target) {
-    case TcuTarget::A:
-      return !slot.a_pending && !slot.wmma_pending;
-    case TcuTarget::B:
-      return !slot.b_pending && !slot.wmma_pending;
-    default:
-      return false;
-    }
+  static bool a_slot_can_rebind(const ASlotState& slot) {
+    return !slot.valid || !a_slot_has_pending_work(slot);
   }
 
-  static bool c_side_target_available(const OperandSlot& slot) {
+  static bool b_slot_can_rebind(const BSlotState& slot) {
+    return !slot.valid || !b_slot_has_pending_work(slot);
+  }
+
+  static bool c_slot_can_rebind(const CSlotState& slot) {
+    return !slot.valid || (!c_slot_has_pending_work(slot) && !slot.c_dirty);
+  }
+
+  static bool a_slot_target_available(const ASlotState& slot) {
+    return !slot.a_pending && !slot.wmma_pending;
+  }
+
+  static bool b_slot_target_available(const BSlotState& slot) {
+    return !slot.b_pending && !slot.wmma_pending;
+  }
+
+  static bool c_slot_target_available(const CSlotState& slot) {
     return !slot.c_pending && !slot.store_pending
         && !slot.c_dirty && slot.c_wmma_inflight == 0;
-  }
-
-  static bool slot_target_available(const OperandSlot& slot, TcuTarget target) {
-    switch (target) {
-    case TcuTarget::A:
-    case TcuTarget::B:
-      return ab_side_target_available(slot, target);
-    case TcuTarget::C:
-      return c_side_target_available(slot);
-    default:
-      return false;
-    }
   }
 
   void reset_mem_port_budgets() {
@@ -1097,8 +727,18 @@ private:
         break;
       }
     }
-    for (const auto& slot : operand_slots_) {
-      if (slot.a_pending || slot.b_pending || slot.c_pending) {
+    for (const auto& slot : a_slots_) {
+      if (slot.a_pending) {
+        return true;
+      }
+    }
+    for (const auto& slot : b_slots_) {
+      if (slot.b_pending) {
+        return true;
+      }
+    }
+    for (const auto& slot : c_slots_) {
+      if (slot.c_pending) {
         return true;
       }
     }
@@ -1106,12 +746,25 @@ private:
   }
 
   SlotReleaseReason classify_slot_release_reason() const {
-    for (const auto& slot : operand_slots_) {
+    for (const auto& slot : a_slots_) {
       if (!slot.valid) {
         continue;
       }
       if (slot.wmma_pending) {
         return SlotReleaseReason::AbWmmaPendingClear;
+      }
+    }
+    for (const auto& slot : b_slots_) {
+      if (!slot.valid) {
+        continue;
+      }
+      if (slot.wmma_pending) {
+        return SlotReleaseReason::AbWmmaPendingClear;
+      }
+    }
+    for (const auto& slot : c_slots_) {
+      if (!slot.valid) {
+        continue;
       }
       if (slot.c_wmma_inflight != 0) {
         return SlotReleaseReason::CWmmaInflightDrain;
@@ -1177,99 +830,140 @@ private:
   }
 
   bool can_issue_mma_load(uint32_t wid, const IntrTcuArgs& args) const {
-    if (args.slot_id >= operand_slots_.size()) {
+    auto wgid = arch_.warpgroup_id(wid);
+    switch (args.target) {
+    case TcuTarget::A: {
+      if (args.slot_id >= a_slots_.size()) {
+        return false;
+      }
+      const auto& slot = a_slots_.at(args.slot_id);
+      if (!slot.valid) {
+        return true;
+      }
+      if (slot.owner_wgid != wgid || slot.descriptor != args.descriptor) {
+        return a_slot_can_rebind(slot);
+      }
+      return a_slot_target_available(slot);
+    }
+    case TcuTarget::B: {
+      if (args.slot_id >= b_slots_.size()) {
+        return false;
+      }
+      const auto& slot = b_slots_.at(args.slot_id);
+      if (!slot.valid) {
+        return true;
+      }
+      if (slot.owner_wgid != wgid || slot.descriptor != args.descriptor) {
+        return b_slot_can_rebind(slot);
+      }
+      return b_slot_target_available(slot);
+    }
+    case TcuTarget::C: {
+      if (args.slot_id >= c_slots_.size()) {
+        return false;
+      }
+      const auto& slot = c_slots_.at(args.slot_id);
+      if (!slot.valid) {
+        return true;
+      }
+      if (slot.owner_wgid != wgid || slot.descriptor != args.descriptor) {
+        return c_slot_can_rebind(slot);
+      }
+      return c_slot_target_available(slot);
+    }
+    default:
       return false;
     }
-    const auto& slot = operand_slots_.at(args.slot_id);
-    if (!slot.valid) {
-      return true;
-    }
-    if (slot.owner_wid != wid || slot.descriptor != args.descriptor) {
-      return slot_can_rebind(slot);
-    }
-    if (args.target == TcuTarget::None) {
-      return !slot_has_pending_work(slot) && !slot.c_dirty;
-    }
-    return slot_target_available(slot, args.target);
   }
 
-  void clear_slot_storage(uint32_t slot_id) {
+  void clear_a_slot_storage(uint32_t slot_id) {
     amem_.clear_slot(slot_id);
-    bmem_.clear_slot(slot_id);
-    cmem_.clear_slot(slot_id);
     metamem_.clear_slot(slot_id);
   }
 
-  void init_slot_for_descriptor(uint32_t slot_id, OperandSlot& slot, uint32_t wid, const IntrTcuArgs& args) {
-    clear_slot_storage(slot_id);
+  void clear_b_slot_storage(uint32_t slot_id) {
+    bmem_.clear_slot(slot_id);
+  }
+
+  void clear_c_slot_storage(uint32_t slot_id) {
+    cmem_.clear_slot(slot_id);
+  }
+
+  void init_a_slot_for_descriptor(uint32_t slot_id, ASlotState& slot, uint32_t wgid, const IntrTcuArgs& args) {
+    clear_a_slot_storage(slot_id);
     slot.reset();
     slot.valid = true;
-    slot.owner_wid = wid;
+    slot.owner_wgid = wgid;
     slot.descriptor = args.descriptor;
     slot.fmt_a = args.fmt_a ? args.fmt_a : args.fmt_ab;
+    slot.a_sparse_mode = args.a_sparse_mode;
+    slot.transpose_a = args.transpose_a != 0;
+  }
+
+  void init_b_slot_for_descriptor(uint32_t slot_id, BSlotState& slot, uint32_t wgid, const IntrTcuArgs& args) {
+    clear_b_slot_storage(slot_id);
+    slot.reset();
+    slot.valid = true;
+    slot.owner_wgid = wgid;
+    slot.descriptor = args.descriptor;
     slot.fmt_b = args.fmt_b ? args.fmt_b : args.fmt_ab;
+    slot.transpose_b = args.transpose_b != 0;
+  }
+
+  void init_c_slot_for_descriptor(uint32_t slot_id, CSlotState& slot, uint32_t wgid, const IntrTcuArgs& args) {
+    clear_c_slot_storage(slot_id);
+    slot.reset();
+    slot.valid = true;
+    slot.owner_wgid = wgid;
+    slot.descriptor = args.descriptor;
     slot.fmt_c = args.fmt_c;
-    slot.sparse_mode = args.sparse_mode;
+    slot.fmt_d = args.fmt_d;
   }
 
-  void ensure_slot_matches(OperandSlot& slot, uint32_t wid, const IntrTcuArgs& args) {
-    if (!slot.valid) {
-      std::abort();
-      return;
+  static void mark_a_pending(ASlotState& slot, bool pending) {
+    slot.a_pending = pending;
+    if (pending) {
+      slot.a_ready = false;
     }
-    if (slot.owner_wid != wid || slot.descriptor != args.descriptor) {
-      std::abort();
-    }
+    slot.busy = a_slot_has_pending_work(slot);
   }
 
-  void mark_target_pending(OperandSlot& slot, TcuTarget target, bool pending) {
-    switch (target) {
-    case TcuTarget::A:
-      slot.a_pending = pending;
-      if (pending) {
-        slot.a_ready = false;
-      }
-      break;
-    case TcuTarget::B:
-      slot.b_pending = pending;
-      if (pending) {
-        slot.b_ready = false;
-      }
-      break;
-    case TcuTarget::C:
-      slot.c_pending = pending;
-      if (pending) {
-        slot.c_ready = false;
-        slot.cmem_final_valid = false;
-      }
-      break;
-    default:
-      std::abort();
+  static void mark_b_pending(BSlotState& slot, bool pending) {
+    slot.b_pending = pending;
+    if (pending) {
+      slot.b_ready = false;
     }
-    slot.busy = slot_has_pending_work(slot);
+    slot.busy = b_slot_has_pending_work(slot);
   }
 
-  void mark_target_ready(OperandSlot& slot, TcuTarget target) {
-    switch (target) {
-    case TcuTarget::A:
-      slot.a_pending = false;
-      slot.a_ready = true;
-      break;
-    case TcuTarget::B:
-      slot.b_pending = false;
-      slot.b_ready = true;
-      break;
-    case TcuTarget::C:
-      slot.c_pending = false;
-      slot.c_ready = true;
-      slot.cmem_final_valid = true;
-      slot.c_dirty = false;
-      slot.c_wmma_inflight = 0;
-      break;
-    default:
-      std::abort();
+  static void mark_c_pending(CSlotState& slot, bool pending) {
+    slot.c_pending = pending;
+    if (pending) {
+      slot.c_ready = false;
+      slot.cmem_final_valid = false;
     }
-    slot.busy = slot_has_pending_work(slot);
+    slot.busy = c_slot_has_pending_work(slot);
+  }
+
+  static void mark_a_ready(ASlotState& slot) {
+    slot.a_pending = false;
+    slot.a_ready = true;
+    slot.busy = a_slot_has_pending_work(slot);
+  }
+
+  static void mark_b_ready(BSlotState& slot) {
+    slot.b_pending = false;
+    slot.b_ready = true;
+    slot.busy = b_slot_has_pending_work(slot);
+  }
+
+  static void mark_c_ready(CSlotState& slot) {
+    slot.c_pending = false;
+    slot.c_ready = true;
+    slot.cmem_final_valid = true;
+    slot.c_dirty = false;
+    slot.c_wmma_inflight = 0;
+    slot.busy = c_slot_has_pending_work(slot);
   }
 
   static TcuTarget mem_uop_target(MemUop::Kind kind) {
@@ -1286,43 +980,61 @@ private:
     }
   }
 
-  uint32_t fill_packet_offset(const OperandSlot& slot, const MemUop& uop) const {
+  uint32_t fill_packet_offset(const MemUop& uop) const {
     if (uop.separate_handle) {
       return 0;
     }
     IntrTcuArgs args{};
-    args.fmt_a = slot.fmt_a;
-    args.fmt_b = slot.fmt_b;
-    args.fmt_c = slot.fmt_c;
-    args.sparse_mode = slot.sparse_mode;
+    args.fmt_a = a_slots_.at(uop.slot_id).fmt_a;
+    args.fmt_b = b_slots_.at(uop.slot_id).fmt_b;
+    args.fmt_c = c_slots_.at(uop.slot_id).fmt_c;
+    args.a_sparse_mode = a_slots_.at(uop.slot_id).a_sparse_mode;
     args.target = mem_uop_target(uop.kind);
     return target_packet_offset(args);
   }
 
-  uint32_t fill_payload_packet_count(const OperandSlot& slot, const MemUop& uop) const {
+  uint32_t fill_payload_packet_count(const MemUop& uop) const {
+    auto payload_fmt = mem_uop_payload_fmt(uop);
     switch (uop.kind) {
     case MemUop::Kind::FillA:
-      return a_packet_count(slot.fmt_a);
+      return a_packet_count(payload_fmt);
     case MemUop::Kind::FillB:
-      return b_packet_count(slot.fmt_b, slot.sparse_mode);
+      return b_packet_count(payload_fmt);
     case MemUop::Kind::FillC:
-      return c_packet_count(slot.fmt_c);
+      return c_load_packet_count(payload_fmt);
     default:
       std::abort();
     }
   }
 
-  uint32_t store_packet_offset(const OperandSlot& slot, const MemUop& uop) const {
+  uint32_t store_packet_offset(const MemUop& uop) const {
     if (uop.separate_handle) {
       return 0;
     }
     IntrTcuArgs args{};
-    args.fmt_a = slot.fmt_a;
-    args.fmt_b = slot.fmt_b;
-    args.fmt_c = slot.fmt_c;
-    args.sparse_mode = slot.sparse_mode;
+    args.fmt_a = a_slots_.at(uop.slot_id).fmt_a;
+    args.fmt_b = b_slots_.at(uop.slot_id).fmt_b;
+    args.fmt_c = c_slots_.at(uop.slot_id).fmt_c;
+    args.fmt_d = c_slots_.at(uop.slot_id).fmt_d;
+    args.a_sparse_mode = a_slots_.at(uop.slot_id).a_sparse_mode;
     args.target = TcuTarget::C;
     return target_packet_offset(args);
+  }
+
+  uint32_t mem_uop_payload_fmt(const MemUop& uop) const {
+    if (uop.payload_fmt != kUnsetPayloadFmt) {
+      return uop.payload_fmt;
+    }
+    switch (uop.kind) {
+    case MemUop::Kind::FillA:
+      return a_slots_.at(uop.slot_id).fmt_a;
+    case MemUop::Kind::FillB:
+      return b_slots_.at(uop.slot_id).fmt_b;
+    case MemUop::Kind::FillC:
+      return c_slots_.at(uop.slot_id).fmt_c;
+    default:
+      return 0;
+    }
   }
 
   bool lookup_window_packet_idx(const MemUop& uop,
@@ -1335,7 +1047,7 @@ private:
     if (!core_->lookup_tmem_window(uop.handle, uop.window_id, &window)) {
       return false;
     }
-    if (window->fmt == 0 || window->packets_per_tile == 0) {
+    if (window->packets_per_tile == 0) {
       return false;
     }
     *packet_idx = (uop.tile_idx * window->packets_per_tile) + local_packet_idx;
@@ -1352,7 +1064,7 @@ private:
     if (!core_->lookup_tmem_window(uop.handle, meta_shadow_window_id(uop.window_id), &window)) {
       return false;
     }
-    if (window->fmt == 0 || window->packets_per_tile == 0) {
+    if (window->packets_per_tile == 0) {
       return false;
     }
     *packet_idx = (uop.tile_idx * window->packets_per_tile) + local_packet_idx;
@@ -1367,12 +1079,13 @@ private:
     Meta,
   };
 
-  LocalFillAction select_fill_local_write(const MemUop& uop, const OperandSlot& slot) const {
+  LocalFillAction select_fill_local_write(const MemUop& uop) const {
+    auto payload_fmt = mem_uop_payload_fmt(uop);
     switch (uop.kind) {
     case MemUop::Kind::FillA:
       if (uop.remaining_amem_writes != 0) {
         auto beat_idx = AMem::fill_beats() - uop.remaining_amem_writes;
-        auto packets_needed = AMem::packets_per_fill_beat(slot.fmt_a);
+        auto packets_needed = AMem::packets_per_fill_beat(payload_fmt);
         if (uop.staged_payload_packets.size() >= (beat_idx + 1) * packets_needed) {
           return LocalFillAction::AData;
         }
@@ -1384,8 +1097,8 @@ private:
       return LocalFillAction::None;
     case MemUop::Kind::FillB:
       if (uop.remaining_bmem_writes != 0) {
-        auto beat_idx = BMem::fill_beats(slot.sparse_mode) - uop.remaining_bmem_writes;
-        auto packets_needed = BMem::packets_per_fill_beat(slot.fmt_b, slot.sparse_mode);
+        auto beat_idx = BMem::fill_beats() - uop.remaining_bmem_writes;
+        auto packets_needed = BMem::packets_per_fill_beat(payload_fmt);
         if (uop.staged_payload_packets.size() >= (beat_idx + 1) * packets_needed) {
           return LocalFillAction::BData;
         }
@@ -1393,8 +1106,8 @@ private:
       return LocalFillAction::None;
     case MemUop::Kind::FillC:
       if (uop.remaining_cmem_writes != 0) {
-        auto beat_idx = CMem::fill_beats(slot.fmt_c) - uop.remaining_cmem_writes;
-        auto packets_needed = CMem::packets_per_fill_group(slot.fmt_c);
+        auto beat_idx = CMem::fill_beats(payload_fmt) - uop.remaining_cmem_writes;
+        auto packets_needed = CMem::packets_per_fill_group(payload_fmt);
         auto group_base = (beat_idx / 2) * packets_needed;
         if (uop.staged_payload_packets.size() >= group_base + packets_needed) {
           return LocalFillAction::CData;
@@ -1436,47 +1149,69 @@ private:
     return out;
   }
 
-  bool perform_fill_local_write(MemUop& uop, const OperandSlot& slot, LocalFillAction action) {
+  bool perform_fill_local_write(MemUop& uop, LocalFillAction action) {
+    auto payload_fmt = mem_uop_payload_fmt(uop);
     switch (action) {
     case LocalFillAction::AData: {
       auto beat_idx = AMem::fill_beats() - uop.remaining_amem_writes;
-      auto packets_per_beat = AMem::packets_per_fill_beat(slot.fmt_a);
+      auto packets_per_beat = AMem::packets_per_fill_beat(payload_fmt);
       std::vector<AMem::packet_t> packets;
       auto base = beat_idx * packets_per_beat;
-      for (uint32_t i = 0; i < packets_per_beat; ++i) {
-        packets.push_back(to_amem_packet(uop.staged_payload_packets.at(base + i)));
-      }
-      if (!amem_.write_fill_beat(uop.slot_id, slot.fmt_a, beat_idx, packets)) {
-        std::abort();
-      }
+	      for (uint32_t i = 0; i < packets_per_beat; ++i) {
+	        packets.push_back(to_amem_packet(uop.staged_payload_packets.at(base + i)));
+	      }
+	      if (!amem_.write_fill_beat(uop.slot_id, payload_fmt, beat_idx, packets)) {
+	        std::cerr << "TensorUnit error: AMem fill write failed"
+	                  << " kind=" << static_cast<uint32_t>(uop.kind)
+	                  << " slot=" << uop.slot_id
+	                  << " beat=" << beat_idx
+	                  << " payload_fmt=" << payload_fmt
+	                  << " packets=" << packets.size()
+	                  << std::endl;
+	        std::abort();
+	      }
       --uop.remaining_amem_writes;
       return true;
     }
     case LocalFillAction::BData: {
-      auto beat_idx = BMem::fill_beats(slot.sparse_mode) - uop.remaining_bmem_writes;
-      auto packets_per_beat = BMem::packets_per_fill_beat(slot.fmt_b, slot.sparse_mode);
+      auto beat_idx = BMem::fill_beats() - uop.remaining_bmem_writes;
+      auto packets_per_beat = BMem::packets_per_fill_beat(payload_fmt);
       std::vector<BMem::packet_t> packets;
       auto base = beat_idx * packets_per_beat;
-      for (uint32_t i = 0; i < packets_per_beat; ++i) {
-        packets.push_back(to_bmem_packet(uop.staged_payload_packets.at(base + i)));
-      }
-      if (!bmem_.write_fill_beat(uop.slot_id, slot.fmt_b, beat_idx, packets, slot.sparse_mode)) {
-        std::abort();
-      }
+	      for (uint32_t i = 0; i < packets_per_beat; ++i) {
+	        packets.push_back(to_bmem_packet(uop.staged_payload_packets.at(base + i)));
+	      }
+	      if (!bmem_.write_fill_beat(uop.slot_id, payload_fmt, beat_idx, packets)) {
+	        std::cerr << "TensorUnit error: BMem fill write failed"
+	                  << " kind=" << static_cast<uint32_t>(uop.kind)
+	                  << " slot=" << uop.slot_id
+	                  << " beat=" << beat_idx
+	                  << " payload_fmt=" << payload_fmt
+	                  << " packets=" << packets.size()
+	                  << std::endl;
+	        std::abort();
+	      }
       --uop.remaining_bmem_writes;
       return true;
     }
     case LocalFillAction::CData: {
-      auto beat_idx = CMem::fill_beats(slot.fmt_c) - uop.remaining_cmem_writes;
-      auto packets_per_group = CMem::packets_per_fill_group(slot.fmt_c);
+      auto beat_idx = CMem::fill_beats(payload_fmt) - uop.remaining_cmem_writes;
+      auto packets_per_group = CMem::packets_per_fill_group(payload_fmt);
       auto group_base = (beat_idx / 2) * packets_per_group;
       std::vector<CMem::packet_t> packets;
-      for (uint32_t i = 0; i < packets_per_group; ++i) {
-        packets.push_back(to_cmem_packet(uop.staged_payload_packets.at(group_base + i)));
-      }
-      if (!cmem_.write_fill_beat(uop.slot_id, slot.fmt_c, beat_idx, packets)) {
-        std::abort();
-      }
+	      for (uint32_t i = 0; i < packets_per_group; ++i) {
+	        packets.push_back(to_cmem_packet(uop.staged_payload_packets.at(group_base + i)));
+	      }
+	      if (!cmem_.write_fill_beat(uop.slot_id, payload_fmt, beat_idx, packets)) {
+	        std::cerr << "TensorUnit error: CMem fill write failed"
+	                  << " kind=" << static_cast<uint32_t>(uop.kind)
+	                  << " slot=" << uop.slot_id
+	                  << " beat=" << beat_idx
+	                  << " payload_fmt=" << payload_fmt
+	                  << " packets=" << packets.size()
+	                  << std::endl;
+	        std::abort();
+	      }
       --uop.remaining_cmem_writes;
       return true;
     }
@@ -1493,34 +1228,60 @@ private:
     }
   }
 
-  bool stage_fill_read(MemUop& uop, const OperandSlot& slot) {
+  bool stage_fill_read(MemUop& uop) {
     if (uop.remaining_tmem_reads == 0) {
       return false;
     }
 
-    auto payload_packets = fill_payload_packet_count(slot, uop);
+    auto payload_packets = fill_payload_packet_count(uop);
     Core::TmemPacket packet;
-    if (uop.next_payload_packet_idx < payload_packets) {
-      uint32_t packet_idx = 0;
-      if (!lookup_window_packet_idx(uop, uop.next_payload_packet_idx, &packet_idx)) {
-        packet_idx = fill_packet_offset(slot, uop) + uop.next_payload_packet_idx;
-        if (!core_->tmem_read_packet(uop.handle, packet_idx, &packet)) {
-          std::abort();
-        }
-      } else if (!core_->tmem_read_window_packet(uop.handle, uop.window_id, packet_idx, &packet)) {
-        std::abort();
-      }
+	    if (uop.next_payload_packet_idx < payload_packets) {
+	      uint32_t packet_idx = 0;
+	      if (!lookup_window_packet_idx(uop, uop.next_payload_packet_idx, &packet_idx)) {
+	        packet_idx = fill_packet_offset(uop) + uop.next_payload_packet_idx;
+	        if (!core_->tmem_read_packet(uop.handle, packet_idx, &packet)) {
+	          std::cerr << "TensorUnit error: TMEM packet read failed"
+	                    << " kind=" << static_cast<uint32_t>(uop.kind)
+	                    << " handle=" << uop.handle
+	                    << " packet_idx=" << packet_idx
+	                    << " slot=" << uop.slot_id
+	                    << std::endl;
+	          std::abort();
+	        }
+	      } else if (!core_->tmem_read_window_packet(uop.handle, uop.window_id, packet_idx, &packet)) {
+	        std::cerr << "TensorUnit error: TMEM window packet read failed"
+	                  << " kind=" << static_cast<uint32_t>(uop.kind)
+	                  << " handle=" << uop.handle
+	                  << " window=" << uop.window_id
+	                  << " tile=" << uop.tile_idx
+	                  << " packet_idx=" << packet_idx
+	                  << " slot=" << uop.slot_id
+	                  << std::endl;
+	        std::abort();
+	      }
       uop.staged_payload_packets.push_back(packet);
       ++uop.next_payload_packet_idx;
     } else {
-      uint32_t meta_packet_idx = 0;
-      if (!lookup_meta_window_packet_idx(uop, uop.next_meta_packet_idx, &meta_packet_idx)) {
-        if (!core_->tmem_read_meta_packet(uop.handle, uop.next_meta_packet_idx, &packet)) {
-          std::abort();
-        }
-      } else if (!core_->tmem_read_window_packet(uop.handle, meta_shadow_window_id(uop.window_id), meta_packet_idx, &packet)) {
-        std::abort();
-      }
+	      uint32_t meta_packet_idx = 0;
+	      if (!lookup_meta_window_packet_idx(uop, uop.next_meta_packet_idx, &meta_packet_idx)) {
+	        if (!core_->tmem_read_meta_packet(uop.handle, uop.next_meta_packet_idx, &packet)) {
+	          std::cerr << "TensorUnit error: TMEM meta packet read failed"
+	                    << " handle=" << uop.handle
+	                    << " packet_idx=" << uop.next_meta_packet_idx
+	                    << " slot=" << uop.slot_id
+	                    << std::endl;
+	          std::abort();
+	        }
+	      } else if (!core_->tmem_read_window_packet(uop.handle, meta_shadow_window_id(uop.window_id), meta_packet_idx, &packet)) {
+	        std::cerr << "TensorUnit error: TMEM meta window packet read failed"
+	                  << " handle=" << uop.handle
+	                  << " window=" << meta_shadow_window_id(uop.window_id)
+	                  << " tile=" << uop.tile_idx
+	                  << " packet_idx=" << meta_packet_idx
+	                  << " slot=" << uop.slot_id
+	                  << std::endl;
+	        std::abort();
+	      }
       uop.staged_meta_packets.push_back(packet);
       ++uop.next_meta_packet_idx;
     }
@@ -1529,12 +1290,12 @@ private:
     return true;
   }
 
-  bool try_acquire_fill_read_port(const MemUop& uop, const OperandSlot& slot) {
-    auto payload_packets = fill_payload_packet_count(slot, uop);
+  bool try_acquire_fill_read_port(const MemUop& uop) {
+    auto payload_packets = fill_payload_packet_count(uop);
     if (uop.next_payload_packet_idx < payload_packets) {
       uint32_t packet_idx = 0;
       if (!lookup_window_packet_idx(uop, uop.next_payload_packet_idx, &packet_idx)) {
-        packet_idx = fill_packet_offset(slot, uop) + uop.next_payload_packet_idx;
+        packet_idx = fill_packet_offset(uop) + uop.next_payload_packet_idx;
         return core_->try_acquire_tmem_read_port(uop.handle, packet_idx);
       }
       return core_->try_acquire_tmem_window_read_port(uop.handle, uop.window_id, packet_idx);
@@ -1548,10 +1309,10 @@ private:
 
   void append_store_packets_for_subtile_pair(
       MemUop& uop,
-      uint32_t fmt_c,
+      uint32_t fmt_d,
       const std::array<std::array<uint32_t, kPrimitiveDim>, kPrimitiveDim>& left,
       const uint32_t right[kPrimitiveDim][kPrimitiveDim]) {
-    if (fmt_c == vt::fp32::id) {
+    if (fmt_d == vt::fp32::id) {
       for (uint32_t row = 0; row < kPrimitiveDim; ++row) {
         CMem::packet_t packet{};
         for (uint32_t col = 0; col < CMem::kDim; ++col) {
@@ -1568,26 +1329,46 @@ private:
       return;
     }
 
-    for (uint32_t packet_idx = 0; packet_idx < 4; ++packet_idx) {
-      CMem::packet_t packet{};
-      for (uint32_t elem = 0; elem < 32; ++elem) {
-        auto row = packet_idx * 2 + (elem / 16);
-        auto col = elem % 16;
-        auto raw = (col < kPrimitiveDim) ? left[row][col] : right[row][col - kPrimitiveDim];
-        auto bits = fp22_to_fp16(raw);
-        auto off = elem * 2;
-        packet.at(off + 0) = bits & 0xff;
-        packet.at(off + 1) = (bits >> 8) & 0xff;
+    if (fmt_d == vt::fp16::id) {
+      for (uint32_t packet_idx = 0; packet_idx < 4; ++packet_idx) {
+        CMem::packet_t packet{};
+        for (uint32_t elem = 0; elem < 32; ++elem) {
+          auto row = packet_idx * 2 + (elem / 16);
+          auto col = elem % 16;
+          auto raw = (col < kPrimitiveDim) ? left[row][col] : right[row][col - kPrimitiveDim];
+          auto bits = fp22_to_fp16(raw);
+          auto off = elem * 2;
+          packet.at(off + 0) = bits & 0xff;
+          packet.at(off + 1) = (bits >> 8) & 0xff;
+        }
+        uop.staged_store_packets.push_back(to_tmem_packet(packet));
       }
-      uop.staged_store_packets.push_back(to_tmem_packet(packet));
+      return;
     }
+
+    if (fmt_d == vt::fp8::id) {
+      for (uint32_t packet_idx = 0; packet_idx < 2; ++packet_idx) {
+        CMem::packet_t packet{};
+        for (uint32_t elem = 0; elem < 64; ++elem) {
+          auto row = packet_idx * 4 + (elem / 16);
+          auto col = elem % 16;
+          auto raw = (col < kPrimitiveDim) ? left[row][col] : right[row][col - kPrimitiveDim];
+          packet.at(elem) = fp22_to_fp8_e4m3(raw);
+        }
+        uop.staged_store_packets.push_back(to_tmem_packet(packet));
+      }
+      return;
+    }
+
+    std::abort();
   }
 
-  bool stage_store_read(MemUop& uop, const OperandSlot& slot) {
+  bool stage_store_read(MemUop& uop) {
     if (uop.remaining_cmem_reads == 0) {
       return false;
     }
 
+    const auto& slot = c_slots_.at(uop.slot_id);
     auto beat_idx = CMem::dump_beats(slot.fmt_c) - uop.remaining_cmem_reads;
     uint32_t subtile[kPrimitiveDim][kPrimitiveDim] = {};
     cmem_.read_subtile_fp22(uop.slot_id, beat_idx, subtile);
@@ -1603,7 +1384,7 @@ private:
       if (!uop.staged_store_left_valid) {
         std::abort();
       }
-      append_store_packets_for_subtile_pair(uop, slot.fmt_c, uop.staged_store_left_subtile, subtile);
+      append_store_packets_for_subtile_pair(uop, slot.fmt_d, uop.staged_store_left_subtile, subtile);
       uop.staged_store_left_valid = false;
     }
 
@@ -1611,25 +1392,39 @@ private:
     return true;
   }
 
-  bool emit_store_packet(MemUop& uop, const OperandSlot& slot) {
+  bool emit_store_packet(MemUop& uop) {
     if (uop.staged_store_packet_cursor >= uop.staged_store_packets.size()
      || uop.remaining_tmem_writes == 0) {
       return false;
     }
 
     uint32_t packet_idx = 0;
-    if (!lookup_window_packet_idx(uop, uop.next_store_packet_idx, &packet_idx)) {
-      packet_idx = store_packet_offset(slot, uop) + uop.next_store_packet_idx;
-      const auto& packet = uop.staged_store_packets.at(uop.staged_store_packet_cursor);
-      if (!core_->tmem_write_packet(uop.handle, packet_idx, packet)) {
-        std::abort();
-      }
-    } else {
-      const auto& packet = uop.staged_store_packets.at(uop.staged_store_packet_cursor);
-      if (!core_->tmem_write_window_packet(uop.handle, uop.window_id, packet_idx, packet)) {
-        std::abort();
-      }
-    }
+	    if (!lookup_window_packet_idx(uop, uop.next_store_packet_idx, &packet_idx)) {
+	      packet_idx = store_packet_offset(uop) + uop.next_store_packet_idx;
+	      const auto& packet = uop.staged_store_packets.at(uop.staged_store_packet_cursor);
+	      if (!core_->tmem_write_packet(uop.handle, packet_idx, packet)) {
+	        std::cerr << "TensorUnit error: TMEM packet write failed"
+	                  << " kind=" << static_cast<uint32_t>(uop.kind)
+	                  << " handle=" << uop.handle
+	                  << " packet_idx=" << packet_idx
+	                  << " slot=" << uop.slot_id
+	                  << std::endl;
+	        std::abort();
+	      }
+	    } else {
+	      const auto& packet = uop.staged_store_packets.at(uop.staged_store_packet_cursor);
+	      if (!core_->tmem_write_window_packet(uop.handle, uop.window_id, packet_idx, packet)) {
+	        std::cerr << "TensorUnit error: TMEM window packet write failed"
+	                  << " kind=" << static_cast<uint32_t>(uop.kind)
+	                  << " handle=" << uop.handle
+	                  << " window=" << uop.window_id
+	                  << " tile=" << uop.tile_idx
+	                  << " packet_idx=" << packet_idx
+	                  << " slot=" << uop.slot_id
+	                  << std::endl;
+	        std::abort();
+	      }
+	    }
     ++uop.next_store_packet_idx;
     ++uop.staged_store_packet_cursor;
     --uop.remaining_tmem_writes;
@@ -1640,137 +1435,109 @@ private:
     return true;
   }
 
-  bool try_acquire_store_write_port(const MemUop& uop, const OperandSlot& slot) {
+  bool try_acquire_store_write_port(const MemUop& uop) {
     uint32_t packet_idx = 0;
     if (!lookup_window_packet_idx(uop, uop.next_store_packet_idx, &packet_idx)) {
-      packet_idx = store_packet_offset(slot, uop) + uop.next_store_packet_idx;
+      packet_idx = store_packet_offset(uop) + uop.next_store_packet_idx;
       return core_->try_acquire_tmem_write_port(uop.handle, packet_idx);
     }
     return core_->try_acquire_tmem_window_write_port(uop.handle, uop.window_id, packet_idx);
   }
 
-  void execute_fill(uint32_t slot_id,
-                    const OperandSlot& slot,
-                    uint32_t handle,
-                    uint32_t window_id,
-                    TcuTarget target,
-                    bool separate_handle) {
-    IntrTcuArgs resolved_args{};
-    resolved_args.descriptor = slot.descriptor;
-    resolved_args.fmt_a = slot.fmt_a;
-    resolved_args.fmt_b = slot.fmt_b;
-    resolved_args.fmt_ab = (slot.fmt_a == slot.fmt_b) ? slot.fmt_a : 0;
-    resolved_args.fmt_c = slot.fmt_c;
-    resolved_args.sparse_mode = slot.sparse_mode;
-    resolved_args.target = target;
-
-    auto packets_needed = (target == TcuTarget::C)
-                        ? c_packet_count(slot.fmt_c)
-                        : ((target == TcuTarget::A)
-                           ? a_packet_count(slot.fmt_a)
-                           : b_packet_count(slot.fmt_b, slot.sparse_mode));
-    auto packet_offset = separate_handle ? 0 : target_packet_offset(resolved_args);
-    std::vector<Core::TmemPacket> packets(packets_needed);
-    const TmemWindowPlan* window = nullptr;
-    bool use_window = separate_handle
-                   && core_->lookup_tmem_window(handle, window_id, &window)
-                   && window->fmt != 0
-                   && window->packets_per_tile == packets_needed;
-    for (uint32_t i = 0; i < packets_needed; ++i) {
-      if (use_window) {
-        if (!core_->tmem_read_window_packet(handle, window_id, i, &packets.at(i))) {
-          std::abort();
-        }
-      } else if (!core_->tmem_read_packet(handle, packet_offset + i, &packets.at(i))) {
-        std::abort();
+  void enqueue_async_mma_load(uint32_t wid, uint32_t handle, const IntrTcuArgs& args, ExeTraceData* trace_data) {
+    auto wgid = arch_.warpgroup_id(wid);
+    if (!core_->tmem_handle_ready_for_mma_load(handle, args.target, args.a_sparse_mode)) {
+      if (trace_data) {
+        trace_data->retry = true;
       }
+      return;
     }
-
-    switch (target) {
-    case TcuTarget::A: {
-      auto packet_bytes = copy_packets<AMem::packet_t>(packets);
-      if (!amem_.fill_tile(slot_id, slot.fmt_a, packet_bytes)) {
-        std::abort();
+    if ((args.target == TcuTarget::A && args.slot_id >= a_slots_.size())
+     || (args.target == TcuTarget::B && args.slot_id >= b_slots_.size())
+     || (args.target == TcuTarget::C && args.slot_id >= c_slots_.size())
+     || args.target == TcuTarget::None) {
+      if (trace_data) {
+        trace_data->retry = true;
       }
-      if (slot.sparse_mode != vt::sparse_none) {
-        auto meta_packets_needed = meta_packet_count(slot.sparse_mode);
-        std::vector<Core::TmemPacket> meta_packets(meta_packets_needed);
-        for (uint32_t i = 0; i < meta_packets_needed; ++i) {
-          uint32_t meta_packet_idx = i;
-          const TmemWindowPlan* meta_window = nullptr;
-          bool use_meta_window = separate_handle
-                              && core_->lookup_tmem_window(handle, meta_shadow_window_id(window_id), &meta_window)
-                              && meta_window->fmt != 0
-                              && meta_window->packets_per_tile == meta_packets_needed;
-          if (use_meta_window) {
-            if (!core_->tmem_read_window_packet(handle, meta_shadow_window_id(window_id), meta_packet_idx, &meta_packets.at(i))) {
-              std::abort();
-            }
-          } else if (!core_->tmem_read_meta_packet(handle, i, &meta_packets.at(i))) {
-            std::abort();
+      return;
+    }
+    auto slot_id = static_cast<uint32_t>(args.slot_id);
+    const TmemWindowPlan* source_window = nullptr;
+    bool use_window = false;
+    uint32_t source_payload_fmt = 0;
+    bool lookup_ok = core_->lookup_tmem_window(handle, args.window_id, &source_window);
+    use_window = lookup_ok && source_window->packets_per_tile != 0;
+    if (!use_window) {
+      if (!core_->ensure_tmem_window_bound(handle, args.descriptor, args.target, args.window_id)) {
+        if (trace_data) {
+          trace_data->retry = true;
+        }
+        return;
+      }
+      lookup_ok = core_->lookup_tmem_window(handle, args.window_id, &source_window);
+      use_window = lookup_ok && source_window->packets_per_tile != 0;
+    }
+    if (!use_window || !window_matches_load_target(args.target, source_window->target)) {
+      if (trace_data) {
+        trace_data->retry = true;
+      }
+      return;
+    }
+    source_payload_fmt = source_window->fmt;
+
+    switch (args.target) {
+    case TcuTarget::A: {
+      auto& slot = a_slots_.at(slot_id);
+      if (!slot.valid || slot.owner_wgid != wgid || slot.descriptor != args.descriptor) {
+        if (!a_slot_can_rebind(slot)) {
+          if (trace_data) {
+            trace_data->retry = true;
           }
+          return;
         }
-        auto meta_bytes = copy_packets<MetaMem::packet_t>(meta_packets);
-        if (!metamem_.fill_tile(slot_id, meta_bytes)) {
-          std::abort();
+        init_a_slot_for_descriptor(slot_id, slot, wgid, args);
+      } else if (!a_slot_target_available(slot)) {
+        if (trace_data) {
+          trace_data->retry = true;
         }
+        return;
       }
     } break;
     case TcuTarget::B: {
-      auto packet_bytes = copy_packets<BMem::packet_t>(packets);
-      if (!bmem_.fill_tile(slot_id, slot.fmt_b, packet_bytes, slot.sparse_mode)) {
-        std::abort();
+      auto& slot = b_slots_.at(slot_id);
+      if (!slot.valid || slot.owner_wgid != wgid || slot.descriptor != args.descriptor) {
+        if (!b_slot_can_rebind(slot)) {
+          if (trace_data) {
+            trace_data->retry = true;
+          }
+          return;
+        }
+        init_b_slot_for_descriptor(slot_id, slot, wgid, args);
+      } else if (!b_slot_target_available(slot)) {
+        if (trace_data) {
+          trace_data->retry = true;
+        }
+        return;
       }
     } break;
     case TcuTarget::C: {
-      auto packet_bytes = copy_packets<CMem::packet_t>(packets);
-      if (!cmem_.fill_tile(slot_id, slot.fmt_c, packet_bytes)) {
-        std::abort();
+      auto& slot = c_slots_.at(slot_id);
+      if (!slot.valid || slot.owner_wgid != wgid || slot.descriptor != args.descriptor) {
+        if (!c_slot_can_rebind(slot)) {
+          if (trace_data) {
+            trace_data->retry = true;
+          }
+          return;
+        }
+        init_c_slot_for_descriptor(slot_id, slot, wgid, args);
+      } else if (!c_slot_target_available(slot)) {
+        if (trace_data) {
+          trace_data->retry = true;
+        }
+        return;
       }
     } break;
     default:
-      std::abort();
-    }
-  }
-
-  void enqueue_async_mma_load(uint32_t wid, uint32_t handle, const IntrTcuArgs& args, ExeTraceData* trace_data) {
-    if (!core_->tmem_handle_ready_for_mma_load(handle, args.target, args.sparse_mode)) {
-      if (trace_data) {
-        trace_data->retry = true;
-      }
-      return;
-    }
-    if (args.slot_id >= operand_slots_.size()) {
-      if (trace_data) {
-        trace_data->retry = true;
-      }
-      return;
-    }
-    auto slot_id = static_cast<int32_t>(args.slot_id);
-    auto& slot = operand_slots_.at(slot_id);
-    if (!core_->ensure_tmem_window_bound(handle, args.descriptor, args.target, args.window_id)) {
-      if (trace_data) {
-        trace_data->retry = true;
-      }
-      return;
-    }
-    if (!slot.valid || slot.owner_wid != wid || slot.descriptor != args.descriptor) {
-      if (!slot_can_rebind(slot)) {
-        if (trace_data) {
-          trace_data->retry = true;
-        }
-        return;
-      }
-      init_slot_for_descriptor(static_cast<uint32_t>(slot_id), slot, wid, args);
-    } else if (args.target == TcuTarget::None) {
-      if (slot_has_pending_work(slot) || slot.c_dirty) {
-        if (trace_data) {
-          trace_data->retry = true;
-        }
-        return;
-      }
-      init_slot_for_descriptor(static_cast<uint32_t>(slot_id), slot, wid, args);
-    } else if (!slot_target_available(slot, args.target)) {
       if (trace_data) {
         trace_data->retry = true;
       }
@@ -1779,102 +1546,106 @@ private:
 
     auto async_id = core_->mma_load_async_issue(wid, handle, args.descriptor);
     uint32_t num_uops = 0;
-    auto push_fill = [&](MemUop::Kind kind, TcuTarget target, bool separate_handle) {
+    auto push_fill = [&](MemUop::Kind kind,
+                         TcuTarget target,
+                         bool separate_handle,
+                         uint32_t payload_fmt) {
       MemUop op{};
       op.kind = kind;
-      op.wid = wid;
-      op.slot_id = static_cast<uint32_t>(slot_id);
+      op.wgid = wgid;
+      op.slot_id = slot_id;
       op.handle = handle;
       op.window_id = args.window_id;
+      op.payload_fmt = payload_fmt;
+      op.tile_idx = args.tile_id;
       op.async_id = async_id;
       op.separate_handle = separate_handle;
-      WindowCursorRole cursor_role = WindowCursorRole::LoadA;
       switch (target) {
-      case TcuTarget::A:
-        cursor_role = WindowCursorRole::LoadA;
-        break;
-      case TcuTarget::B:
-        cursor_role = WindowCursorRole::LoadB;
-        break;
-      case TcuTarget::C:
-        cursor_role = WindowCursorRole::LoadC;
-        break;
-      default:
-        break;
-      }
-      (void)reserve_window_cursor(handle, args.window_id, cursor_role, &op.tile_idx, &op.packets_per_tile);
-      switch (target) {
-      case TcuTarget::A:
-        op.remaining_tmem_reads = a_packet_count(slot.fmt_a)
-                                + ((slot.sparse_mode != vt::sparse_none) ? meta_packet_count(slot.sparse_mode) : 0);
+      case TcuTarget::A: {
+        const auto& slot = a_slots_.at(slot_id);
+        op.remaining_tmem_reads = a_packet_count((payload_fmt != kUnsetPayloadFmt) ? payload_fmt : slot.fmt_a)
+                                + ((slot.a_sparse_mode != vt::sparse_none) ? meta_packet_count(slot.a_sparse_mode) : 0);
         op.remaining_amem_writes = AMem::fill_beats();
-        op.remaining_meta_writes = (slot.sparse_mode != vt::sparse_none) ? MetaMem::fill_beats() : 0;
-        break;
-      case TcuTarget::B:
-        op.remaining_tmem_reads = b_packet_count(slot.fmt_b, slot.sparse_mode);
-        op.remaining_bmem_writes = BMem::fill_beats(slot.sparse_mode);
-        break;
-      case TcuTarget::C:
-        op.remaining_tmem_reads = c_packet_count(slot.fmt_c);
-        op.remaining_cmem_writes = CMem::fill_beats(slot.fmt_c);
-        break;
+        op.remaining_meta_writes = (slot.a_sparse_mode != vt::sparse_none) ? MetaMem::fill_beats() : 0;
+        mark_a_pending(a_slots_.at(slot_id), true);
+      } break;
+      case TcuTarget::B: {
+        const auto& slot = b_slots_.at(slot_id);
+        op.remaining_tmem_reads = b_packet_count((payload_fmt != kUnsetPayloadFmt) ? payload_fmt : slot.fmt_b);
+        op.remaining_bmem_writes = BMem::fill_beats();
+        mark_b_pending(b_slots_.at(slot_id), true);
+      } break;
+      case TcuTarget::C: {
+        const auto& slot = c_slots_.at(slot_id);
+        op.remaining_tmem_reads = c_load_packet_count((payload_fmt != kUnsetPayloadFmt) ? payload_fmt : slot.fmt_c);
+        op.remaining_cmem_writes = CMem::fill_beats((payload_fmt != kUnsetPayloadFmt) ? payload_fmt : slot.fmt_c);
+        mark_c_pending(c_slots_.at(slot_id), true);
+      } break;
       default:
         std::abort();
       }
-      mark_target_pending(slot, target, true);
       mem_ops_.push_back(op);
       perf_stats_.mem_queue_max = std::max<uint64_t>(perf_stats_.mem_queue_max, mem_ops_.size());
       ++num_uops;
     };
 
-    if (args.target == TcuTarget::None) {
-      push_fill(MemUop::Kind::FillA, TcuTarget::A, false);
-      push_fill(MemUop::Kind::FillB, TcuTarget::B, false);
-      push_fill(MemUop::Kind::FillC, TcuTarget::C, false);
-    } else {
-      switch (args.target) {
-      case TcuTarget::A:
-        push_fill(MemUop::Kind::FillA, TcuTarget::A, true);
-        break;
-      case TcuTarget::B:
-        push_fill(MemUop::Kind::FillB, TcuTarget::B, true);
-        break;
-      case TcuTarget::C:
-        push_fill(MemUop::Kind::FillC, TcuTarget::C, true);
-        break;
-      default:
-        std::abort();
-      }
+    switch (args.target) {
+    case TcuTarget::A:
+      push_fill(MemUop::Kind::FillA, TcuTarget::A, true, source_payload_fmt);
+      break;
+    case TcuTarget::B:
+      push_fill(MemUop::Kind::FillB, TcuTarget::B, true, source_payload_fmt);
+      break;
+    case TcuTarget::C:
+      push_fill(MemUop::Kind::FillC, TcuTarget::C, true, source_payload_fmt);
+      break;
+    default:
+      std::abort();
     }
 
     pending_mem_ops_[async_id] = num_uops;
   }
 
   void enqueue_async_mma_store(uint32_t wid, uint32_t handle, const IntrTcuArgs& args, ExeTraceData* trace_data) {
+    auto wgid = arch_.warpgroup_id(wid);
     if (!core_->tmem_handle_ready_for_mma_store(handle)) {
       if (trace_data) {
         trace_data->retry = true;
       }
       return;
     }
-    if (args.slot_id >= operand_slots_.size()) {
+    if (args.slot_id >= c_slots_.size()) {
       if (trace_data) {
         trace_data->retry = true;
       }
       return;
     }
-    auto slot_id = static_cast<int32_t>(args.slot_id);
-    auto& slot = operand_slots_.at(slot_id);
-    if (!core_->ensure_tmem_window_bound(handle, args.descriptor, TcuTarget::C, args.window_id)) {
+    auto slot_id = static_cast<uint32_t>(args.slot_id);
+    auto& slot = c_slots_.at(slot_id);
+    const TmemWindowPlan* store_window = nullptr;
+    bool use_window = core_->lookup_tmem_window(handle, args.window_id, &store_window)
+                   && store_window->target == TmemWindowTarget::D
+                   && store_window->packets_per_tile == d_store_packet_count(slot.fmt_d);
+    if (!use_window
+     && args.window_id != 0
+     && !core_->ensure_tmem_window_bound(handle, args.descriptor, TcuTarget::C, args.window_id, true)) {
       if (trace_data) {
         trace_data->retry = true;
       }
       return;
     }
-    if (args.target != TcuTarget::None && args.target != TcuTarget::C) {
-      std::abort();
+    if (!use_window && args.window_id != 0) {
+      use_window = core_->lookup_tmem_window(handle, args.window_id, &store_window)
+                && store_window->target == TmemWindowTarget::D
+                && store_window->packets_per_tile == d_store_packet_count(slot.fmt_d);
     }
-    if (!slot.valid || slot.owner_wid != wid || slot.descriptor != args.descriptor
+    if (args.window_id != 0 && !use_window) {
+      if (trace_data) {
+        trace_data->retry = true;
+      }
+      return;
+    }
+    if (!slot.valid || slot.owner_wgid != wgid || slot.descriptor != args.descriptor
      || slot.store_pending || slot.c_wmma_inflight != 0) {
       if (trace_data) {
         trace_data->retry = true;
@@ -1887,21 +1658,21 @@ private:
       }
       return;
     }
-    auto& store_slot = operand_slots_.at(slot_id);
+    auto& store_slot = c_slots_.at(slot_id);
     store_slot.store_pending = true;
     store_slot.busy = true;
     store_slot.store_async_id = core_->mma_store_async_issue(wid, handle, args.descriptor);
     MemUop op{};
     op.kind = MemUop::Kind::StoreC;
-    op.wid = wid;
-    op.slot_id = static_cast<uint32_t>(slot_id);
+    op.wgid = wgid;
+    op.slot_id = slot_id;
     op.handle = handle;
     op.window_id = args.window_id;
+    op.tile_idx = args.tile_id;
     op.async_id = store_slot.store_async_id;
-    op.separate_handle = args.target != TcuTarget::None;
-    (void)reserve_window_cursor(handle, args.window_id, WindowCursorRole::StoreC, &op.tile_idx, &op.packets_per_tile);
+    op.separate_handle = use_window;
     op.remaining_cmem_reads = CMem::dump_beats(store_slot.fmt_c);
-    op.remaining_tmem_writes = c_packet_count(store_slot.fmt_c);
+    op.remaining_tmem_writes = d_store_packet_count(store_slot.fmt_d);
     mem_ops_.push_back(op);
     perf_stats_.mem_queue_max = std::max<uint64_t>(perf_stats_.mem_queue_max, mem_ops_.size());
   }
@@ -1912,48 +1683,58 @@ private:
                           uint32_t fmt_b,
                           uint32_t fmt_c,
                           ExeTraceData* trace_data) {
+    auto wgid = arch_.warpgroup_id(wid);
     if (!use_open_tensorcore(fmt_a, fmt_b, fmt_c)) {
       if (trace_data) {
         trace_data->retry = true;
       }
       return;
     }
-    if (args.slot_id >= operand_slots_.size() || args.c_slot_id >= operand_slots_.size()) {
+    if (args.a_slot_id >= a_slots_.size()
+     || args.b_slot_id >= b_slots_.size()
+     || args.c_slot_id >= c_slots_.size()) {
       if (trace_data) {
         trace_data->retry = true;
       }
       return;
     }
-    auto ab_slot_id = static_cast<int32_t>(args.slot_id);
-    auto c_slot_id = static_cast<int32_t>(args.c_slot_id);
-    auto& ab_slot = operand_slots_.at(ab_slot_id);
-    auto& c_slot = operand_slots_.at(c_slot_id);
-    if (!ab_slot.valid || ab_slot.owner_wid != wid || ab_slot.descriptor != args.descriptor
-     || !c_slot.valid || c_slot.owner_wid != wid || c_slot.descriptor != args.descriptor
-     || !(ab_slot.a_ready && ab_slot.b_ready && c_slot.c_ready)
-     || ab_slot.wmma_pending || c_slot.store_pending) {
+    auto a_slot_id = static_cast<uint32_t>(args.a_slot_id);
+    auto b_slot_id = static_cast<uint32_t>(args.b_slot_id);
+    auto c_slot_id = static_cast<uint32_t>(args.c_slot_id);
+    auto& a_slot = a_slots_.at(a_slot_id);
+    auto& b_slot = b_slots_.at(b_slot_id);
+    auto& c_slot = c_slots_.at(c_slot_id);
+    if (!a_slot.valid || a_slot.owner_wgid != wgid || a_slot.descriptor != args.descriptor
+     || !b_slot.valid || b_slot.owner_wgid != wgid || b_slot.descriptor != args.descriptor
+     || !c_slot.valid || c_slot.owner_wgid != wgid || c_slot.descriptor != args.descriptor
+     || !(a_slot.a_ready && b_slot.b_ready && c_slot.c_ready)
+     || a_slot.wmma_pending || b_slot.wmma_pending || c_slot.store_pending) {
       if (trace_data) {
         trace_data->retry = true;
       }
       return;
     }
-    ab_slot.wmma_pending = true;
-    ab_slot.busy = slot_has_pending_work(ab_slot);
+    a_slot.wmma_pending = true;
+    a_slot.busy = a_slot_has_pending_work(a_slot);
+    b_slot.wmma_pending = true;
+    b_slot.busy = b_slot_has_pending_work(b_slot);
     c_slot.busy = true;
     c_slot.cmem_final_valid = false;
     c_slot.c_dirty = true;
     ++c_slot.c_wmma_inflight;
     auto async_id = core_->wmma_async_issue(wid);
-    ab_slot.wmma_async_id = async_id;
+    a_slot.wmma_async_id = async_id;
+    b_slot.wmma_async_id = async_id;
     pending_wmma_uops_[async_id] = kWmmaPrimitiveCount;
     pending_wmma_jobs_.push_back(PendingWmmaJob{
-      wid,
-      static_cast<uint32_t>(ab_slot_id),
-      static_cast<uint32_t>(c_slot_id),
+      wgid,
+      a_slot_id,
+      b_slot_id,
+      c_slot_id,
       fmt_a,
       fmt_b,
       fmt_c,
-      args.sparse_mode,
+      a_slot.a_sparse_mode,
       async_id,
       0,
     });
@@ -1968,20 +1749,19 @@ private:
     ensure_mem_port_budgets();
     for (size_t idx = 0; idx < mem_ops_.size(); ++idx) {
       auto& uop = mem_ops_.at(idx);
-      auto& slot = operand_slots_.at(uop.slot_id);
       bool progressed = false;
 
       if (uop.kind == MemUop::Kind::FillA
        || uop.kind == MemUop::Kind::FillB
        || uop.kind == MemUop::Kind::FillC) {
-        auto fill_action = select_fill_local_write(uop, slot);
+        auto fill_action = select_fill_local_write(uop);
         bool local_blocked = false;
 
         switch (fill_action) {
         case LocalFillAction::AData:
           if (amem_write_budget_ != 0) {
             --amem_write_budget_;
-            progressed = perform_fill_local_write(uop, slot, fill_action);
+            progressed = perform_fill_local_write(uop, fill_action);
           } else {
             local_blocked = true;
           }
@@ -1989,7 +1769,7 @@ private:
         case LocalFillAction::BData:
           if (bmem_write_budget_ != 0) {
             --bmem_write_budget_;
-            progressed = perform_fill_local_write(uop, slot, fill_action);
+            progressed = perform_fill_local_write(uop, fill_action);
           } else {
             local_blocked = true;
           }
@@ -1997,7 +1777,7 @@ private:
         case LocalFillAction::CData:
           if (cmem_write_budget_ != 0) {
             --cmem_write_budget_;
-            progressed = perform_fill_local_write(uop, slot, fill_action);
+            progressed = perform_fill_local_write(uop, fill_action);
           } else {
             local_blocked = true;
           }
@@ -2005,7 +1785,7 @@ private:
         case LocalFillAction::Meta:
           if (meta_write_budget_ != 0) {
             --meta_write_budget_;
-            progressed = perform_fill_local_write(uop, slot, fill_action);
+            progressed = perform_fill_local_write(uop, fill_action);
           } else {
             local_blocked = true;
           }
@@ -2015,8 +1795,8 @@ private:
         }
 
         if (!progressed && uop.remaining_tmem_reads != 0) {
-          if (try_acquire_fill_read_port(uop, slot)) {
-            progressed = stage_fill_read(uop, slot);
+          if (try_acquire_fill_read_port(uop)) {
+            progressed = stage_fill_read(uop);
           } else if (!local_blocked) {
             ++perf_stats_.stall_tmem_read_port_busy;
             continue;
@@ -2044,8 +1824,8 @@ private:
         }
       } else if (uop.kind == MemUop::Kind::StoreC) {
         if (uop.staged_store_packet_cursor < uop.staged_store_packets.size()) {
-          if (try_acquire_store_write_port(uop, slot)) {
-            progressed = emit_store_packet(uop, slot);
+          if (try_acquire_store_write_port(uop)) {
+            progressed = emit_store_packet(uop);
           } else {
             ++perf_stats_.stall_tmem_write_port_busy;
             continue;
@@ -2056,7 +1836,7 @@ private:
             continue;
           }
           --cmem_read_budget_;
-          progressed = stage_store_read(uop, slot);
+          progressed = stage_store_read(uop);
         }
       } else if (uop.remaining_amem_writes != 0 || uop.remaining_bmem_writes != 0
               || uop.remaining_cmem_writes != 0 || uop.remaining_cmem_reads != 0
@@ -2121,20 +1901,27 @@ private:
       }
 
       switch (uop.kind) {
-      case MemUop::Kind::FillA:
-        mark_target_ready(slot, TcuTarget::A);
+      case MemUop::Kind::FillA: {
+        auto& slot = a_slots_.at(uop.slot_id);
+        mark_a_ready(slot);
         break;
-      case MemUop::Kind::FillB:
-        mark_target_ready(slot, TcuTarget::B);
+      }
+      case MemUop::Kind::FillB: {
+        auto& slot = b_slots_.at(uop.slot_id);
+        mark_b_ready(slot);
         break;
-      case MemUop::Kind::FillC:
-        mark_target_ready(slot, TcuTarget::C);
+      }
+      case MemUop::Kind::FillC: {
+        auto& slot = c_slots_.at(uop.slot_id);
+        mark_c_ready(slot);
         break;
+      }
       case MemUop::Kind::StoreC: {
+        auto& slot = c_slots_.at(uop.slot_id);
         slot.store_pending = false;
         slot.c_dirty = false;
         slot.cmem_final_valid = true;
-        slot.busy = slot_has_pending_work(slot);
+        slot.busy = c_slot_has_pending_work(slot);
         core_->async_tensor_complete(uop.async_id);
         mem_ops_.erase(mem_ops_.begin() + idx);
         return;
@@ -2171,8 +1958,14 @@ private:
       if (pending_wmma_jobs_.empty()) {
         bool tensor_frontend_live = !mem_ops_.empty() || !pending_wmma_uops_.empty();
         if (!tensor_frontend_live) {
-          for (const auto& slot : operand_slots_) {
-            tensor_frontend_live |= slot.valid || slot.c_dirty || slot_has_pending_work(slot);
+          for (const auto& slot : a_slots_) {
+            tensor_frontend_live |= slot.valid || a_slot_has_pending_work(slot);
+          }
+          for (const auto& slot : b_slots_) {
+            tensor_frontend_live |= slot.valid || b_slot_has_pending_work(slot);
+          }
+          for (const auto& slot : c_slots_) {
+            tensor_frontend_live |= slot.valid || slot.c_dirty || c_slot_has_pending_work(slot);
           }
         }
         if (tensor_frontend_live) {
@@ -2186,7 +1979,8 @@ private:
     }
 
     auto& job = active_wmma_job_;
-    auto& ab_slot = operand_slots_.at(job.ab_slot_id);
+    auto& a_slot = a_slots_.at(job.a_slot_id);
+    auto& b_slot = b_slots_.at(job.b_slot_id);
 
     uint32_t storage_k = (job.next_uop < kSubtilesPerTile) ? 0 : 1;
     uint32_t c_subtile_id = job.next_uop & (kSubtilesPerTile - 1);
@@ -2196,20 +1990,21 @@ private:
     uint16_t b_block[kPrimitiveDim][kPrimitiveDim] = {};
     uint32_t zero_c[kPrimitiveDim][kPrimitiveDim] = {};
 
-    amem_.read_primitive(job.ab_slot_id, storage_m, storage_k, a_block);
-    // Sparse B is temporarily materialized through the dense 576b layout.
-    bmem_.read_primitive(job.ab_slot_id, storage_k, storage_n, b_block);
+    amem_.read_primitive(job.a_slot_id, storage_m, storage_k, a_block, a_slot.transpose_a);
+    bmem_.read_primitive(job.b_slot_id, storage_k, storage_n, b_block, b_slot.transpose_b);
 
     TensorCoreMeta meta{};
-    meta.wid = job.wid;
+    meta.wid = arch_.warpgroup_leader(job.wgid);
     meta.async_id = job.async_id;
-    meta.ab_slot_id = job.ab_slot_id;
+    meta.a_slot_id = job.a_slot_id;
+    meta.b_slot_id = job.b_slot_id;
     meta.c_slot_id = job.c_slot_id;
     meta.c_subtile_id = c_subtile_id;
     meta.valid = true;
 
-    tensorcore_fmt_c_ = job.fmt_c;
-    configure_open_tensorcore_precision(job.fmt_c);
+    auto& c_slot = c_slots_.at(job.c_slot_id);
+    tensorcore_fmt_out_ = c_slot.fmt_d;
+    configure_open_tensorcore_precision(tensorcore_fmt_out_);
     tensorcore_.push_uop(a_block, b_block, zero_c, meta);
     auto cycle = core_->current_cycle();
     ++perf_stats_.issued_primitive_tiles;
@@ -2220,16 +2015,19 @@ private:
 
     ++job.next_uop;
     if (job.next_uop >= kWmmaPrimitiveCount) {
-      ab_slot.wmma_pending = false;
-      ab_slot.a_ready = false;
-      ab_slot.busy = slot_has_pending_work(ab_slot);
+      a_slot.wmma_pending = false;
+      a_slot.a_ready = false;
+      a_slot.busy = a_slot_has_pending_work(a_slot);
+      b_slot.wmma_pending = false;
+      b_slot.b_ready = false;
+      b_slot.busy = b_slot_has_pending_work(b_slot);
       active_wmma_job_valid_ = false;
       return;
     }
   }
 
   void tick_tensorcore() {
-    configure_open_tensorcore_precision(tensorcore_fmt_c_);
+    configure_open_tensorcore_precision(tensorcore_fmt_out_);
     tensorcore_.tick(true);
 
     TensorCoreRetire retire;
@@ -2243,7 +2041,7 @@ private:
     if (!retire.valid || !retire.meta.valid) {
       return;
     }
-    auto& slot = operand_slots_.at(retire.meta.c_slot_id);
+    auto& slot = c_slots_.at(retire.meta.c_slot_id);
     auto subtile_id = retire.meta.c_subtile_id;
 
     auto cycle = core_->current_cycle();
@@ -2266,7 +2064,7 @@ private:
         std::abort();
       }
       --slot.c_wmma_inflight;
-      slot.busy = slot_has_pending_work(slot);
+      slot.busy = c_slot_has_pending_work(slot);
       slot.c_dirty = true;
       slot.cmem_final_valid = true;
       ++perf_stats_.retired_macro_wmma;
@@ -2278,7 +2076,9 @@ private:
   Core*       core_;
   Arch        arch_;
   PerfStats   perf_stats_;
-  std::array<OperandSlot, kNumOperandSlots> operand_slots_;
+  std::array<ASlotState, kNumOperandSlots> a_slots_;
+  std::array<BSlotState, kNumOperandSlots> b_slots_;
+  std::array<CSlotState, kNumOperandSlots> c_slots_;
   AMem amem_;
   BMem bmem_;
   CMem cmem_;
@@ -2290,8 +2090,7 @@ private:
   PendingWmmaJob active_wmma_job_;
   bool active_wmma_job_valid_ = false;
   TensorCoreTop tensorcore_;
-  uint32_t tensorcore_fmt_c_ = vt::fp16::id;
-  std::unordered_map<WindowCursorKey, WindowCursorState, WindowCursorKeyHash> window_cursors_;
+  uint32_t tensorcore_fmt_out_ = vt::fp16::id;
   uint64_t mem_port_cycle_ = std::numeric_limits<uint64_t>::max();
   uint32_t amem_write_budget_ = 0;
   uint32_t bmem_write_budget_ = 0;
@@ -2311,7 +2110,7 @@ op_string_t vortex::op_string(TcuType tcu_type, IntrTcuArgs args) {
   case TcuType::TMEM_REL_PERMIT:
     return {"TMEM_REL_PERMIT", ""};
   case TcuType::TMA_LOAD:
-    return {"TMA_LOAD" + std::string(args.transpose_b ? ".TB" : ""), ""};
+    return {"TMA_LOAD", ""};
   case TcuType::TMA_STORE:
     return {"TMA_STORE", ""};
   case TcuType::TC_COMMIT:
@@ -2334,7 +2133,7 @@ op_string_t vortex::op_string(TcuType tcu_type, IntrTcuArgs args) {
       return {"MMA_STORE.ASYNC." + std::to_string(args.descriptor) + "." + std::to_string(args.slot_id)
             + "." + std::to_string(static_cast<uint32_t>(args.target)), ""};
     }
-    return {"MMA_STORE." + std::string(vt::fmt_string(args.fmt_c)), ""};
+    return {"MMA_STORE." + std::string(vt::fmt_string(args.fmt_d)), ""};
   case TcuType::MBAR_INIT:
     return {"MBAR_INIT", ""};
   case TcuType::MBAR_ARRIVE:
@@ -2345,8 +2144,10 @@ op_string_t vortex::op_string(TcuType tcu_type, IntrTcuArgs args) {
     return {"TMA_WAIT", ""};
   case TcuType::WMMA:
     if (args.macro_op) {
-      return {"WMMA.ASYNC." + std::to_string(args.descriptor) + "." + std::to_string(args.slot_id)
-            + "." + std::to_string(args.c_slot_id), ""};
+      return {"WMMA.ASYNC." + std::to_string(args.descriptor)
+            + ".A" + std::to_string(args.a_slot_id)
+            + ".B" + std::to_string(args.b_slot_id)
+            + ".C" + std::to_string(args.c_slot_id), ""};
     }
     return {"WMMA." + std::string(vt::fmt_string(fmt_a)) + "." + std::string(vt::fmt_string(fmt_b)) + "." + std::string(vt::fmt_string(args.fmt_c))
           + "." + std::to_string(args.step_m) + "." + std::to_string(args.step_n) + "." + std::to_string(args.step_k), ""};

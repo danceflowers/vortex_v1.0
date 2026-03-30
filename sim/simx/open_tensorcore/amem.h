@@ -127,21 +127,26 @@ public:
     return true;
   }
 
-  void read_primitive(uint32_t slot_id, uint32_t step_m, uint32_t step_k, uint16_t out[8][8]) const {
-    auto line_idx = slot_base(slot_id) + step_m * 2 + step_k;
+  void read_primitive(uint32_t slot_id,
+                      uint32_t step_m,
+                      uint32_t step_k,
+                      uint16_t out[8][8],
+                      bool transpose = false) const {
+    auto line_idx = slot_base(slot_id) + ((transpose ? step_k : step_m) * 2) + (transpose ? step_m : step_k);
     if (!row_valid_.at(line_idx)) {
       std::abort();
     }
     const auto& line = lines_.at(line_idx);
     for (uint32_t i = 0; i < 8; ++i) {
       for (uint32_t j = 0; j < 8; ++j) {
-        out[i][j] = load_elem(line, i * 8 + j);
+        auto elem_idx = transpose ? (j * 8 + i) : (i * 8 + j);
+        out[i][j] = load_elem(line, elem_idx);
       }
     }
   }
 
-  void read_primitive(uint32_t step_m, uint32_t step_k, uint16_t out[8][8]) const {
-    read_primitive(0, step_m, step_k, out);
+  void read_primitive(uint32_t step_m, uint32_t step_k, uint16_t out[8][8], bool transpose = false) const {
+    read_primitive(0, step_m, step_k, out, transpose);
   }
 
 private:

@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <tensor_cfg.h>
+#include <vx_tensor.h>
 #include <vortex.h>
 
 #include "../tcu_host_utils.h"
@@ -33,7 +34,6 @@ static constexpr uint32_t kTileDim = 16;
 static constexpr uint32_t kABytes = kTileDim * kTileDim * sizeof(input_a_t);
 static constexpr uint32_t kBBytes = kTileDim * kTileDim * sizeof(input_b_t);
 static constexpr uint32_t kCBytes = kTileDim * kTileDim * sizeof(output_t);
-static constexpr uint32_t kCompositeBytes = kABytes + kBBytes + kCBytes;
 static constexpr uint32_t align_up(uint32_t value, uint32_t align) {
   return ((value + align - 1) / align) * align;
 }
@@ -44,14 +44,13 @@ static constexpr uint32_t kABankSpan = align_up(kTileDim * sizeof(input_a_t), 16
 static constexpr uint32_t kBBankSpan = align_up(kTileDim * sizeof(input_b_t), 16);
 static constexpr uint32_t kCBankSpan = align_up(kTileDim * sizeof(output_t), 16);
 static constexpr uint32_t kBankSpan = max3(kABankSpan, kBBankSpan, kCBankSpan);
-static constexpr uint8_t kTileRoleA = 1;
-static constexpr uint8_t kTileRoleB = 2;
-static constexpr uint8_t kTileRoleC = 3;
-static constexpr uint8_t kTileRoleD = 4;
+static constexpr uint32_t kTmaDescCount = 6;
 static constexpr uint8_t kPayloadDense = 0;
 
 vx_device_h device = nullptr;
-vx_buffer_h input_buffer = nullptr;
+vx_buffer_h input_a_buffer = nullptr;
+vx_buffer_h input_b_buffer = nullptr;
+vx_buffer_h input_c_buffer = nullptr;
 vx_buffer_h output_buffer = nullptr;
 vx_buffer_h tma_desc_buffer = nullptr;
 vx_buffer_h mma_desc_buffer = nullptr;
@@ -61,7 +60,9 @@ kernel_arg_t kernel_arg = {};
 
 void cleanup() {
   if (device) {
-    vx_mem_free(input_buffer);
+    vx_mem_free(input_a_buffer);
+    vx_mem_free(input_b_buffer);
+    vx_mem_free(input_c_buffer);
     vx_mem_free(output_buffer);
     vx_mem_free(tma_desc_buffer);
     vx_mem_free(mma_desc_buffer);
@@ -95,50 +96,98 @@ int main() {
 
   input_a_t a_tile[kTileDim][kTileDim];
   input_b_t b_tile[kTileDim][kTileDim];
-  output_t c_tile[kTileDim][kTileDim];
+  output_t c_init_tile[kTileDim][kTileDim];
+  output_t c_zero_tile[kTileDim][kTileDim];
   float ref_tile[kTileDim][kTileDim];
 
   for (uint32_t i = 0; i < kTileDim; ++i) {
     for (uint32_t j = 0; j < kTileDim; ++j) {
       a_tile[i][j] = host_utils::encode_a_input(0.125f * float((i + 1) + (j % 5)));
       b_tile[i][j] = host_utils::encode_b_input(0.0625f * float((j + 1) + (i % 7)));
-      c_tile[i][j] = host_utils::encode_output(0.25f * float((i == j) ? 1 : 0));
+      c_init_tile[i][j] = host_utils::encode_output(0.25f * float((i == j) ? 1 : 0));
+      c_zero_tile[i][j] = host_utils::encode_output(0.0f);
     }
   }
 
-  host_utils::build_open_tensorcore_ref(ref_tile, a_tile, b_tile, c_tile);
+  host_utils::build_open_tensorcore_ref(ref_tile, a_tile, b_tile, c_init_tile);
 
-  std::vector<uint8_t> h_composite(kCompositeBytes, 0);
-  host_utils::pack_ab_tile(h_composite, 0, a_tile, false);
-  host_utils::pack_ab_tile(h_composite, kABytes, b_tile, true);
-  host_utils::pack_c_tile(h_composite, kABytes + kBBytes, c_tile);
+  std::vector<uint8_t> h_a(kABytes, 0);
+  std::vector<uint8_t> h_b(kBBytes, 0);
+  std::vector<uint8_t> h_c(2 * kCBytes, 0);
+  host_utils::pack_ab_tile(h_a, 0, a_tile, false);
+  host_utils::pack_ab_tile(h_b, 0, b_tile, true);
+  host_utils::pack_c_tile(h_c, 0, c_init_tile);
+  host_utils::pack_c_tile(h_c, kCBytes, c_zero_tile);
 
-  tma_descriptor_t tma_descs[4] = {};
+  tma_descriptor_t tma_descs[kTmaDescCount] = {};
   mma_descriptor_t mma_descs[1] = {};
+
+  RT_CHECK(vx_mem_alloc(device, h_a.size(), VX_MEM_READ, &input_a_buffer));
+  RT_CHECK(vx_mem_alloc(device, h_b.size(), VX_MEM_READ, &input_b_buffer));
+  RT_CHECK(vx_mem_alloc(device, h_c.size(), VX_MEM_READ, &input_c_buffer));
+  RT_CHECK(vx_mem_alloc(device, 2 * kCBytes, VX_MEM_WRITE, &output_buffer));
+  RT_CHECK(vx_mem_alloc(device, sizeof(tma_descs), VX_MEM_READ, &tma_desc_buffer));
+  RT_CHECK(vx_mem_alloc(device, sizeof(mma_descs), VX_MEM_READ, &mma_desc_buffer));
+
+  uint64_t input_a_addr = 0;
+  uint64_t input_b_addr = 0;
+  uint64_t input_c_addr = 0;
+  uint64_t output_addr = 0;
+  uint64_t tma_desc_table_addr = 0;
+  uint64_t mma_desc_table_addr = 0;
+  RT_CHECK(vx_mem_address(input_a_buffer, &input_a_addr));
+  RT_CHECK(vx_mem_address(input_b_buffer, &input_b_addr));
+  RT_CHECK(vx_mem_address(input_c_buffer, &input_c_addr));
+  RT_CHECK(vx_mem_address(output_buffer, &output_addr));
+
+  tma_descs[0].addr = input_a_addr;
   tma_descs[0].size_bytes = kABytes;
   tma_descs[0].rows = kTileDim;
   tma_descs[0].cols = kTileDim;
   tma_descs[0].elem_bytes = sizeof(input_a_t);
-  tma_descs[0].tile_role = kTileRoleA;
+  tma_descs[0].tile_role = vt::tma_tile_role_a;
   tma_descs[0].payload_kind = kPayloadDense;
+
+  tma_descs[1].addr = input_b_addr;
   tma_descs[1].size_bytes = kBBytes;
   tma_descs[1].rows = kTileDim;
   tma_descs[1].cols = kTileDim;
   tma_descs[1].elem_bytes = sizeof(input_b_t);
-  tma_descs[1].tile_role = kTileRoleB;
+  tma_descs[1].tile_role = vt::tma_tile_role_b;
   tma_descs[1].payload_kind = kPayloadDense;
+
+  tma_descs[2].addr = input_c_addr;
   tma_descs[2].size_bytes = kCBytes;
   tma_descs[2].rows = kTileDim;
   tma_descs[2].cols = kTileDim;
   tma_descs[2].elem_bytes = sizeof(output_t);
-  tma_descs[2].tile_role = kTileRoleC;
+  tma_descs[2].tile_role = vt::tma_tile_role_c;
   tma_descs[2].payload_kind = kPayloadDense;
+
+  tma_descs[3].addr = input_c_addr + kCBytes;
   tma_descs[3].size_bytes = kCBytes;
   tma_descs[3].rows = kTileDim;
   tma_descs[3].cols = kTileDim;
   tma_descs[3].elem_bytes = sizeof(output_t);
-  tma_descs[3].tile_role = kTileRoleD;
+  tma_descs[3].tile_role = vt::tma_tile_role_c;
   tma_descs[3].payload_kind = kPayloadDense;
+
+  tma_descs[4].addr = output_addr;
+  tma_descs[4].size_bytes = kCBytes;
+  tma_descs[4].rows = kTileDim;
+  tma_descs[4].cols = kTileDim;
+  tma_descs[4].elem_bytes = sizeof(output_t);
+  tma_descs[4].tile_role = vt::tma_tile_role_d;
+  tma_descs[4].payload_kind = kPayloadDense;
+
+  tma_descs[5].addr = output_addr + kCBytes;
+  tma_descs[5].size_bytes = kCBytes;
+  tma_descs[5].rows = kTileDim;
+  tma_descs[5].cols = kTileDim;
+  tma_descs[5].elem_bytes = sizeof(output_t);
+  tma_descs[5].tile_role = vt::tma_tile_role_d;
+  tma_descs[5].payload_kind = kPayloadDense;
+
   mma_descs[0].fmt_a = vt::ATYPE::id;
   mma_descs[0].fmt_b = vt::BTYPE::id;
   mma_descs[0].fmt_c = vt::OTYPE::id;
@@ -150,23 +199,9 @@ int main() {
   mma_descs[0].c_rows = kTileDim;
   mma_descs[0].c_cols = kTileDim;
 
-  RT_CHECK(vx_mem_alloc(device, kCompositeBytes, VX_MEM_READ, &input_buffer));
-  RT_CHECK(vx_mem_alloc(device, kCBytes, VX_MEM_WRITE, &output_buffer));
-  RT_CHECK(vx_mem_alloc(device, sizeof(tma_descs), VX_MEM_READ, &tma_desc_buffer));
-  RT_CHECK(vx_mem_alloc(device, sizeof(mma_descs), VX_MEM_READ, &mma_desc_buffer));
-
-  uint64_t input_addr = 0;
-  uint64_t output_addr = 0;
-  uint64_t tma_desc_table_addr = 0;
-  uint64_t mma_desc_table_addr = 0;
-  RT_CHECK(vx_mem_address(input_buffer, &input_addr));
-  RT_CHECK(vx_mem_address(output_buffer, &output_addr));
-  tma_descs[0].addr = input_addr;
-  tma_descs[1].addr = input_addr + kABytes;
-  tma_descs[2].addr = input_addr + kABytes + kBBytes;
-  tma_descs[3].addr = output_addr;
-
-  RT_CHECK(vx_copy_to_dev(input_buffer, h_composite.data(), 0, h_composite.size()));
+  RT_CHECK(vx_copy_to_dev(input_a_buffer, h_a.data(), 0, h_a.size()));
+  RT_CHECK(vx_copy_to_dev(input_b_buffer, h_b.data(), 0, h_b.size()));
+  RT_CHECK(vx_copy_to_dev(input_c_buffer, h_c.data(), 0, h_c.size()));
   RT_CHECK(vx_copy_to_dev(tma_desc_buffer, tma_descs, 0, sizeof(tma_descs)));
   RT_CHECK(vx_copy_to_dev(mma_desc_buffer, mma_descs, 0, sizeof(mma_descs)));
 
@@ -174,7 +209,7 @@ int main() {
   RT_CHECK(vx_mem_address(mma_desc_buffer, &mma_desc_table_addr));
   kernel_arg.desc_tables.magic = vt::descriptor_table_magic;
   kernel_arg.desc_tables.version = vt::descriptor_table_version;
-  kernel_arg.desc_tables.tma_desc_count = 4;
+  kernel_arg.desc_tables.tma_desc_count = kTmaDescCount;
   kernel_arg.desc_tables.mma_desc_count = 1;
   kernel_arg.desc_tables.tma_desc_addr = tma_desc_table_addr;
   kernel_arg.desc_tables.mma_desc_addr = mma_desc_table_addr;
@@ -182,9 +217,7 @@ int main() {
   kernel_arg.grid_dim[1] = 1;
   kernel_arg.block_dim[0] = NUM_THREADS;
   kernel_arg.block_dim[1] = 1;
-  kernel_arg.a_bank_span = kABankSpan;
-  kernel_arg.b_bank_span = kBBankSpan;
-  kernel_arg.c_bank_span = kCBankSpan;
+  kernel_arg.bank_span = kBankSpan;
 
   RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
   RT_CHECK(vx_upload_bytes(device, &kernel_arg, sizeof(kernel_arg), &args_buffer));
@@ -195,30 +228,32 @@ int main() {
   std::cout << "wait for completion" << std::endl;
   RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
 
-  std::vector<uint8_t> h_output_bytes(kCBytes, 0);
+  std::vector<uint8_t> h_output_bytes(2 * kCBytes, 0);
   RT_CHECK(vx_copy_from_dev(h_output_bytes.data(), output_buffer, 0, h_output_bytes.size()));
-
-  std::vector<output_t> h_output(kTileDim * kTileDim, host_utils::encode_output(0.0f));
-  host_utils::scatter_c_tile(h_output, h_output_bytes.data(), 0, 0);
-
-  std::vector<float> h_output_float;
-  host_utils::convert_output_matrix_to_float(h_output_float, h_output);
 
   float max_abs_err = 0.0f;
   int errors = 0;
   constexpr float tolerance = 1e-6f;
-  for (uint32_t i = 0; i < kTileDim; ++i) {
-    for (uint32_t j = 0; j < kTileDim; ++j) {
-      auto actual = h_output_float[i * kTileDim + j];
-      auto expect = ref_tile[i][j];
-      auto err = std::fabs(actual - expect);
-      max_abs_err = std::max(max_abs_err, err);
-      if (err > tolerance) {
-        if (errors < 16) {
-          std::cout << "mismatch[" << i << "," << j << "]: actual=" << actual
-                    << ", expected=" << expect << ", err=" << err << std::endl;
+  for (uint32_t snap = 0; snap < 2; ++snap) {
+    std::vector<output_t> h_output(kTileDim * kTileDim, host_utils::encode_output(0.0f));
+    host_utils::scatter_c_tile(h_output, h_output_bytes.data() + snap * kCBytes, 0, 0);
+
+    std::vector<float> h_output_float;
+    host_utils::convert_output_matrix_to_float(h_output_float, h_output);
+
+    for (uint32_t i = 0; i < kTileDim; ++i) {
+      for (uint32_t j = 0; j < kTileDim; ++j) {
+        auto actual = h_output_float[i * kTileDim + j];
+        auto expect = ref_tile[i][j];
+        auto err = std::fabs(actual - expect);
+        max_abs_err = std::max(max_abs_err, err);
+        if (err > tolerance) {
+          if (errors < 16) {
+            std::cout << "mismatch[snap=" << snap << "][" << i << "," << j << "]: actual=" << actual
+                      << ", expected=" << expect << ", err=" << err << std::endl;
+          }
+          ++errors;
         }
-        ++errors;
       }
     }
   }

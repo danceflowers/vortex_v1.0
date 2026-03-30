@@ -26,6 +26,7 @@ class Arch {
 private:
   uint16_t num_threads_;
   uint16_t num_warps_;
+  uint16_t warpgroup_size_;
   uint16_t num_cores_;
   uint16_t num_clusters_;
   uint16_t socket_size_;
@@ -36,6 +37,7 @@ public:
   Arch(uint16_t num_threads, uint16_t num_warps, uint16_t num_cores)   
     : num_threads_(num_threads)
     , num_warps_(num_warps)
+    , warpgroup_size_(4)
     , num_cores_(num_cores)
     , num_clusters_(NUM_CLUSTERS)
     , socket_size_(SOCKET_SIZE)
@@ -57,6 +59,30 @@ public:
 
   uint16_t num_warps() const {
     return num_warps_;
+  }
+
+  uint16_t warpgroup_size() const {
+    return warpgroup_size_;
+  }
+
+  uint16_t num_warpgroups() const {
+    return (num_warps_ + warpgroup_size_ - 1) / warpgroup_size_;
+  }
+
+  uint16_t warpgroup_id(uint32_t wid) const {
+    return wid / warpgroup_size_;
+  }
+
+  uint16_t warpgroup_lane(uint32_t wid) const {
+    return wid % warpgroup_size_;
+  }
+
+  uint16_t warpgroup_first_wid(uint32_t wgid) const {
+    return wgid * warpgroup_size_;
+  }
+
+  uint16_t warpgroup_leader(uint32_t wgid) const {
+    return warpgroup_first_wid(wgid);
   }
 
   uint16_t num_cores() const {

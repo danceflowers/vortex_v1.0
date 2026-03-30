@@ -55,8 +55,8 @@ static inline void issue_async_mma_load_ab(uint32_t handle_a,
                                            uint32_t slot_id,
                                            uint32_t barrier_id) {
   vt::mbarrier_init(barrier_id, 1);
-  vt::mma_load_a_slot<kMmaDescId>(handle_a, slot_id);
-  vt::mma_load_b_slot<kMmaDescId>(handle_b, slot_id);
+  vt::mma_load_a_slot<kMmaDescId>(handle_a, 0, 0, slot_id);
+  vt::mma_load_b_slot<kMmaDescId>(handle_b, 0, 0, slot_id);
   (void)vt::tc_commit(barrier_id);
   vt::mbarrier_arrive(barrier_id);
 }
@@ -65,7 +65,7 @@ static inline void issue_async_mma_load_c(uint32_t handle_c,
                                           uint32_t slot_id,
                                           uint32_t barrier_id) {
   vt::mbarrier_init(barrier_id, 1);
-  vt::mma_load_c_slot<kMmaDescId>(handle_c, slot_id);
+  vt::mma_load_c_slot<kMmaDescId>(handle_c, 0, 0, slot_id);
   (void)vt::tc_commit(barrier_id);
   vt::mbarrier_arrive(barrier_id);
 }
@@ -124,11 +124,11 @@ static inline void run_worker_single(kernel_arg_t* __UNIFORM__ arg, uint32_t til
       ++next_phase_to_prefetch;
     }
 
-    ctx::mma_sync_slots<kMmaDescId>(ab_slot, kCSlot, fragC, fragA, fragB, fragC);
+    ctx::mma_sync_slots<kMmaDescId>(ab_slot, ab_slot, kCSlot, fragC, fragA, fragB, fragC);
   }
 
   vt::tc_wait();
-  vt::mma_store_c_slot<kMmaDescId>(handle_d, kCSlot);
+  vt::mma_store_c_slot<kMmaDescId>(handle_d, 0, 0, kCSlot);
   vt::tc_wait();
   auto store_id = vt::tma_store(handle_d, c_out_desc_id(tile_id));
   vt::tma_wait(store_id);
@@ -162,11 +162,11 @@ static inline void run_worker_dual(kernel_arg_t* __UNIFORM__ arg, uint32_t tile_
     (void)vt::tma_load(handle_b, b_desc_id(tile_id, phase));
     issue_async_mma_load_ab(handle_a, handle_b, slot_id, ab_load_barrier);
     vt::mbarrier_wait(ab_load_barrier);
-    ctx::mma_sync_slots<kMmaDescId>(slot_id, slot_id, fragC, fragA, fragB, fragC);
+    ctx::mma_sync_slots<kMmaDescId>(slot_id, slot_id, slot_id, fragC, fragA, fragB, fragC);
   }
 
   vt::tc_wait();
-  vt::mma_store_c_slot<kMmaDescId>(handle_d, slot_id);
+  vt::mma_store_c_slot<kMmaDescId>(handle_d, 0, 0, slot_id);
   vt::tc_wait();
   auto store_id = vt::tma_store(handle_d, c_out_desc_id(tile_id));
   vt::tma_wait(store_id);

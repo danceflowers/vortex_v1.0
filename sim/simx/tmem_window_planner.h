@@ -23,6 +23,7 @@ enum class TmemWindowTarget : uint8_t {
   A = 0,
   B,
   C,
+  D,
   Meta,
 };
 
@@ -39,10 +40,12 @@ struct TmemWindowPlannerInput {
   TensorShape2D a_shape = {};
   TensorShape2D b_shape = {};
   TensorShape2D c_shape = {};
+  TensorShape2D d_shape = {};
   TensorShape2D meta_shape = {};
   uint32_t fmt_a = 0;
   uint32_t fmt_b = 0;
   uint32_t fmt_c = 0;
+  uint32_t fmt_d = 0;
   uint32_t sparse_mode = 0;
   uint32_t allocation_col_span = 0;
 };
@@ -75,14 +78,15 @@ struct TmemLayoutPlan {
   uint32_t epoch = 0;
   uint32_t required_col_span = 0;
   uint32_t required_logical_col_span = 0;
+  uint32_t required_logical_line_span = 0;
   std::vector<TmemWindowPlan> windows;
 };
 
 class TmemWindowPlanner {
 public:
   static constexpr uint32_t kMinAllocationCols = 16;
-  static constexpr uint32_t kLogicalCols = 128;
-  static constexpr uint32_t kLogicalLines = 64;
+  static constexpr uint32_t kLogicalCols = 64;
+  static constexpr uint32_t kLogicalLines = 128;
   static constexpr uint32_t kTileRows = 16;
   static constexpr uint32_t kTileCols = 16;
   static constexpr uint32_t kPacketBytes = 64;
@@ -101,8 +105,8 @@ public:
 private:
   static bool append_dense_window(TmemLayoutPlan* plan,
                                   uint32_t* next_window_id,
-                                  uint32_t* next_alloc_col_base,
-                                  uint32_t* next_col_base,
+                                  uint32_t* required_alloc_col_span,
+                                  uint32_t* next_line_base,
                                   TmemWindowTarget target,
                                   const TensorShape2D& shape,
                                   uint32_t fmt,

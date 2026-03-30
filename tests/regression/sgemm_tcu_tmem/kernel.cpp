@@ -50,7 +50,7 @@ static inline void prepare_c_tile(kernel_arg_t* __UNIFORM__ arg,
                                   uint32_t handle_c,
                                   uint32_t slot_id) {
   (void)vt::tma_load(handle_c, c_in_desc_base(arg) + tile_id);
-  vt::mma_load_c_slot<kMmaDescId>(handle_c, slot_id);
+  vt::mma_load_c_slot<kMmaDescId>(handle_c, 0, 0, slot_id);
 }
 
 static inline void prepare_ab_phase(kernel_arg_t* __UNIFORM__ arg,
@@ -64,8 +64,8 @@ static inline void prepare_ab_phase(kernel_arg_t* __UNIFORM__ arg,
                      phase_desc_id(a_desc_base(arg), phase, num_tiles, tile_id));
   (void)vt::tma_load(handle_b[stage],
                      phase_desc_id(b_desc_base(arg), phase, num_tiles, tile_id));
-  vt::mma_load_a_slot<kMmaDescId>(handle_a[stage], stage);
-  vt::mma_load_b_slot<kMmaDescId>(handle_b[stage], stage);
+  vt::mma_load_a_slot<kMmaDescId>(handle_a[stage], 0, 0, stage);
+  vt::mma_load_b_slot<kMmaDescId>(handle_b[stage], 0, 0, stage);
 }
 
 static inline void run_tile(kernel_arg_t* __UNIFORM__ arg,
@@ -109,10 +109,10 @@ static inline void run_tile(kernel_arg_t* __UNIFORM__ arg,
 
   for (uint32_t phase_base = 0; phase_base < arg->phase_limit; phase_base += kPipelineStages) {
     if (phase_base < arg->phase_limit) {
-      ctx::mma_sync_slots<kMmaDescId>(0, c_slot, fragC, fragA, fragB, fragC);
+      ctx::mma_sync_slots<kMmaDescId>(0, 0, c_slot, fragC, fragA, fragB, fragC);
     }
     if (phase_base + 1 < arg->phase_limit) {
-      ctx::mma_sync_slots<kMmaDescId>(1, c_slot, fragC, fragA, fragB, fragC);
+      ctx::mma_sync_slots<kMmaDescId>(1, 1, c_slot, fragC, fragA, fragB, fragC);
     }
     if (phase_base + 2 < arg->phase_limit) {
       prepare_ab_phase(arg, tile_id, phase_base + 2, 0, handle_a, handle_b, num_tiles);
@@ -158,7 +158,7 @@ static inline void run_tile(kernel_arg_t* __UNIFORM__ arg,
     vt::tma_wait(*pending_store_id);
     *pending_store_valid = false;
   }
-  vt::mma_store_c_slot<kMmaDescId>(handle_d, c_slot);
+  vt::mma_store_c_slot<kMmaDescId>(handle_d, 0, 0, c_slot);
   vt::tc_wait();
   *pending_store_id = vt::tma_store(handle_d, c_out_desc_base(arg) + tile_id);
   *pending_store_valid = true;
@@ -251,12 +251,12 @@ static inline void run_worker_dual(kernel_arg_t* __UNIFORM__ arg, uint32_t wid) 
     for (uint32_t phase = 0; phase < arg->phase_limit; ++phase) {
       (void)vt::tma_load(handle_a, phase_desc_id(a_desc_base(arg), phase, num_tiles, tile_id));
       (void)vt::tma_load(handle_b, phase_desc_id(b_desc_base(arg), phase, num_tiles, tile_id));
-      vt::mma_load_a_slot<kMmaDescId>(handle_a, slot_id);
-      vt::mma_load_b_slot<kMmaDescId>(handle_b, slot_id);
-      ctx::mma_sync_slots<kMmaDescId>(slot_id, slot_id, fragC, fragA, fragB, fragC);
+      vt::mma_load_a_slot<kMmaDescId>(handle_a, 0, 0, slot_id);
+      vt::mma_load_b_slot<kMmaDescId>(handle_b, 0, 0, slot_id);
+      ctx::mma_sync_slots<kMmaDescId>(slot_id, slot_id, slot_id, fragC, fragA, fragB, fragC);
     }
     vt::tc_wait();
-    vt::mma_store_c_slot<kMmaDescId>(handle_d, slot_id);
+    vt::mma_store_c_slot<kMmaDescId>(handle_d, 0, 0, slot_id);
     vt::tc_wait();
     auto store_id = vt::tma_store(handle_d, c_out_desc_base(arg) + tile_id);
     vt::tma_wait(store_id);

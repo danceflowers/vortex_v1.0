@@ -59,8 +59,8 @@ public:
   static constexpr uint32_t kPacketBytes = 64;
   static constexpr uint32_t kPhysicalBankBytes = 8;
   static constexpr uint32_t kPacketLanes = kPacketBytes / kPhysicalBankBytes;
-  static constexpr uint32_t kLogicalLines = 64;
-  static constexpr uint32_t kPayloadCols = 128;
+  static constexpr uint32_t kLogicalLines = 128;
+  static constexpr uint32_t kPayloadCols = 64;
   static constexpr uint32_t kMetaCols = 0;
   static constexpr uint32_t kMetaColBase = kPayloadCols;
   static constexpr uint32_t kNumCols = kPayloadCols + kMetaCols;
@@ -116,6 +116,10 @@ public:
   bool write_window_line_chunk(uint32_t handle, uint32_t window_id, uint32_t line_idx, uint32_t chunk_idx, const TmemPacket& in);
   bool window_line_chunk_count(uint32_t handle, uint32_t window_id, uint32_t* count) const;
   bool shift_window_down(uint32_t handle, uint32_t window_id);
+  bool shift_window_math_row_down(uint32_t handle,
+                                  uint32_t window_id,
+                                  const uint8_t* refill_row,
+                                  uint32_t refill_size_bytes);
 
   bool read_packet(uint32_t handle, uint32_t packet_idx, TmemPacket* out) const;
   bool read_meta_packet(uint32_t handle, uint32_t packet_idx, TmemPacket* out) const;
@@ -212,7 +216,7 @@ private:
                                    const TmemWindowPlan& window) const;
 
   using PhysicalRow = std::vector<uint8_t>;
-  static constexpr uint32_t kPhysicalRows = kLogicalLines;
+  static constexpr uint32_t kPhysicalRows = 64;
 
   uint32_t num_physical_banks_;
   uint32_t bank_slice_bytes_;

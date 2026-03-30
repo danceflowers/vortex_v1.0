@@ -43,10 +43,13 @@ struct MmaDescriptor {
   uint32_t fmt_a = 0;
   uint32_t fmt_b = 0;
   uint32_t fmt_c = 0;
+  uint32_t fmt_d = 0;
   uint8_t ws = 0;
   uint8_t sp = 0;
   uint8_t sparse_mode = 0;
-  uint8_t reserved = 0;
+  uint8_t transpose_a = 0;
+  uint8_t transpose_b = 0;
+  uint8_t reserved[3] = {};
   uint16_t a_rows = 0;
   uint16_t a_cols = 0;
   uint16_t b_rows = 0;
@@ -80,13 +83,12 @@ public:
                            MmaDescriptor* out,
                            const ReadCallback& dcache_read);
 
-  uint32_t estimate_load_latency(const TmaDescriptor& desc, bool transpose_b) const;
+  uint32_t estimate_load_latency(const TmaDescriptor& desc) const;
   uint32_t payload_size_bytes(const TmaDescriptor& desc) const;
   uint32_t payload_packet_count(const TmaDescriptor& desc) const;
   uint32_t meta_packet_count(const TmaDescriptor& desc) const;
 
   bool load_payload(const TmaDescriptor& desc,
-                    bool transpose_b,
                     uint32_t capacity,
                     std::vector<uint8_t>* out,
                     const ReadCallback& dcache_read) const;

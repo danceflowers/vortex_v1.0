@@ -29,6 +29,7 @@ using host_utils = tcu_test::TileHostUtils<input_a_t, input_b_t, output_t, 16>;
 
 static const char* kernel_file = "kernel.vxbin";
 
+static constexpr uint32_t kWarpgroupWarps = 4;
 static constexpr uint32_t kTileDim = 16;
 static constexpr uint32_t kABytes = kTileDim * kTileDim * sizeof(input_a_t);
 static constexpr uint32_t kBBytes = kTileDim * kTileDim * sizeof(input_b_t);
@@ -89,6 +90,15 @@ int main() {
   if (num_threads != NUM_THREADS) {
     std::cout << "Error: device warp size (" << num_threads
               << ") must match NUM_THREADS=" << NUM_THREADS << "!" << std::endl;
+    cleanup();
+    return -1;
+  }
+
+  uint64_t num_warps = 0;
+  RT_CHECK(vx_dev_caps(device, VX_CAPS_NUM_WARPS, &num_warps));
+  if (num_warps < kWarpgroupWarps) {
+    std::cout << "Error: device must provide at least " << kWarpgroupWarps
+              << " warps per core for the warpgroup regression!" << std::endl;
     cleanup();
     return -1;
   }
@@ -180,7 +190,7 @@ int main() {
   kernel_arg.desc_tables.mma_desc_addr = mma_desc_table_addr;
   kernel_arg.grid_dim[0] = 1;
   kernel_arg.grid_dim[1] = 1;
-  kernel_arg.block_dim[0] = NUM_THREADS;
+  kernel_arg.block_dim[0] = NUM_THREADS * kWarpgroupWarps;
   kernel_arg.block_dim[1] = 1;
   kernel_arg.a_bank_span = kABankSpan;
   kernel_arg.b_bank_span = kBBankSpan;

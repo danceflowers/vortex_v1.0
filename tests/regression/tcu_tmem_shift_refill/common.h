@@ -40,10 +40,13 @@ typedef struct __attribute__((packed)) {
   uint32_t fmt_a;
   uint32_t fmt_b;
   uint32_t fmt_c;
+  uint32_t fmt_d;
   uint8_t ws;
   uint8_t sp;
   uint8_t sparse_mode;
-  uint8_t reserved;
+  uint8_t transpose_a;
+  uint8_t transpose_b;
+  uint8_t reserved[3];
   uint16_t a_rows;
   uint16_t a_cols;
   uint16_t b_rows;

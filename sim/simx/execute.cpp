@@ -51,13 +51,12 @@ inline int64_t check_boxing(int64_t a) {
 }
 
 #ifdef EXT_TCU_ENABLE
-static inline uint32_t effective_tmem_window_id(uint32_t tagged_handle, uint32_t explicit_window_id) {
-  auto tagged_window_id = tmem_tagged_handle_window(tagged_handle);
-  return (explicit_window_id != 0) ? explicit_window_id : tagged_window_id;
+static inline bool has_mma_descriptor(const IntrTcuArgs& args) {
+  return args.descriptor != kInvalidTcuDescriptorId;
 }
 
 static inline void resolve_mma_descriptor(Core* core, IntrTcuArgs* args) {
-  if (args->descriptor == 0xffffffffu) {
+  if (!has_mma_descriptor(*args)) {
     return;
   }
   Core::MmaDescriptor desc;
@@ -68,9 +67,12 @@ static inline void resolve_mma_descriptor(Core* core, IntrTcuArgs* args) {
   args->fmt_b = desc.fmt_b;
   args->fmt_ab = (desc.fmt_a == desc.fmt_b) ? desc.fmt_a : 0;
   args->fmt_c = desc.fmt_c;
+  args->fmt_d = desc.fmt_d;
   args->ws = desc.ws;
   args->sp = desc.sp;
-  args->sparse_mode = desc.sparse_mode;
+  args->a_sparse_mode = desc.sparse_mode;
+  args->transpose_a = desc.transpose_a;
+  args->transpose_b = desc.transpose_b;
 }
 #endif
 
@@ -1502,18 +1504,18 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         rd_write = true;
       } break;
       case TcuType::TMEM_FREE: {
-        auto handle = tmem_tagged_handle_base(rs1_data.at(thread_start).u32);
+        auto handle = rs1_data.at(thread_start).u32;
         core_->tmem_free(handle);
       } break;
       case TcuType::TMEM_REL_PERMIT: {
         core_->tmem_rel_permit();
       } break;
       case TcuType::TMA_LOAD: {
-        auto tagged_handle = rs1_data.at(thread_start).u32;
-        auto handle = tmem_tagged_handle_base(tagged_handle);
-        tpuArgs.window_id = effective_tmem_window_id(tagged_handle, tpuArgs.window_id);
-        auto desc_id = rs2_data.at(thread_start).u32;
-        auto async_id = core_->tma_load(wid, handle, desc_id, tpuArgs.transpose_b, tpuArgs.window_id);
+        auto handle = rs1_data.at(thread_start).u32;
+        auto control = rs2_data.at(thread_start).u32;
+        tpuArgs.window_id = tcu_tmem_op_ctl_window_id(control);
+        auto desc_id = tcu_tmem_op_ctl_desc_id(control);
+        auto async_id = core_->tma_load(wid, handle, desc_id, tpuArgs.window_id);
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t))
             continue;
@@ -1523,10 +1525,10 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         rd_write = true;
       } break;
       case TcuType::TMA_STORE: {
-        auto tagged_handle = rs1_data.at(thread_start).u32;
-        auto handle = tmem_tagged_handle_base(tagged_handle);
-        tpuArgs.window_id = effective_tmem_window_id(tagged_handle, tpuArgs.window_id);
-        auto desc_id = rs2_data.at(thread_start).u32;
+        auto handle = rs1_data.at(thread_start).u32;
+        auto control = rs2_data.at(thread_start).u32;
+        tpuArgs.window_id = tcu_tmem_op_ctl_window_id(control);
+        auto desc_id = tcu_tmem_op_ctl_desc_id(control);
         auto async_id = core_->tma_store(wid, handle, desc_id, tpuArgs.window_id);
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t))
@@ -1561,12 +1563,12 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         }
       } break;
       case TcuType::TMEM_SHIFT: {
-        auto tagged_handle = rs1_data.at(thread_start).u32;
-        auto handle = tmem_tagged_handle_base(tagged_handle);
-        tpuArgs.window_id = effective_tmem_window_id(tagged_handle, tpuArgs.window_id);
+        auto handle = rs1_data.at(thread_start).u32;
         auto shift_control = rs2_data.at(thread_start).u32;
-        auto refill_desc_id = tmem_shift_has_refill(shift_control)
-                            ? tmem_shift_refill_desc_id(shift_control)
+        tpuArgs.window_id = tcu_tmem_op_ctl_window_id(shift_control);
+        auto flags = tcu_tmem_op_ctl_flags(shift_control);
+        auto refill_desc_id = (flags & kTcuTmemOpFlagRefill) != 0
+                            ? tcu_tmem_op_ctl_desc_id(shift_control)
                             : 0;
         auto async_id = core_->tmem_shift(wid, handle, tpuArgs.window_id, refill_desc_id);
         for (uint32_t t = thread_start; t < num_threads; ++t) {
@@ -1579,9 +1581,12 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       } break;
       case TcuType::MMA_LOAD: {
         resolve_mma_descriptor(core_, &tpuArgs);
-        auto tagged_handle = rs1_data.at(thread_start).u32;
-        auto handle = tmem_tagged_handle_base(tagged_handle);
-        tpuArgs.window_id = effective_tmem_window_id(tagged_handle, tpuArgs.window_id);
+        auto handle = rs1_data.at(thread_start).u32;
+        auto control = rs2_data.at(thread_start).u32;
+        tpuArgs.target = tcu_mma_mem_ctl_target(control);
+        tpuArgs.slot_id = tcu_mma_mem_ctl_slot_id(control);
+        tpuArgs.window_id = tcu_mma_mem_ctl_window_id(control);
+        tpuArgs.tile_id = tcu_mma_mem_ctl_tile_id(control);
         tensor_unit_->mma_load(wid, handle, tpuArgs, trace_data.get());
         if (trace_data->retry) {
           core_->set_stall_reason(wid, WarpStallReason::AsyncTensor);
@@ -1591,9 +1596,12 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       } break;
       case TcuType::MMA_STORE: {
         resolve_mma_descriptor(core_, &tpuArgs);
-        auto tagged_handle = rs1_data.at(thread_start).u32;
-        auto handle = tmem_tagged_handle_base(tagged_handle);
-        tpuArgs.window_id = effective_tmem_window_id(tagged_handle, tpuArgs.window_id);
+        auto handle = rs1_data.at(thread_start).u32;
+        auto control = rs2_data.at(thread_start).u32;
+        tpuArgs.target = tcu_mma_mem_ctl_target(control);
+        tpuArgs.slot_id = tcu_mma_mem_ctl_slot_id(control);
+        tpuArgs.window_id = tcu_mma_mem_ctl_window_id(control);
+        tpuArgs.tile_id = tcu_mma_mem_ctl_tile_id(control);
         tensor_unit_->mma_store(wid, handle, tpuArgs, trace_data.get());
         if (trace_data->retry) {
           core_->set_stall_reason(wid, WarpStallReason::AsyncTensor);

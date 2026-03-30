@@ -30,7 +30,9 @@ typedef struct {
   descriptor_table_arg_t desc_tables;
   uint32_t grid_dim[2];
   uint32_t block_dim[2];
-  uint32_t bank_span;
+  uint32_t a_bank_span;
+  uint32_t b_bank_span;
+  uint32_t c_bank_span;
 } kernel_arg_t;
 
 typedef struct __attribute__((packed)) {
@@ -56,10 +58,13 @@ typedef struct __attribute__((packed)) {
   uint32_t fmt_a;
   uint32_t fmt_b;
   uint32_t fmt_c;
+  uint32_t fmt_d;
   uint8_t ws;
   uint8_t sp;
   uint8_t sparse_mode;
-  uint8_t reserved;
+  uint8_t transpose_a;
+  uint8_t transpose_b;
+  uint8_t reserved[3];
   uint16_t a_rows;
   uint16_t a_cols;
   uint16_t b_rows;

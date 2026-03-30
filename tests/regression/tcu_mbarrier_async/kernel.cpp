@@ -6,7 +6,9 @@ namespace vt = vortex::tensor;
 using ctx = vt::wmma_context_ab<NUM_THREADS, vt::ATYPE, vt::BTYPE, vt::OTYPE>;
 
 static constexpr uint32_t kTmaInDescId = 0;
-static constexpr uint32_t kTmaOutDescId = 1;
+static constexpr uint32_t kTmaBDescId = 1;
+static constexpr uint32_t kTmaCDescId = 2;
+static constexpr uint32_t kTmaOutDescId = 3;
 static constexpr uint32_t kMmaDescId = 0;
 // The waits are fully sequential, so one local mbarrier is sufficient here.
 static constexpr uint32_t kMmaLoadBarrierId = 0;
@@ -28,10 +30,12 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   ctx::fill_fragment(fragB, 0);
   ctx::fill_fragment(fragC, 0);
 
-  uint32_t handle = vt::tmem_alloc(arg->bank_span);
+  uint32_t handle = vt::tmem_alloc(arg->c_bank_span);
 
   vt::mbarrier_init(0, 1);
-  (void)vt::tma_load(handle, kTmaInDescId);
+  (void)vt::tma_load(handle, kTmaInDescId, 0);
+  (void)vt::tma_load(handle, kTmaBDescId, 1);
+  (void)vt::tma_load(handle, kTmaCDescId, 2);
   (void)vt::tc_commit(0);
   vt::tc_fence_before();
   vt::mbarrier_arrive(0);
@@ -39,17 +43,19 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   vt::tc_fence_after();
 
   vt::mbarrier_init(kMmaLoadBarrierId, 1);
-  vt::mma_load<kMmaDescId>(handle);
+  vt::mma_load_a_slot<kMmaDescId>(handle, 0, 0, 0);
+  vt::mma_load_b_slot<kMmaDescId>(handle, 1, 0, 0);
+  vt::mma_load_c_slot<kMmaDescId>(handle, 2, 0, 0);
   wait_tensor_async(kMmaLoadBarrierId);
   vt::mbarrier_init(kWmmaBarrierId, 1);
-  ctx::mma_sync<kMmaDescId>(fragC, fragA, fragB, fragC);
+  ctx::mma_sync_slots<kMmaDescId>(0, 0, 0, fragC, fragA, fragB, fragC);
   wait_tensor_async(kWmmaBarrierId);
   vt::mbarrier_init(kMmaStoreBarrierId, 1);
-  vt::mma_store<kMmaDescId>(handle);
+  vt::mma_store_c_slot<kMmaDescId>(handle, 3, 0, 0);
   wait_tensor_async(kMmaStoreBarrierId);
 
   vt::mbarrier_init(1, 1);
-  (void)vt::tma_store(handle, kTmaOutDescId);
+  (void)vt::tma_store(handle, kTmaOutDescId, 3);
   (void)vt::tc_commit(1);
   vt::tc_fence_before();
   vt::mbarrier_arrive(1);

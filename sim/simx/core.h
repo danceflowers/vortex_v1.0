@@ -217,7 +217,7 @@ public:
   uint32_t tmem_alloc(uint32_t col_span);
   bool tmem_free(uint32_t handle);
   void tmem_rel_permit();
-  uint32_t tma_load(uint32_t wid, uint32_t handle, uint32_t desc_id, bool transpose_b, uint32_t window_id = 0);
+  uint32_t tma_load(uint32_t wid, uint32_t handle, uint32_t desc_id, uint32_t window_id = 0);
   uint32_t tma_store(uint32_t wid, uint32_t handle, uint32_t desc_id, uint32_t window_id = 0);
   uint32_t tmem_shift(uint32_t wid, uint32_t handle, uint32_t window_id = 0, uint32_t refill_desc_id = 0);
   uint32_t mma_load_async_issue(uint32_t wid, uint32_t handle, uint32_t desc_id);
@@ -244,7 +244,7 @@ public:
   bool tmem_query(uint32_t handle, uint32_t* col_span, uint32_t* size_bytes) const;
   bool lookup_tmem_window(uint32_t handle, uint32_t window_id, const TmemWindowPlan** out) const;
   bool tmem_window_epoch(uint32_t handle, uint32_t* epoch) const;
-  bool ensure_tmem_window_bound(uint32_t handle, uint32_t desc_id, TcuTarget target, uint32_t window_id);
+  bool ensure_tmem_window_bound(uint32_t handle, uint32_t desc_id, TcuTarget target, uint32_t window_id, bool store_path = false);
   bool read_mma_descriptor(uint32_t desc_id, MmaDescriptor* out);
   bool read_tma_descriptor(uint32_t desc_id, TmaDescriptor* out);
   bool try_acquire_tmem_read_port(uint32_t handle, uint32_t packet_idx);
@@ -343,13 +343,13 @@ private:
     uint32_t async_id = 0;
     AsyncTensorOpType type = AsyncTensorOpType::TmaLoad;
     uint32_t wid = 0;
+    uint32_t wgid = 0;
     uint32_t handle = 0;
     uint32_t descriptor_id = 0;
     uint32_t window_id = 0;
     uint32_t refill_desc_id = 0;
     uint64_t issue_cycle = 0;
     uint64_t ready_cycle = 0;
-    bool transpose_b = false;
     bool completed = false;
     bool committed = false;
     uint32_t barrier_id = 0;
@@ -403,6 +403,7 @@ private:
   void process_async_tensor_op(AsyncTensorOp& op);
   void finalize_async_tensor_op(AsyncTensorOp& op);
   void resume_async_waiters(uint32_t async_id);
+  WarpMask warpgroup_mask(uint32_t wgid) const;
   void try_resume_fence_waiters();
   bool has_pending_async_ops(uint32_t wid, bool committed_only) const;
   bool has_pending_local_tensor_ops(uint32_t wid) const;

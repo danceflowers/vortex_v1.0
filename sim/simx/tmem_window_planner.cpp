@@ -42,6 +42,32 @@ uint32_t fmt_bytes(uint32_t fmt) {
   }
 }
 
+uint32_t cmem_packet_count(uint32_t fmt) {
+  switch (fmt) {
+  case vortex::tensor::fp8::id:
+    return 4;
+  case vortex::tensor::fp16::id:
+    return 8;
+  case vortex::tensor::fp32::id:
+    return 16;
+  default:
+    return 0;
+  }
+}
+
+uint32_t ab_packet_count(TmemWindowTarget target, uint32_t fmt, uint32_t sparse_mode) {
+  (void)target;
+  (void)sparse_mode;
+  switch (fmt) {
+  case vortex::tensor::fp8::id:
+    return 4;
+  case vortex::tensor::fp16::id:
+    return 8;
+  default:
+    return 0;
+  }
+}
+
 void set_reason(std::string* reason, const std::string& text) {
   if (reason) {
     *reason = text;
@@ -52,14 +78,14 @@ void set_reason(std::string* reason, const std::string& text) {
 
 bool TmemWindowPlanner::append_dense_window(TmemLayoutPlan* plan,
                                             uint32_t* next_window_id,
-                                            uint32_t* next_alloc_col_base,
-                                            uint32_t* next_col_base,
+                                            uint32_t* required_alloc_col_span,
+                                            uint32_t* next_line_base,
                                             TmemWindowTarget target,
                                             const TensorShape2D& shape,
                                             uint32_t fmt,
                                             uint32_t sparse_mode,
                                             std::string* reason) {
-  if (nullptr == plan || nullptr == next_window_id || nullptr == next_alloc_col_base || nullptr == next_col_base) {
+  if (nullptr == plan || nullptr == next_window_id || nullptr == required_alloc_col_span || nullptr == next_line_base) {
     return false;
   }
   if (shape.empty()) {
@@ -70,35 +96,34 @@ bool TmemWindowPlanner::append_dense_window(TmemLayoutPlan* plan,
   if (!build_single_dense_window(target, shape, fmt, sparse_mode, (*next_window_id)++, &window, reason)) {
     return false;
   }
-  window.logical_col_base = *next_col_base;
+  window.logical_col_base = 0;
+  window.logical_line_base = *next_line_base;
   uint32_t packet_base = 0;
   for (const auto& existing : plan->windows) {
     packet_base += existing.tile_count * existing.packets_per_tile;
   }
   window.packet_base = packet_base;
 
-  if (window.logical_line_span > kLogicalLines) {
+  auto next_logical_line = *next_line_base + window.logical_line_span;
+  if (next_logical_line > kLogicalLines) {
     std::ostringstream oss;
     oss << "window " << window.window_id << " exceeds TMEM logical line capacity";
     set_reason(reason, oss.str());
     return false;
   }
 
-  auto next_logical_col = *next_col_base + window.logical_col_span;
-  if (next_logical_col > kLogicalCols) {
+  if (window.logical_col_span > kLogicalCols) {
     std::ostringstream oss;
     oss << "window " << window.window_id << " exceeds TMEM logical column capacity";
     set_reason(reason, oss.str());
     return false;
   }
 
-  auto compat_col_span = align_up(shape.cols, kTileCols);
-  auto next_alloc_col = *next_alloc_col_base + compat_col_span;
-
-  *next_col_base = next_logical_col;
-  *next_alloc_col_base = next_alloc_col;
-  plan->required_col_span = std::max<uint32_t>(plan->required_col_span, next_alloc_col);
-  plan->required_logical_col_span = std::max<uint32_t>(plan->required_logical_col_span, next_logical_col);
+  *next_line_base = next_logical_line;
+  *required_alloc_col_span = std::max<uint32_t>(*required_alloc_col_span, window.logical_col_span);
+  plan->required_col_span = std::max<uint32_t>(plan->required_col_span, *required_alloc_col_span);
+  plan->required_logical_col_span = std::max<uint32_t>(plan->required_logical_col_span, window.logical_col_span);
+  plan->required_logical_line_span = std::max<uint32_t>(plan->required_logical_line_span, next_logical_line);
   plan->windows.push_back(window);
   return true;
 }
@@ -133,18 +158,45 @@ bool TmemWindowPlanner::build_single_dense_window(TmemWindowTarget target,
   window.fmt = fmt;
   window.sparse_mode = sparse_mode;
   window.logical_line_base = 0;
-  window.logical_col_span = align_up(shape.cols * elem_bytes, kMinAllocationCols);
-  window.logical_line_span = shape.rows;
-  window.logical_tile_col_span = kTileCols * elem_bytes;
-  window.logical_tile_line_span = kTileRows;
   window.tile_rows = ceil_div(std::max<uint32_t>(1, shape.rows), kTileRows);
   window.tile_cols = ceil_div(std::max<uint32_t>(1, shape.cols), kTileCols);
   window.tile_count = window.tile_rows * window.tile_cols;
-  window.packet_cols = 8;
-  window.packet_rows = std::max<uint32_t>(1, kPacketBytes / (window.packet_cols * elem_bytes));
-  window.logical_packet_col_span = window.packet_cols * elem_bytes;
-  window.logical_packet_line_span = window.packet_rows;
-  window.packets_per_tile = ceil_div(kTileRows, window.packet_rows) * ceil_div(kTileCols, window.packet_cols);
+  if (target == TmemWindowTarget::A || target == TmemWindowTarget::B
+   || target == TmemWindowTarget::C || target == TmemWindowTarget::D) {
+    auto packets_per_tile = (target == TmemWindowTarget::C || target == TmemWindowTarget::D)
+                          ? cmem_packet_count(fmt)
+                          : ab_packet_count(target, fmt, sparse_mode);
+    if (0 == packets_per_tile) {
+      std::ostringstream oss;
+      oss << "unsupported window format " << fmt
+          << " for target " << static_cast<uint32_t>(target);
+      set_reason(reason, oss.str());
+      return false;
+    }
+    // Explicit A/B/C/D windows store the packet stream already consumed/produced
+    // by the corresponding local memories. Each TMEM logical line is one 64B packet.
+    window.packet_cols = kPacketBytes / elem_bytes;
+    window.packet_rows = 1;
+    window.packets_per_tile = packets_per_tile;
+    window.logical_col_span = kPacketBytes;
+    window.logical_line_span = window.tile_count * window.packets_per_tile;
+    window.logical_tile_col_span = kPacketBytes;
+    window.logical_tile_line_span = window.packets_per_tile;
+    window.logical_packet_col_span = kPacketBytes;
+    window.logical_packet_line_span = 1;
+  } else {
+    window.packet_cols = 8;
+    window.packet_rows = std::max<uint32_t>(1, kPacketBytes / (window.packet_cols * elem_bytes));
+    window.packets_per_tile = ceil_div(kTileRows, window.packet_rows) * ceil_div(kTileCols, window.packet_cols);
+    // Dense A/B windows use a packet-major logical layout:
+    // each math packet is packed row-major into one 64B logical line.
+    window.logical_col_span = kPacketBytes;
+    window.logical_line_span = window.tile_count * window.packets_per_tile;
+    window.logical_tile_col_span = kPacketBytes;
+    window.logical_tile_line_span = window.packets_per_tile;
+    window.logical_packet_col_span = kPacketBytes;
+    window.logical_packet_line_span = 1;
+  }
   *out = window;
   return true;
 }
@@ -158,16 +210,18 @@ bool TmemWindowPlanner::build_dense_plan(const TmemWindowPlannerInput& input,
 
   TmemLayoutPlan plan{};
   uint32_t next_window_id = 0;
-  uint32_t next_alloc_col_base = 0;
-  uint32_t next_col_base = 0;
+  uint32_t required_alloc_col_span = 0;
+  uint32_t next_line_base = 0;
 
-  if (!append_dense_window(&plan, &next_window_id, &next_alloc_col_base, &next_col_base,
+  if (!append_dense_window(&plan, &next_window_id, &required_alloc_col_span, &next_line_base,
                            TmemWindowTarget::A, input.a_shape, input.fmt_a, input.sparse_mode, reason)
-   || !append_dense_window(&plan, &next_window_id, &next_alloc_col_base, &next_col_base,
+   || !append_dense_window(&plan, &next_window_id, &required_alloc_col_span, &next_line_base,
                            TmemWindowTarget::B, input.b_shape, input.fmt_b, input.sparse_mode, reason)
-   || !append_dense_window(&plan, &next_window_id, &next_alloc_col_base, &next_col_base,
+   || !append_dense_window(&plan, &next_window_id, &required_alloc_col_span, &next_line_base,
                            TmemWindowTarget::C, input.c_shape, input.fmt_c, input.sparse_mode, reason)
-   || !append_dense_window(&plan, &next_window_id, &next_alloc_col_base, &next_col_base,
+   || !append_dense_window(&plan, &next_window_id, &required_alloc_col_span, &next_line_base,
+                           TmemWindowTarget::D, input.d_shape, input.fmt_d, input.sparse_mode, reason)
+   || !append_dense_window(&plan, &next_window_id, &required_alloc_col_span, &next_line_base,
                            TmemWindowTarget::Meta, input.meta_shape, vortex::tensor::uint8::id, input.sparse_mode, reason)) {
     return false;
   }
@@ -186,6 +240,10 @@ bool TmemWindowPlanner::build_dense_plan(const TmemWindowPlannerInput& input,
   }
   if (plan.required_logical_col_span > kLogicalCols) {
     set_reason(reason, "planned logical TMEM window footprint exceeds TMEM logical column capacity");
+    return false;
+  }
+  if (plan.required_logical_line_span > kLogicalLines) {
+    set_reason(reason, "planned logical TMEM window footprint exceeds TMEM logical line capacity");
     return false;
   }
 
