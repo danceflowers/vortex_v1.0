@@ -8,6 +8,8 @@
 #include "tensor_cfg.h"
 #include "fp_types.h"
 
+// BMem models the TensorCore B operand SRAM. Each slot owns four logical lines,
+// and each line stores one 8x8 primitive block after fp8/fp16 -> fp9 conversion.
 class BMem {
 public:
   using packet_t = std::array<uint8_t, 64>;
@@ -52,31 +54,33 @@ public:
     return (fmt_ab == vortex::tensor::fp16::id) ? 8 : 4;
   }
 
-  static uint32_t fill_beats(uint32_t sparse_mode = vortex::tensor::sparse_none) {
+  static uint32_t fill_lines(uint32_t sparse_mode = vortex::tensor::sparse_none) {
     if (sparse_mode != vortex::tensor::sparse_none) {
       return kRowsPerSlot;
     }
     return kRowsPerSlot;
   }
 
-  static uint32_t packets_per_fill_beat(uint32_t fmt_ab, uint32_t sparse_mode = vortex::tensor::sparse_none) {
+  static uint32_t packets_per_fill_line(uint32_t fmt_ab, uint32_t sparse_mode = vortex::tensor::sparse_none) {
     if (sparse_mode != vortex::tensor::sparse_none) {
       return (fmt_ab == vortex::tensor::fp16::id) ? 2 : 1;
     }
     return (fmt_ab == vortex::tensor::fp16::id) ? 2 : 1;
   }
 
-  bool write_fill_beat(uint32_t slot_id,
+  // One local write action fills one BMem line. fp16 consumes two 64B packets;
+  // fp8 consumes one 64B packet.
+  bool write_fill_line(uint32_t slot_id,
                        uint32_t fmt_ab,
-                       uint32_t beat_idx,
+                       uint32_t line_idx,
                        const std::vector<packet_t>& packets,
                        uint32_t sparse_mode = vortex::tensor::sparse_none) {
-    auto needed = packets_per_fill_beat(fmt_ab, sparse_mode);
-    if (beat_idx >= kRowsPerSlot || packets.size() < needed) {
+    auto needed = packets_per_fill_line(fmt_ab, sparse_mode);
+    if (line_idx >= kRowsPerSlot || packets.size() < needed) {
       return false;
     }
 
-    auto& dst = lines_.at(slot_base(slot_id) + beat_idx);
+    auto& dst = lines_.at(slot_base(slot_id) + line_idx);
     for (auto& bank : dst) {
       bank.fill(0);
     }
@@ -100,7 +104,7 @@ public:
         store_elem(dst, elem, convert_to_fp9(p.at(elem), PREC_FP8_E4M3));
       }
     }
-    row_valid_.at(slot_base(slot_id) + beat_idx) = true;
+    row_valid_.at(slot_base(slot_id) + line_idx) = true;
     return true;
   }
 
@@ -114,13 +118,13 @@ public:
     }
 
     clear_slot(slot_id);
-    auto packets_per_beat = packets_per_fill_beat(fmt_ab, sparse_mode);
-    for (uint32_t beat = 0; beat < kRowsPerSlot; ++beat) {
-      std::vector<packet_t> beat_packets;
-      for (uint32_t packet = 0; packet < packets_per_beat; ++packet) {
-        beat_packets.push_back(packets.at(beat * packets_per_beat + packet));
+    auto packets_per_line = packets_per_fill_line(fmt_ab, sparse_mode);
+    for (uint32_t line = 0; line < kRowsPerSlot; ++line) {
+      std::vector<packet_t> line_packets;
+      for (uint32_t packet = 0; packet < packets_per_line; ++packet) {
+        line_packets.push_back(packets.at(line * packets_per_line + packet));
       }
-      if (!write_fill_beat(slot_id, fmt_ab, beat, beat_packets, sparse_mode)) {
+      if (!write_fill_line(slot_id, fmt_ab, line, line_packets, sparse_mode)) {
         return false;
       }
     }

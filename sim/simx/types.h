@@ -710,6 +710,11 @@ enum class TcuType {
 };
 
 static constexpr uint32_t kInvalidTcuDescriptorId = 0xffffffffu;
+// TCU control-word packing used by the macro tensor memory path.
+//
+// TMEM/TMA-style operations use a control word that carries window selection,
+// descriptor id and per-op flags. MMA_LOAD/MMA_STORE use a separate control
+// word that carries target, logical slot, window and tile selection.
 static constexpr uint32_t kTcuTmemOpCtlWindowBits = 8;
 static constexpr uint32_t kTcuTmemOpCtlDescBits = 16;
 static constexpr uint32_t kTcuTmemOpCtlFlagsBits = 8;
@@ -731,42 +736,42 @@ static constexpr uint32_t kTcuMmaMemCtlWindowShift = kTcuMmaMemCtlTargetShift + 
 static constexpr uint32_t kTcuMmaMemCtlTileShift = kTcuMmaMemCtlWindowShift + kTcuMmaMemCtlWindowBits;
 static constexpr uint32_t kTcuMmaMemCtlSlotShift = kTcuMmaMemCtlTileShift + kTcuMmaMemCtlTileBits;
 
-inline uint32_t tcu_mma_mem_ctl_mask(uint32_t bits) {
+inline uint32_t tcu_control_field_mask(uint32_t bits) {
   return (bits >= 32) ? 0xffffffffu : ((1u << bits) - 1);
 }
 
 inline uint32_t tcu_tmem_op_make_control(uint32_t window_id,
                                          uint32_t desc_id = 0,
                                          uint32_t flags = 0) {
-  return ((window_id & tcu_mma_mem_ctl_mask(kTcuTmemOpCtlWindowBits)) << kTcuTmemOpCtlWindowShift)
-       | ((desc_id & tcu_mma_mem_ctl_mask(kTcuTmemOpCtlDescBits)) << kTcuTmemOpCtlDescShift)
-       | ((flags & tcu_mma_mem_ctl_mask(kTcuTmemOpCtlFlagsBits)) << kTcuTmemOpCtlFlagsShift);
+  return ((window_id & tcu_control_field_mask(kTcuTmemOpCtlWindowBits)) << kTcuTmemOpCtlWindowShift)
+       | ((desc_id & tcu_control_field_mask(kTcuTmemOpCtlDescBits)) << kTcuTmemOpCtlDescShift)
+       | ((flags & tcu_control_field_mask(kTcuTmemOpCtlFlagsBits)) << kTcuTmemOpCtlFlagsShift);
 }
 
 inline uint32_t tcu_tmem_op_ctl_window_id(uint32_t control) {
-  return (control >> kTcuTmemOpCtlWindowShift) & tcu_mma_mem_ctl_mask(kTcuTmemOpCtlWindowBits);
+  return (control >> kTcuTmemOpCtlWindowShift) & tcu_control_field_mask(kTcuTmemOpCtlWindowBits);
 }
 
 inline uint32_t tcu_tmem_op_ctl_desc_id(uint32_t control) {
-  return (control >> kTcuTmemOpCtlDescShift) & tcu_mma_mem_ctl_mask(kTcuTmemOpCtlDescBits);
+  return (control >> kTcuTmemOpCtlDescShift) & tcu_control_field_mask(kTcuTmemOpCtlDescBits);
 }
 
 inline uint32_t tcu_tmem_op_ctl_flags(uint32_t control) {
-  return (control >> kTcuTmemOpCtlFlagsShift) & tcu_mma_mem_ctl_mask(kTcuTmemOpCtlFlagsBits);
+  return (control >> kTcuTmemOpCtlFlagsShift) & tcu_control_field_mask(kTcuTmemOpCtlFlagsBits);
 }
 
 inline uint32_t tcu_mma_mem_make_control(TcuTarget target,
                                          uint32_t slot_id,
                                          uint32_t window_id,
                                          uint32_t tile_id) {
-  return ((static_cast<uint32_t>(target) & tcu_mma_mem_ctl_mask(kTcuMmaMemCtlTargetBits)) << kTcuMmaMemCtlTargetShift)
-       | ((window_id & tcu_mma_mem_ctl_mask(kTcuMmaMemCtlWindowBits)) << kTcuMmaMemCtlWindowShift)
-       | ((tile_id & tcu_mma_mem_ctl_mask(kTcuMmaMemCtlTileBits)) << kTcuMmaMemCtlTileShift)
-       | ((slot_id & tcu_mma_mem_ctl_mask(kTcuMmaMemCtlSlotBits)) << kTcuMmaMemCtlSlotShift);
+  return ((static_cast<uint32_t>(target) & tcu_control_field_mask(kTcuMmaMemCtlTargetBits)) << kTcuMmaMemCtlTargetShift)
+       | ((window_id & tcu_control_field_mask(kTcuMmaMemCtlWindowBits)) << kTcuMmaMemCtlWindowShift)
+       | ((tile_id & tcu_control_field_mask(kTcuMmaMemCtlTileBits)) << kTcuMmaMemCtlTileShift)
+       | ((slot_id & tcu_control_field_mask(kTcuMmaMemCtlSlotBits)) << kTcuMmaMemCtlSlotShift);
 }
 
 inline TcuTarget tcu_mma_mem_ctl_target(uint32_t control) {
-  auto raw = (control >> kTcuMmaMemCtlTargetShift) & tcu_mma_mem_ctl_mask(kTcuMmaMemCtlTargetBits);
+  auto raw = (control >> kTcuMmaMemCtlTargetShift) & tcu_control_field_mask(kTcuMmaMemCtlTargetBits);
   switch (raw) {
   case 0: return TcuTarget::None;
   case 1: return TcuTarget::A;
@@ -778,30 +783,35 @@ inline TcuTarget tcu_mma_mem_ctl_target(uint32_t control) {
 }
 
 inline uint32_t tcu_mma_mem_ctl_window_id(uint32_t control) {
-  return (control >> kTcuMmaMemCtlWindowShift) & tcu_mma_mem_ctl_mask(kTcuMmaMemCtlWindowBits);
+  return (control >> kTcuMmaMemCtlWindowShift) & tcu_control_field_mask(kTcuMmaMemCtlWindowBits);
 }
 
 inline uint32_t tcu_mma_mem_ctl_tile_id(uint32_t control) {
-  return (control >> kTcuMmaMemCtlTileShift) & tcu_mma_mem_ctl_mask(kTcuMmaMemCtlTileBits);
+  return (control >> kTcuMmaMemCtlTileShift) & tcu_control_field_mask(kTcuMmaMemCtlTileBits);
 }
 
 inline uint32_t tcu_mma_mem_ctl_slot_id(uint32_t control) {
-  return (control >> kTcuMmaMemCtlSlotShift) & tcu_mma_mem_ctl_mask(kTcuMmaMemCtlSlotBits);
+  return (control >> kTcuMmaMemCtlSlotShift) & tcu_control_field_mask(kTcuMmaMemCtlSlotBits);
 }
 
 inline uint32_t tcu_wmma_make_slot_control(uint32_t a_slot_id, uint32_t b_slot_id) {
-  return ((a_slot_id & tcu_mma_mem_ctl_mask(kTcuWmmaSlotCtlSlotBits)) << kTcuWmmaSlotCtlAShift)
-       | ((b_slot_id & tcu_mma_mem_ctl_mask(kTcuWmmaSlotCtlSlotBits)) << kTcuWmmaSlotCtlBShift);
+  return ((a_slot_id & tcu_control_field_mask(kTcuWmmaSlotCtlSlotBits)) << kTcuWmmaSlotCtlAShift)
+       | ((b_slot_id & tcu_control_field_mask(kTcuWmmaSlotCtlSlotBits)) << kTcuWmmaSlotCtlBShift);
 }
 
 inline uint32_t tcu_wmma_ctl_a_slot_id(uint32_t control) {
-  return (control >> kTcuWmmaSlotCtlAShift) & tcu_mma_mem_ctl_mask(kTcuWmmaSlotCtlSlotBits);
+  return (control >> kTcuWmmaSlotCtlAShift) & tcu_control_field_mask(kTcuWmmaSlotCtlSlotBits);
 }
 
 inline uint32_t tcu_wmma_ctl_b_slot_id(uint32_t control) {
-  return (control >> kTcuWmmaSlotCtlBShift) & tcu_mma_mem_ctl_mask(kTcuWmmaSlotCtlSlotBits);
+  return (control >> kTcuWmmaSlotCtlBShift) & tcu_control_field_mask(kTcuWmmaSlotCtlSlotBits);
 }
 
+// Canonical decoded/executed tensor instruction arguments.
+//
+// Decode fills the architectural intent (descriptor id, fence mode, macro-op
+// selection). Execute later resolves runtime control words into window/tile/
+// slot selection and fills in the effective operand formats from descriptors.
 struct IntrTcuArgs {
   uint32_t fmt_ab = 0;
   uint32_t fmt_a = 0;
@@ -811,6 +821,8 @@ struct IntrTcuArgs {
   uint32_t step_m = 0;
   uint32_t step_n = 0;
   uint32_t step_k = 0;
+  // Legacy field name kept while old call sites are retired. In the current
+  // TMEM model this denotes logical column span rather than physical banks.
   uint32_t bank_span = 0;
   uint32_t meta_col_span = 0;
   uint32_t packet_count = 0;

@@ -778,7 +778,7 @@ bool Tmem::shift_window_math_row_down(uint32_t handle,
   }
 
   auto elem_bytes = fmt_bytes(window->fmt);
-  if (0 == elem_bytes || window->elem_shape.empty() || window->packet_cols == 0 || window->packet_rows == 0) {
+  if (0 == elem_bytes || window->elem_shape.empty() || !TmemWindowPlanner::uses_math_packet_adapter(*window)) {
     if (!shift_window_down(handle, window_id)) {
       return false;
     }
@@ -798,31 +798,15 @@ bool Tmem::shift_window_math_row_down(uint32_t handle,
   auto cols = std::max<uint32_t>(1, window->elem_shape.cols);
   auto row_bytes = cols * elem_bytes;
   std::vector<uint8_t> math_bytes(rows * row_bytes, 0);
-
-  auto packet_cols_per_tile = ceil_div(TmemWindowPlanner::kTileCols, window->packet_cols);
   for (uint32_t tile_idx = 0; tile_idx < window->tile_count; ++tile_idx) {
-    auto tile_row = tile_idx / std::max<uint32_t>(1, window->tile_cols);
-    auto tile_col = tile_idx % std::max<uint32_t>(1, window->tile_cols);
     for (uint32_t local_packet_idx = 0; local_packet_idx < window->packets_per_tile; ++local_packet_idx) {
-      auto packet_row_group = local_packet_idx / packet_cols_per_tile;
-      auto packet_col_group = local_packet_idx % packet_cols_per_tile;
       auto packet_idx = tile_idx * window->packets_per_tile + local_packet_idx;
       TmemPacket packet;
       if (!read_window_packet(handle, window_id, packet_idx, &packet)) {
         return false;
       }
-      uint32_t offset = 0;
-      for (uint32_t pr = 0; pr < window->packet_rows; ++pr) {
-        auto math_row = tile_row * TmemWindowPlanner::kTileRows + packet_row_group * window->packet_rows + pr;
-        for (uint32_t pc = 0; pc < window->packet_cols; ++pc) {
-          auto math_col = tile_col * TmemWindowPlanner::kTileCols + packet_col_group * window->packet_cols + pc;
-          for (uint32_t b = 0; b < elem_bytes; ++b) {
-            if (math_row < rows && math_col < cols) {
-              math_bytes.at(math_row * row_bytes + math_col * elem_bytes + b) = packet.bytes.at(offset);
-            }
-            ++offset;
-          }
-        }
+      if (!TmemWindowPlanner::unpack_math_packet(*window, packet_idx, packet.bytes, &math_bytes)) {
+        return false;
       }
     }
   }
@@ -836,25 +820,11 @@ bool Tmem::shift_window_math_row_down(uint32_t handle,
   }
 
   for (uint32_t tile_idx = 0; tile_idx < window->tile_count; ++tile_idx) {
-    auto tile_row = tile_idx / std::max<uint32_t>(1, window->tile_cols);
-    auto tile_col = tile_idx % std::max<uint32_t>(1, window->tile_cols);
     for (uint32_t local_packet_idx = 0; local_packet_idx < window->packets_per_tile; ++local_packet_idx) {
-      auto packet_row_group = local_packet_idx / packet_cols_per_tile;
-      auto packet_col_group = local_packet_idx % packet_cols_per_tile;
       auto packet_idx = tile_idx * window->packets_per_tile + local_packet_idx;
       TmemPacket packet;
-      uint32_t offset = 0;
-      for (uint32_t pr = 0; pr < window->packet_rows; ++pr) {
-        auto math_row = tile_row * TmemWindowPlanner::kTileRows + packet_row_group * window->packet_rows + pr;
-        for (uint32_t pc = 0; pc < window->packet_cols; ++pc) {
-          auto math_col = tile_col * TmemWindowPlanner::kTileCols + packet_col_group * window->packet_cols + pc;
-          for (uint32_t b = 0; b < elem_bytes; ++b) {
-            if (math_row < rows && math_col < cols) {
-              packet.bytes.at(offset) = math_bytes.at(math_row * row_bytes + math_col * elem_bytes + b);
-            }
-            ++offset;
-          }
-        }
+      if (!TmemWindowPlanner::pack_math_packet(*window, math_bytes, packet_idx, &packet.bytes)) {
+        return false;
       }
       if (!write_window_packet(handle, window_id, packet_idx, packet)) {
         return false;

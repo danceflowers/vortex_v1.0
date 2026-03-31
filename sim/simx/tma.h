@@ -20,6 +20,10 @@
 
 namespace vortex {
 
+// Software-visible TMA transfer descriptor.
+//
+// The descriptor describes one external-memory matrix window and the logical
+// TMEM destination/source footprint used by the Core-side TMA engine.
 struct TmaDescriptor {
   uint64_t addr = 0;
   uint32_t size_bytes = 0;
@@ -32,6 +36,8 @@ struct TmaDescriptor {
   uint32_t meta_size_bytes = 0;
   uint16_t tmem_base = 0;
   uint16_t meta_tmem_base = 0;
+  // Legacy field name retained for ABI compatibility. In the current model it
+  // denotes the allocation span in logical TMEM columns, not physical banks.
   uint16_t bank_span = 0;
   uint16_t meta_col_span = 0;
   uint8_t tile_role = static_cast<uint8_t>(TcuTarget::None);
@@ -39,6 +45,11 @@ struct TmaDescriptor {
   uint8_t reserved[2] = {};
 } __attribute__((packed));
 
+// Software-visible MMA descriptor.
+//
+// Shapes are expressed in mathematical matrix elements. The window planner and
+// TensorUnit later translate these dimensions into TMEM windows, tiles and
+// packets according to operand format and layout policy.
 struct MmaDescriptor {
   uint32_t fmt_a = 0;
   uint32_t fmt_b = 0;
@@ -58,6 +69,11 @@ struct MmaDescriptor {
   uint16_t c_cols = 0;
 } __attribute__((packed));
 
+// Front-end TMA timing/descriptor helper.
+//
+// This object models descriptor fetch, launch latency estimation and payload /
+// metadata marshaling. Per-cycle packet progression happens later in
+// Core::advance_async_tensor_engine once an AsyncTensorOp has been issued.
 class TmaModel {
 public:
   using ReadCallback = std::function<void(void*, uint64_t, uint32_t)>;

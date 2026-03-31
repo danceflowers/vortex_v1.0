@@ -40,6 +40,11 @@ enum class TmemHandleBlockReason : uint8_t {
   MetaNotReady,
 };
 
+// One software-visible TMEM allocation handle.
+//
+// The allocation reserves a slab of logical TMEM columns, tracks readiness for
+// payload/meta traffic, and owns the planned windows that map mathematical
+// matrices onto the TMEM logical view.
 struct TmemAllocation {
   bool valid = false;
   uint32_t payload_col_base = 0;
@@ -54,6 +59,10 @@ struct TmemAllocation {
   bool meta_ready = true;
 };
 
+// TMEM models the tensor scratchpad between mathematical matrix windows and
+// the physical banked SRAM array. Clients interact with allocations, windows,
+// packets and logical lines; TMEM resolves those accesses onto banks, rows and
+// per-cycle read/write arbitration.
 class Tmem {
 public:
   static constexpr uint32_t kPacketBytes = 64;

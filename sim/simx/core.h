@@ -339,6 +339,9 @@ private:
     Wmma,
   };
 
+  // AsyncTensorOp models one Core-side asynchronous tensor transaction.
+  // TMA load/store and TMEM shift are advanced here cycle by cycle before the
+  // TensorUnit consumes the resulting TMEM-visible state.
   struct AsyncTensorOp {
     uint32_t async_id = 0;
     AsyncTensorOpType type = AsyncTensorOpType::TmaLoad;
@@ -349,16 +352,16 @@ private:
     uint32_t window_id = 0;
     uint32_t refill_desc_id = 0;
     uint64_t issue_cycle = 0;
-    uint64_t ready_cycle = 0;
+    uint64_t first_service_cycle = 0;
     bool completed = false;
     bool committed = false;
     uint32_t barrier_id = 0;
-    bool txn_initialized = false;
-    uint32_t remaining_base_cycles = 0;
+    bool transaction_initialized = false;
+    uint32_t remaining_launch_cycles = 0;
     uint32_t remaining_tmem_read_packets = 0;
     uint32_t remaining_tmem_write_packets = 0;
-    uint32_t payload_packet_cursor = 0;
-    uint32_t meta_packet_cursor = 0;
+    uint32_t next_payload_packet_idx = 0;
+    uint32_t next_meta_packet_idx = 0;
     uint32_t payload_size_bytes = 0;
     uint32_t meta_size_bytes = 0;
     uint32_t refill_size_bytes = 0;
@@ -367,12 +370,12 @@ private:
     uint32_t meta_col_base = 0;
     uint32_t meta_col_span = 0;
     bool use_meta_region = false;
-    bool shift_window_applied = false;
+    bool shift_body_applied = false;
     TmaDescriptor tma_desc = {};
     std::vector<uint8_t> payload_buffer;
     std::vector<uint8_t> meta_buffer;
     uint32_t remaining_refill_write_packets = 0;
-    uint32_t refill_packet_cursor = 0;
+    uint32_t next_refill_packet_idx = 0;
   };
 
   struct MBarrierEntry {
@@ -399,8 +402,8 @@ private:
   std::vector<FenceWaitState> fence_wait_states_;
   uint32_t next_async_id_;
 
-  void advance_async_tensor_ops();
-  void process_async_tensor_op(AsyncTensorOp& op);
+  void advance_async_tensor_engine();
+  void advance_async_tensor_transaction(AsyncTensorOp& op);
   void finalize_async_tensor_op(AsyncTensorOp& op);
   void resume_async_waiters(uint32_t async_id);
   WarpMask warpgroup_mask(uint32_t wgid) const;
@@ -411,7 +414,7 @@ private:
   void mark_mbarrier_phase_active(uint32_t barrier_id);
   void reset_tmem_port_budgets();
   void ensure_tmem_port_budgets();
-  void init_async_tensor_op_progress(AsyncTensorOp& op);
+  void initialize_async_tensor_transaction(AsyncTensorOp& op);
   bool tmem_region_query(uint32_t col_base, uint32_t col_span, uint32_t* size_bytes) const;
   bool tmem_region_copy_in(uint32_t col_base, uint32_t col_span, const uint8_t* data, uint32_t size_bytes);
   bool tmem_region_copy_out(uint32_t col_base, uint32_t col_span, uint8_t* data, uint32_t size_bytes) const;

@@ -39,6 +39,8 @@ namespace {
 
 using InstrAllocator = PoolAllocator<Instr, 64>;
 
+// Create one pipeline-visible TCU instruction shell. Runtime register values
+// such as handles and control words are resolved later during execute.
 std::shared_ptr<Instr> make_tcu_instr(InstrAllocator& instr_pool,
                                       uint64_t uuid,
                                       TcuType op_type,
@@ -1103,7 +1105,7 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
       ibuffer.push_back(instr);
     } break;
   #ifdef EXT_TCU_ENABLE
-    case 2: {
+    case 2: { // TMEM allocation / TMA launch / TMA wait control group
       switch (funct3) {
       case 0: { // Legacy synchronous WMMA path removed.
         std::abort();
@@ -1142,7 +1144,7 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
         std::abort();
       }
     } break;
-    case 4: {
+    case 4: { // Tensor memory / tensor compute macro-op group
       switch (funct3) {
       case 0: { // WMMA using preloaded desc_id
         IntrTcuArgs args{};
@@ -1179,7 +1181,7 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
         std::abort();
       }
     } break;
-    case 3: {
+    case 3: { // Tensor synchronization / shift / barrier control group
       switch (funct3) {
       case 0: { // TMEM_REL_PERMIT
         auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TMEM_REL_PERMIT);

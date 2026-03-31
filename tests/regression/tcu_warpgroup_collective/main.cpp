@@ -119,9 +119,9 @@ int main() {
   host_utils::build_open_tensorcore_ref(ref_tile, a_tile, b_tile, c_tile);
 
   std::vector<uint8_t> h_composite(kCompositeBytes, 0);
-  host_utils::pack_ab_tile(h_composite, 0, a_tile, false);
-  host_utils::pack_ab_tile(h_composite, kABytes, b_tile, true);
-  host_utils::pack_c_tile(h_composite, kABytes + kBBytes, c_tile);
+  std::memcpy(h_composite.data(), a_tile, kABytes);
+  std::memcpy(h_composite.data() + kABytes, b_tile, kBBytes);
+  std::memcpy(h_composite.data() + kABytes + kBBytes, c_tile, kCBytes);
 
   tma_descriptor_t tma_descs[4] = {};
   mma_descriptor_t mma_descs[1] = {};
@@ -209,7 +209,7 @@ int main() {
   RT_CHECK(vx_copy_from_dev(h_output_bytes.data(), output_buffer, 0, h_output_bytes.size()));
 
   std::vector<output_t> h_output(kTileDim * kTileDim, host_utils::encode_output(0.0f));
-  host_utils::scatter_c_tile(h_output, h_output_bytes.data(), 0, 0);
+  std::memcpy(h_output.data(), h_output_bytes.data(), kCBytes);
 
   std::vector<float> h_output_float;
   host_utils::convert_output_matrix_to_float(h_output_float, h_output);

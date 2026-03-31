@@ -12,6 +12,9 @@
 #include "fp22_to_fp16.h"
 #include "fp_types.h"
 
+// CMem models the TensorCore accumulator SRAM. Each slot owns four 8x8
+// subtiles stored in fp22. Load/store paths operate in subtile granularity,
+// while packet counts depend on the exposed C/D precision.
 class CMem {
 public:
   using packet_t = std::array<uint8_t, 64>;
@@ -62,64 +65,65 @@ public:
     }
   }
 
-  static constexpr uint32_t fill_beats(uint32_t) {
+  static constexpr uint32_t fill_subtiles(uint32_t) {
     return kRowsPerSlot;
   }
 
-  static constexpr uint32_t dump_beats(uint32_t) {
+  static constexpr uint32_t dump_subtiles(uint32_t) {
     return kRowsPerSlot;
   }
 
-  static uint32_t packets_per_fill_group(uint32_t fmt_c) {
+  static uint32_t packets_per_subtile(uint32_t fmt_c) {
     switch (fmt_c) {
     case vortex::tensor::fp8::id:
-      return 2;
+      return 1;
     case vortex::tensor::fp16::id:
-      return 4;
+      return 2;
     case vortex::tensor::fp32::id:
-      return 8;
+      return 4;
     default:
       return 0;
     }
   }
 
-  bool write_fill_beat(uint32_t slot_id,
-                       uint32_t fmt_c,
-                       uint32_t beat_idx,
+  // One local write action fills one 8x8 C subtile.
+  bool write_fill_subtile(uint32_t slot_id,
+                          uint32_t fmt_c,
+                          uint32_t subtile_idx,
                        const std::vector<packet_t>& packets) {
-    auto needed = packets_per_fill_group(fmt_c);
-    if (beat_idx >= kRowsPerSlot || packets.size() < needed) {
+    auto needed = packets_per_subtile(fmt_c);
+    if (subtile_idx >= kRowsPerSlot || packets.size() < needed) {
       return false;
     }
 
-    auto row_idx = slot_base(slot_id) + beat_idx;
+    auto row_idx = slot_base(slot_id) + subtile_idx;
     auto& row = rows_.at(row_idx);
     for (auto& bank : row) {
       bank.fill(0);
     }
 
-    auto storage_n = beat_idx % 2;
     if (fmt_c == vortex::tensor::fp32::id) {
-      for (uint32_t row_in_subtile = 0; row_in_subtile < kPrimitiveDim; ++row_in_subtile) {
-        const auto& p = packets.at(row_in_subtile);
-        for (uint32_t col_in_subtile = 0; col_in_subtile < kPrimitiveDim; ++col_in_subtile) {
-          auto col = storage_n * kPrimitiveDim + col_in_subtile;
-          auto off = col * 4;
-          uint32_t bits = static_cast<uint32_t>(p.at(off + 0))
-                        | (static_cast<uint32_t>(p.at(off + 1)) << 8)
-                        | (static_cast<uint32_t>(p.at(off + 2)) << 16)
-                        | (static_cast<uint32_t>(p.at(off + 3)) << 24);
-          store_elem(row, row_in_subtile * kPrimitiveDim + col_in_subtile, convert_c_to_fp22(bits, PREC_FP32));
+      for (uint32_t packet_idx = 0; packet_idx < packets.size(); ++packet_idx) {
+        const auto& p = packets.at(packet_idx);
+        for (uint32_t row_pair = 0; row_pair < 2; ++row_pair) {
+          auto row_in_subtile = packet_idx * 2 + row_pair;
+          for (uint32_t col_in_subtile = 0; col_in_subtile < kPrimitiveDim; ++col_in_subtile) {
+            auto off = (row_pair * kPrimitiveDim + col_in_subtile) * 4;
+            uint32_t bits = static_cast<uint32_t>(p.at(off + 0))
+                          | (static_cast<uint32_t>(p.at(off + 1)) << 8)
+                          | (static_cast<uint32_t>(p.at(off + 2)) << 16)
+                          | (static_cast<uint32_t>(p.at(off + 3)) << 24);
+            store_elem(row, row_in_subtile * kPrimitiveDim + col_in_subtile, convert_c_to_fp22(bits, PREC_FP32));
+          }
         }
       }
     } else if (fmt_c == vortex::tensor::fp16::id) {
       for (uint32_t packet_idx = 0; packet_idx < packets.size(); ++packet_idx) {
         const auto& p = packets.at(packet_idx);
-        for (uint32_t row_pair = 0; row_pair < 2; ++row_pair) {
+        for (uint32_t row_pair = 0; row_pair < 4; ++row_pair) {
+          auto row_in_subtile = packet_idx * 4 + row_pair;
           for (uint32_t col_in_subtile = 0; col_in_subtile < kPrimitiveDim; ++col_in_subtile) {
-            auto row_in_subtile = packet_idx * 2 + row_pair;
-            auto col = storage_n * kPrimitiveDim + col_in_subtile;
-            auto off = (row_pair * kDim + col) * 2;
+            auto off = (row_pair * kPrimitiveDim + col_in_subtile) * 2;
             uint16_t bits = static_cast<uint16_t>(p.at(off + 0) | (p.at(off + 1) << 8));
             store_elem(row,
                        row_in_subtile * kPrimitiveDim + col_in_subtile,
@@ -128,17 +132,13 @@ public:
         }
       }
     } else if (fmt_c == vortex::tensor::fp8::id) {
-      for (uint32_t packet_idx = 0; packet_idx < packets.size(); ++packet_idx) {
-        const auto& p = packets.at(packet_idx);
-        for (uint32_t row_quad = 0; row_quad < 4; ++row_quad) {
-          auto row_in_subtile = packet_idx * 4 + row_quad;
-          for (uint32_t col_in_subtile = 0; col_in_subtile < kPrimitiveDim; ++col_in_subtile) {
-            auto src_col = storage_n * kPrimitiveDim + col_in_subtile;
-            auto off = row_quad * kDim + src_col;
-            store_elem(row,
-                       row_in_subtile * kPrimitiveDim + col_in_subtile,
-                       convert_c_to_fp22(p.at(off), PREC_FP8_E4M3));
-          }
+      const auto& p = packets.front();
+      for (uint32_t row_in_subtile = 0; row_in_subtile < kPrimitiveDim; ++row_in_subtile) {
+        for (uint32_t col_in_subtile = 0; col_in_subtile < kPrimitiveDim; ++col_in_subtile) {
+          auto off = row_in_subtile * kPrimitiveDim + col_in_subtile;
+          store_elem(row,
+                     row_in_subtile * kPrimitiveDim + col_in_subtile,
+                     convert_c_to_fp22(p.at(off), PREC_FP8_E4M3));
         }
       }
     } else {
@@ -156,14 +156,14 @@ public:
     }
 
     clear_slot(slot_id);
-    auto packets_per_group = packets_per_fill_group(fmt_c);
-    for (uint32_t beat = 0; beat < kRowsPerSlot; ++beat) {
-      std::vector<packet_t> beat_packets;
-      auto group_base = (beat / 2) * packets_per_group;
-      for (uint32_t packet = 0; packet < packets_per_group; ++packet) {
-        beat_packets.push_back(packets.at(group_base + packet));
+    auto packets_per_subtile_group = packets_per_subtile(fmt_c);
+    for (uint32_t subtile = 0; subtile < kRowsPerSlot; ++subtile) {
+      std::vector<packet_t> subtile_packets;
+      auto group_base = subtile * packets_per_subtile_group;
+      for (uint32_t packet = 0; packet < packets_per_subtile_group; ++packet) {
+        subtile_packets.push_back(packets.at(group_base + packet));
       }
-      if (!write_fill_beat(slot_id, fmt_c, beat, beat_packets)) {
+      if (!write_fill_subtile(slot_id, fmt_c, subtile, subtile_packets)) {
         return false;
       }
     }
@@ -174,48 +174,79 @@ public:
     return fill_tile(0, fmt_c, packets);
   }
 
+  bool dump_subtile_packets(uint32_t slot_id,
+                            uint32_t fmt_c,
+                            uint32_t subtile_id,
+                            std::vector<packet_t>* packets) const {
+    if (nullptr == packets || subtile_id >= kRowsPerSlot || !valid(slot_id)) {
+      return false;
+    }
+
+    auto packets_per_group = packets_per_subtile(fmt_c);
+    packets->assign(packets_per_group, packet_t{});
+    if (fmt_c == vortex::tensor::fp32::id) {
+      for (uint32_t packet_idx = 0; packet_idx < packets_per_group; ++packet_idx) {
+        auto& p = packets->at(packet_idx);
+        for (uint32_t row_pair = 0; row_pair < 2; ++row_pair) {
+          auto row = packet_idx * 2 + row_pair;
+          for (uint32_t col = 0; col < kPrimitiveDim; ++col) {
+            auto bits = fp22_to_fp32(load_subtile_elem(slot_id, subtile_id, row, col));
+            auto off = (row_pair * kPrimitiveDim + col) * 4;
+            p.at(off + 0) = bits & 0xff;
+            p.at(off + 1) = (bits >> 8) & 0xff;
+            p.at(off + 2) = (bits >> 16) & 0xff;
+            p.at(off + 3) = (bits >> 24) & 0xff;
+          }
+        }
+      }
+      return true;
+    }
+
+    if (fmt_c == vortex::tensor::fp16::id) {
+      for (uint32_t packet_idx = 0; packet_idx < packets_per_group; ++packet_idx) {
+        auto& p = packets->at(packet_idx);
+        for (uint32_t row_quad = 0; row_quad < 4; ++row_quad) {
+          auto row = packet_idx * 4 + row_quad;
+          for (uint32_t col = 0; col < kPrimitiveDim; ++col) {
+            auto bits = fp22_to_fp16(load_subtile_elem(slot_id, subtile_id, row, col));
+            auto off = (row_quad * kPrimitiveDim + col) * 2;
+            p.at(off + 0) = bits & 0xff;
+            p.at(off + 1) = (bits >> 8) & 0xff;
+          }
+        }
+      }
+      return true;
+    }
+
+    if (fmt_c == vortex::tensor::fp8::id) {
+      auto& p = packets->front();
+      for (uint32_t row = 0; row < kPrimitiveDim; ++row) {
+        for (uint32_t col = 0; col < kPrimitiveDim; ++col) {
+          p.at(row * kPrimitiveDim + col) = fp22_to_fp8_e4m3(load_subtile_elem(slot_id, subtile_id, row, col));
+        }
+      }
+      return true;
+    }
+
+    return false;
+  }
+
   bool dump_tile(uint32_t slot_id, uint32_t fmt_c, std::vector<packet_t>* packets) const {
     if (nullptr == packets || !valid(slot_id)) {
       return false;
     }
 
     packets->assign(packet_count(fmt_c), packet_t{});
-    if (fmt_c == vortex::tensor::fp32::id) {
-      for (uint32_t row = 0; row < kDim; ++row) {
-        auto& p = packets->at(row);
-        for (uint32_t col = 0; col < kDim; ++col) {
-          auto raw = load_matrix_elem(slot_id, row, col);
-          auto bits = fp22_to_fp32(raw);
-          auto off = col * 4;
-          p.at(off + 0) = bits & 0xff;
-          p.at(off + 1) = (bits >> 8) & 0xff;
-          p.at(off + 2) = (bits >> 16) & 0xff;
-          p.at(off + 3) = (bits >> 24) & 0xff;
-        }
+    auto packets_per_group = packets_per_subtile(fmt_c);
+    for (uint32_t subtile = 0; subtile < kRowsPerSlot; ++subtile) {
+      auto base = subtile * packets_per_group;
+      std::vector<packet_t> subtile_packets;
+      if (!dump_subtile_packets(slot_id, fmt_c, subtile, &subtile_packets)) {
+        return false;
       }
-    } else if (fmt_c == vortex::tensor::fp16::id) {
-      for (uint32_t packet = 0; packet < packets->size(); ++packet) {
-        auto& p = packets->at(packet);
-        for (uint32_t elem = 0; elem < 32; ++elem) {
-          auto row = packet * 2 + (elem / 16);
-          auto col = elem % 16;
-          auto bits = fp22_to_fp16(load_matrix_elem(slot_id, row, col));
-          auto off = elem * 2;
-          p.at(off + 0) = bits & 0xff;
-          p.at(off + 1) = (bits >> 8) & 0xff;
-        }
+      for (uint32_t packet_idx = 0; packet_idx < packets_per_group; ++packet_idx) {
+        packets->at(base + packet_idx) = subtile_packets.at(packet_idx);
       }
-    } else if (fmt_c == vortex::tensor::fp8::id) {
-      for (uint32_t packet = 0; packet < packets->size(); ++packet) {
-        auto& p = packets->at(packet);
-        for (uint32_t elem = 0; elem < 64; ++elem) {
-          auto row = packet * 4 + (elem / 16);
-          auto col = elem % 16;
-          p.at(elem) = fp22_to_fp8_e4m3(load_matrix_elem(slot_id, row, col));
-        }
-      }
-    } else {
-      return false;
     }
     return true;
   }
@@ -336,6 +367,10 @@ private:
     auto subtile = (row / kPrimitiveDim) * 2 + (col / kPrimitiveDim);
     auto elem_idx = (row % kPrimitiveDim) * kPrimitiveDim + (col % kPrimitiveDim);
     return load_elem(rows_.at(slot_base(slot_id) + subtile), elem_idx);
+  }
+
+  uint32_t load_subtile_elem(uint32_t slot_id, uint32_t subtile, uint32_t row, uint32_t col) const {
+    return load_elem(rows_.at(slot_base(slot_id) + subtile), row * kPrimitiveDim + col);
   }
 
   std::array<row_t, kDepth> rows_;

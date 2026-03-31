@@ -247,17 +247,27 @@ struct TileHostUtils {
   static void pack_c_tile_fp32(std::vector<uint8_t>& composite,
                                uint32_t byte_offset,
                                const float tile[TileDim][TileDim]) {
-    for (uint32_t row = 0; row < TileDim; ++row) {
-      uint32_t row_offset = byte_offset + row * 64;
-      for (uint32_t col = 0; col < TileDim; ++col) {
-        union {
-          float f;
-          uint32_t u;
-        } cvt = {tile[row][col]};
-        composite[row_offset + col * 4 + 0] = cvt.u & 0xff;
-        composite[row_offset + col * 4 + 1] = (cvt.u >> 8) & 0xff;
-        composite[row_offset + col * 4 + 2] = (cvt.u >> 16) & 0xff;
-        composite[row_offset + col * 4 + 3] = (cvt.u >> 24) & 0xff;
+    for (uint32_t subtile = 0; subtile < 4; ++subtile) {
+      uint32_t subtile_row = subtile / 2;
+      uint32_t subtile_col = subtile % 2;
+      for (uint32_t packet = 0; packet < 4; ++packet) {
+        uint32_t packet_offset = byte_offset + (subtile * 4 + packet) * 64;
+        uint32_t row_base = subtile_row * 8 + packet * 2;
+        uint32_t col_base = subtile_col * 8;
+        for (uint32_t r = 0; r < 2; ++r) {
+          for (uint32_t c = 0; c < 8; ++c) {
+            union {
+              float f;
+              uint32_t u;
+            } cvt = {tile[row_base + r][col_base + c]};
+            uint32_t elem = r * 8 + c;
+            uint32_t off = packet_offset + elem * 4;
+            composite[off + 0] = cvt.u & 0xff;
+            composite[off + 1] = (cvt.u >> 8) & 0xff;
+            composite[off + 2] = (cvt.u >> 16) & 0xff;
+            composite[off + 3] = (cvt.u >> 24) & 0xff;
+          }
+        }
       }
     }
   }
@@ -265,15 +275,21 @@ struct TileHostUtils {
   static void pack_c_tile_fp16(std::vector<uint8_t>& composite,
                                uint32_t byte_offset,
                                const uint16_t tile[TileDim][TileDim]) {
-    for (uint32_t packet = 0; packet < 8; ++packet) {
-      uint32_t packet_offset = byte_offset + packet * 64;
-      for (uint32_t elem = 0; elem < 32; ++elem) {
-        uint32_t row = packet * 2 + (elem / 16);
-        uint32_t col = elem % 16;
-        uint32_t off = packet_offset + elem * 2;
-        auto value = tile[row][col];
-        composite[off + 0] = value & 0xff;
-        composite[off + 1] = (value >> 8) & 0xff;
+    for (uint32_t subtile = 0; subtile < 4; ++subtile) {
+      uint32_t subtile_row = subtile / 2;
+      uint32_t subtile_col = subtile % 2;
+      for (uint32_t packet = 0; packet < 2; ++packet) {
+        uint32_t packet_offset = byte_offset + (subtile * 2 + packet) * 64;
+        uint32_t row_base = subtile_row * 8 + packet * 4;
+        uint32_t col_base = subtile_col * 8;
+        for (uint32_t elem = 0; elem < 32; ++elem) {
+          uint32_t row = row_base + (elem / 8);
+          uint32_t col = col_base + (elem % 8);
+          uint32_t off = packet_offset + elem * 2;
+          auto value = tile[row][col];
+          composite[off + 0] = value & 0xff;
+          composite[off + 1] = (value >> 8) & 0xff;
+        }
       }
     }
   }
@@ -296,19 +312,28 @@ struct TileHostUtils {
                                   uint32_t tile_col) {
     uint32_t row_base = tile_row * TileDim;
     uint32_t col_base = tile_col * TileDim;
-    for (uint32_t i = 0; i < TileDim; ++i) {
-      for (uint32_t j = 0; j < TileDim; ++j) {
-        uint32_t off = i * 64 + j * 4;
-        union {
-          uint32_t u;
-          float f;
-        } cvt = {
-          static_cast<uint32_t>(tile_bytes[off + 0])
-          | (static_cast<uint32_t>(tile_bytes[off + 1]) << 8)
-          | (static_cast<uint32_t>(tile_bytes[off + 2]) << 16)
-          | (static_cast<uint32_t>(tile_bytes[off + 3]) << 24)
-        };
-        matrix[(row_base + i) * TileDim + (col_base + j)] = cvt.f;
+    for (uint32_t subtile = 0; subtile < 4; ++subtile) {
+      uint32_t subtile_row = subtile / 2;
+      uint32_t subtile_col = subtile % 2;
+      for (uint32_t packet = 0; packet < 4; ++packet) {
+        uint32_t packet_offset = (subtile * 4 + packet) * 64;
+        uint32_t row_block = subtile_row * 8 + packet * 2;
+        uint32_t col_block = subtile_col * 8;
+        for (uint32_t elem = 0; elem < 16; ++elem) {
+          uint32_t row = row_block + (elem / 8);
+          uint32_t col = col_block + (elem % 8);
+          uint32_t off = packet_offset + elem * 4;
+          union {
+            uint32_t u;
+            float f;
+          } cvt = {
+            static_cast<uint32_t>(tile_bytes[off + 0])
+            | (static_cast<uint32_t>(tile_bytes[off + 1]) << 8)
+            | (static_cast<uint32_t>(tile_bytes[off + 2]) << 16)
+            | (static_cast<uint32_t>(tile_bytes[off + 3]) << 24)
+          };
+          matrix[(row_base + row) * TileDim + (col_base + col)] = cvt.f;
+        }
       }
     }
   }
@@ -319,13 +344,20 @@ struct TileHostUtils {
                                   uint32_t tile_col) {
     uint32_t row_base = tile_row * TileDim;
     uint32_t col_base = tile_col * TileDim;
-    for (uint32_t packet = 0; packet < 8; ++packet) {
-      for (uint32_t elem = 0; elem < 32; ++elem) {
-        uint32_t row = packet * 2 + (elem / 16);
-        uint32_t col = elem % 16;
-        uint32_t off = packet * 64 + elem * 2;
-        uint16_t value = static_cast<uint16_t>(tile_bytes[off + 0] | (tile_bytes[off + 1] << 8));
-        matrix[(row_base + row) * TileDim + (col_base + col)] = value;
+    for (uint32_t subtile = 0; subtile < 4; ++subtile) {
+      uint32_t subtile_row = subtile / 2;
+      uint32_t subtile_col = subtile % 2;
+      for (uint32_t packet = 0; packet < 2; ++packet) {
+        uint32_t packet_offset = (subtile * 2 + packet) * 64;
+        uint32_t row_block = subtile_row * 8 + packet * 4;
+        uint32_t col_block = subtile_col * 8;
+        for (uint32_t elem = 0; elem < 32; ++elem) {
+          uint32_t row = row_block + (elem / 8);
+          uint32_t col = col_block + (elem % 8);
+          uint32_t off = packet_offset + elem * 2;
+          uint16_t value = static_cast<uint16_t>(tile_bytes[off + 0] | (tile_bytes[off + 1] << 8));
+          matrix[(row_base + row) * TileDim + (col_base + col)] = value;
+        }
       }
     }
   }

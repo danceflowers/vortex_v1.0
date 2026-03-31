@@ -163,11 +163,15 @@ public:
   static constexpr uint32_t kWmmaPrimitiveCount = 8;
   static constexpr uint32_t kSubtilesPerTile = 4;
   static constexpr uint32_t kPrimitiveDim = 8;
-  static constexpr uint32_t kAmemWriteBeatsPerCycle = 1;
-  static constexpr uint32_t kBmemWriteBeatsPerCycle = 1;
-  static constexpr uint32_t kCmemWriteBeatsPerCycle = 1;
-  static constexpr uint32_t kCmemReadBeatsPerCycle = 1;
-  static constexpr uint32_t kMetaWriteBeatsPerCycle = 1;
+  // Local SRAM port budgets exposed by the current TensorUnit model.
+  static constexpr uint32_t kAmemWriteLinesPerCycle = 1;
+  static constexpr uint32_t kBmemWriteLinesPerCycle = 1;
+  static constexpr uint32_t kCmemWriteSubtilesPerCycle = 1;
+  static constexpr uint32_t kCmemReadSubtilesPerCycle = 1;
+  static constexpr uint32_t kMetaWritePacketsPerCycle = 1;
+
+  // These slot states are the TensorUnit-visible ownership and scheduling view.
+  // The underlying SRAMs additionally track finer per-line/per-subtile valid bits.
   struct ASlotState {
     uint32_t owner_wgid = 0;
     uint32_t descriptor = 0xffffffffu;
@@ -254,6 +258,8 @@ public:
     }
   };
 
+  // One macro WMMA expands into eight primitives. This job tracks which
+  // primitive should be issued next for the active macro-op.
   struct PendingWmmaJob {
     uint32_t wgid = 0;
     uint32_t a_slot_id = 0;
@@ -268,6 +274,8 @@ public:
   };
 
   struct MemUop {
+    // MemUop models one TensorUnit-side local memory transaction. It bridges
+    // a TMEM window/tile packet stream and one local operand/result slot.
     enum class Kind : uint8_t {
       FillA = 0,
       FillB,
@@ -284,22 +292,22 @@ public:
     uint32_t tile_idx = 0;
     uint32_t async_id = 0;
     bool separate_handle = false;
-    uint32_t remaining_tmem_reads = 0;
-    uint32_t remaining_tmem_writes = 0;
-    uint32_t remaining_amem_writes = 0;
-    uint32_t remaining_bmem_writes = 0;
-    uint32_t remaining_cmem_writes = 0;
-    uint32_t remaining_cmem_reads = 0;
-    uint32_t remaining_meta_writes = 0;
+    uint32_t remaining_tmem_read_packets = 0;
+    uint32_t remaining_tmem_write_packets = 0;
+    uint32_t remaining_amem_fill_lines = 0;
+    uint32_t remaining_bmem_fill_lines = 0;
+    uint32_t remaining_cmem_fill_subtiles = 0;
+    uint32_t remaining_cmem_dump_subtiles = 0;
+    uint32_t remaining_metamem_fill_packets = 0;
     uint32_t next_payload_packet_idx = 0;
     uint32_t next_meta_packet_idx = 0;
+    // Packets already fetched from TMEM but not yet committed into the local SRAM.
     std::vector<Core::TmemPacket> staged_payload_packets;
     std::vector<Core::TmemPacket> staged_meta_packets;
     uint32_t next_store_packet_idx = 0;
     uint32_t staged_store_packet_cursor = 0;
+    // Packets assembled from one or more C subtiles and waiting for TMEM writeback.
     std::vector<Core::TmemPacket> staged_store_packets;
-    std::array<std::array<uint32_t, kPrimitiveDim>, kPrimitiveDim> staged_store_left_subtile = {};
-    bool staged_store_left_valid = false;
   };
 
   enum class NoWmmaReadyReason : uint8_t {
@@ -358,6 +366,11 @@ public:
   }
 
   void tick() {
+    // TensorUnit timing order:
+    // 1) accept macro-ops into the output delay pipe
+    // 2) advance local TMEM<->SRAM load/store work
+    // 3) issue at most one WMMA primitive into the TensorCore frontend
+    // 4) advance the TensorCore arithmetic pipeline and retire one primitive
     for (uint32_t iw = 0; iw < ISSUE_WIDTH; ++iw) {
       auto& input = simobject_->Inputs.at(iw);
       if (input.empty())
@@ -382,13 +395,13 @@ public:
       input.pop();
     }
 
-    service_mem_ops();
-    dispatch_compute_uop();
+    advance_tensor_memory_pipeline();
+    issue_wmma_primitives();
     sample_pending_wmma_depth();
     if (tensorcore_.active()) {
       ++perf_stats_.tc_active_cycles;
     }
-    tick_tensorcore();
+    advance_tensorcore_pipeline();
   }
 
   void mma_load(uint32_t wid, uint32_t handle, IntrTcuArgs args, ExeTraceData* trace_data) {
@@ -668,11 +681,11 @@ private:
 
   void reset_mem_port_budgets() {
     mem_port_cycle_ = core_->current_cycle();
-    amem_write_budget_ = kAmemWriteBeatsPerCycle;
-    bmem_write_budget_ = kBmemWriteBeatsPerCycle;
-    cmem_write_budget_ = kCmemWriteBeatsPerCycle;
-    cmem_read_budget_ = kCmemReadBeatsPerCycle;
-    meta_write_budget_ = kMetaWriteBeatsPerCycle;
+    amem_write_budget_ = kAmemWriteLinesPerCycle;
+    bmem_write_budget_ = kBmemWriteLinesPerCycle;
+    cmem_write_budget_ = kCmemWriteSubtilesPerCycle;
+    cmem_read_budget_ = kCmemReadSubtilesPerCycle;
+    meta_write_budget_ = kMetaWritePacketsPerCycle;
   }
 
   void ensure_mem_port_budgets() {
@@ -682,15 +695,14 @@ private:
   }
 
   static bool mem_op_complete(const MemUop& op) {
-    return op.remaining_tmem_reads == 0
-        && op.remaining_tmem_writes == 0
-        && op.remaining_amem_writes == 0
-        && op.remaining_bmem_writes == 0
-        && op.remaining_cmem_writes == 0
-        && op.remaining_cmem_reads == 0
-        && op.remaining_meta_writes == 0
-        && op.staged_store_packets.empty()
-        && !op.staged_store_left_valid;
+    return op.remaining_tmem_read_packets == 0
+        && op.remaining_tmem_write_packets == 0
+        && op.remaining_amem_fill_lines == 0
+        && op.remaining_bmem_fill_lines == 0
+        && op.remaining_cmem_fill_subtiles == 0
+        && op.remaining_cmem_dump_subtiles == 0
+        && op.remaining_metamem_fill_packets == 0
+        && op.staged_store_packets.empty();
   }
 
   uint32_t current_pending_wmma_depth() const {
@@ -1083,32 +1095,32 @@ private:
     auto payload_fmt = mem_uop_payload_fmt(uop);
     switch (uop.kind) {
     case MemUop::Kind::FillA:
-      if (uop.remaining_amem_writes != 0) {
-        auto beat_idx = AMem::fill_beats() - uop.remaining_amem_writes;
-        auto packets_needed = AMem::packets_per_fill_beat(payload_fmt);
-        if (uop.staged_payload_packets.size() >= (beat_idx + 1) * packets_needed) {
+      if (uop.remaining_amem_fill_lines != 0) {
+        auto line_idx = AMem::fill_lines() - uop.remaining_amem_fill_lines;
+        auto packets_needed = AMem::packets_per_fill_line(payload_fmt);
+        if (uop.staged_payload_packets.size() >= (line_idx + 1) * packets_needed) {
           return LocalFillAction::AData;
         }
       }
-      if (uop.remaining_meta_writes != 0
+      if (uop.remaining_metamem_fill_packets != 0
        && uop.staged_meta_packets.size() >= MetaMem::packet_count()) {
         return LocalFillAction::Meta;
       }
       return LocalFillAction::None;
     case MemUop::Kind::FillB:
-      if (uop.remaining_bmem_writes != 0) {
-        auto beat_idx = BMem::fill_beats() - uop.remaining_bmem_writes;
-        auto packets_needed = BMem::packets_per_fill_beat(payload_fmt);
-        if (uop.staged_payload_packets.size() >= (beat_idx + 1) * packets_needed) {
+      if (uop.remaining_bmem_fill_lines != 0) {
+        auto line_idx = BMem::fill_lines() - uop.remaining_bmem_fill_lines;
+        auto packets_needed = BMem::packets_per_fill_line(payload_fmt);
+        if (uop.staged_payload_packets.size() >= (line_idx + 1) * packets_needed) {
           return LocalFillAction::BData;
         }
       }
       return LocalFillAction::None;
     case MemUop::Kind::FillC:
-      if (uop.remaining_cmem_writes != 0) {
-        auto beat_idx = CMem::fill_beats(payload_fmt) - uop.remaining_cmem_writes;
-        auto packets_needed = CMem::packets_per_fill_group(payload_fmt);
-        auto group_base = (beat_idx / 2) * packets_needed;
+      if (uop.remaining_cmem_fill_subtiles != 0) {
+        auto subtile_idx = CMem::fill_subtiles(payload_fmt) - uop.remaining_cmem_fill_subtiles;
+        auto packets_needed = CMem::packets_per_subtile(payload_fmt);
+        auto group_base = subtile_idx * packets_needed;
         if (uop.staged_payload_packets.size() >= group_base + packets_needed) {
           return LocalFillAction::CData;
         }
@@ -1153,73 +1165,73 @@ private:
     auto payload_fmt = mem_uop_payload_fmt(uop);
     switch (action) {
     case LocalFillAction::AData: {
-      auto beat_idx = AMem::fill_beats() - uop.remaining_amem_writes;
-      auto packets_per_beat = AMem::packets_per_fill_beat(payload_fmt);
+      auto line_idx = AMem::fill_lines() - uop.remaining_amem_fill_lines;
+      auto packets_per_line = AMem::packets_per_fill_line(payload_fmt);
       std::vector<AMem::packet_t> packets;
-      auto base = beat_idx * packets_per_beat;
-	      for (uint32_t i = 0; i < packets_per_beat; ++i) {
+      auto base = line_idx * packets_per_line;
+	      for (uint32_t i = 0; i < packets_per_line; ++i) {
 	        packets.push_back(to_amem_packet(uop.staged_payload_packets.at(base + i)));
 	      }
-	      if (!amem_.write_fill_beat(uop.slot_id, payload_fmt, beat_idx, packets)) {
+	      if (!amem_.write_fill_line(uop.slot_id, payload_fmt, line_idx, packets)) {
 	        std::cerr << "TensorUnit error: AMem fill write failed"
 	                  << " kind=" << static_cast<uint32_t>(uop.kind)
 	                  << " slot=" << uop.slot_id
-	                  << " beat=" << beat_idx
+	                  << " line=" << line_idx
 	                  << " payload_fmt=" << payload_fmt
 	                  << " packets=" << packets.size()
 	                  << std::endl;
 	        std::abort();
 	      }
-      --uop.remaining_amem_writes;
+      --uop.remaining_amem_fill_lines;
       return true;
     }
     case LocalFillAction::BData: {
-      auto beat_idx = BMem::fill_beats() - uop.remaining_bmem_writes;
-      auto packets_per_beat = BMem::packets_per_fill_beat(payload_fmt);
+      auto line_idx = BMem::fill_lines() - uop.remaining_bmem_fill_lines;
+      auto packets_per_line = BMem::packets_per_fill_line(payload_fmt);
       std::vector<BMem::packet_t> packets;
-      auto base = beat_idx * packets_per_beat;
-	      for (uint32_t i = 0; i < packets_per_beat; ++i) {
+      auto base = line_idx * packets_per_line;
+	      for (uint32_t i = 0; i < packets_per_line; ++i) {
 	        packets.push_back(to_bmem_packet(uop.staged_payload_packets.at(base + i)));
 	      }
-	      if (!bmem_.write_fill_beat(uop.slot_id, payload_fmt, beat_idx, packets)) {
+	      if (!bmem_.write_fill_line(uop.slot_id, payload_fmt, line_idx, packets)) {
 	        std::cerr << "TensorUnit error: BMem fill write failed"
 	                  << " kind=" << static_cast<uint32_t>(uop.kind)
 	                  << " slot=" << uop.slot_id
-	                  << " beat=" << beat_idx
+	                  << " line=" << line_idx
 	                  << " payload_fmt=" << payload_fmt
 	                  << " packets=" << packets.size()
 	                  << std::endl;
 	        std::abort();
 	      }
-      --uop.remaining_bmem_writes;
+      --uop.remaining_bmem_fill_lines;
       return true;
     }
     case LocalFillAction::CData: {
-      auto beat_idx = CMem::fill_beats(payload_fmt) - uop.remaining_cmem_writes;
-      auto packets_per_group = CMem::packets_per_fill_group(payload_fmt);
-      auto group_base = (beat_idx / 2) * packets_per_group;
+      auto subtile_idx = CMem::fill_subtiles(payload_fmt) - uop.remaining_cmem_fill_subtiles;
+      auto packets_per_subtile = CMem::packets_per_subtile(payload_fmt);
+      auto group_base = subtile_idx * packets_per_subtile;
       std::vector<CMem::packet_t> packets;
-	      for (uint32_t i = 0; i < packets_per_group; ++i) {
+	      for (uint32_t i = 0; i < packets_per_subtile; ++i) {
 	        packets.push_back(to_cmem_packet(uop.staged_payload_packets.at(group_base + i)));
 	      }
-	      if (!cmem_.write_fill_beat(uop.slot_id, payload_fmt, beat_idx, packets)) {
+	      if (!cmem_.write_fill_subtile(uop.slot_id, payload_fmt, subtile_idx, packets)) {
 	        std::cerr << "TensorUnit error: CMem fill write failed"
 	                  << " kind=" << static_cast<uint32_t>(uop.kind)
 	                  << " slot=" << uop.slot_id
-	                  << " beat=" << beat_idx
+	                  << " subtile=" << subtile_idx
 	                  << " payload_fmt=" << payload_fmt
 	                  << " packets=" << packets.size()
 	                  << std::endl;
 	        std::abort();
 	      }
-      --uop.remaining_cmem_writes;
+      --uop.remaining_cmem_fill_subtiles;
       return true;
     }
     case LocalFillAction::Meta: {
-      if (!metamem_.write_fill_beat(uop.slot_id, to_meta_packet(uop.staged_meta_packets.front()))) {
+      if (!metamem_.write_fill_packet(uop.slot_id, to_meta_packet(uop.staged_meta_packets.front()))) {
         std::abort();
       }
-      --uop.remaining_meta_writes;
+      --uop.remaining_metamem_fill_packets;
       return true;
     }
     case LocalFillAction::None:
@@ -1229,7 +1241,7 @@ private:
   }
 
   bool stage_fill_read(MemUop& uop) {
-    if (uop.remaining_tmem_reads == 0) {
+    if (uop.remaining_tmem_read_packets == 0) {
       return false;
     }
 
@@ -1286,7 +1298,7 @@ private:
       ++uop.next_meta_packet_idx;
     }
 
-    --uop.remaining_tmem_reads;
+    --uop.remaining_tmem_read_packets;
     return true;
   }
 
@@ -1307,94 +1319,28 @@ private:
     return core_->try_acquire_tmem_window_read_port(uop.handle, meta_shadow_window_id(uop.window_id), meta_packet_idx);
   }
 
-  void append_store_packets_for_subtile_pair(
-      MemUop& uop,
-      uint32_t fmt_d,
-      const std::array<std::array<uint32_t, kPrimitiveDim>, kPrimitiveDim>& left,
-      const uint32_t right[kPrimitiveDim][kPrimitiveDim]) {
-    if (fmt_d == vt::fp32::id) {
-      for (uint32_t row = 0; row < kPrimitiveDim; ++row) {
-        CMem::packet_t packet{};
-        for (uint32_t col = 0; col < CMem::kDim; ++col) {
-          auto raw = (col < kPrimitiveDim) ? left[row][col] : right[row][col - kPrimitiveDim];
-          auto bits = fp22_to_fp32(raw);
-          auto off = col * 4;
-          packet.at(off + 0) = bits & 0xff;
-          packet.at(off + 1) = (bits >> 8) & 0xff;
-          packet.at(off + 2) = (bits >> 16) & 0xff;
-          packet.at(off + 3) = (bits >> 24) & 0xff;
-        }
-        uop.staged_store_packets.push_back(to_tmem_packet(packet));
-      }
-      return;
-    }
-
-    if (fmt_d == vt::fp16::id) {
-      for (uint32_t packet_idx = 0; packet_idx < 4; ++packet_idx) {
-        CMem::packet_t packet{};
-        for (uint32_t elem = 0; elem < 32; ++elem) {
-          auto row = packet_idx * 2 + (elem / 16);
-          auto col = elem % 16;
-          auto raw = (col < kPrimitiveDim) ? left[row][col] : right[row][col - kPrimitiveDim];
-          auto bits = fp22_to_fp16(raw);
-          auto off = elem * 2;
-          packet.at(off + 0) = bits & 0xff;
-          packet.at(off + 1) = (bits >> 8) & 0xff;
-        }
-        uop.staged_store_packets.push_back(to_tmem_packet(packet));
-      }
-      return;
-    }
-
-    if (fmt_d == vt::fp8::id) {
-      for (uint32_t packet_idx = 0; packet_idx < 2; ++packet_idx) {
-        CMem::packet_t packet{};
-        for (uint32_t elem = 0; elem < 64; ++elem) {
-          auto row = packet_idx * 4 + (elem / 16);
-          auto col = elem % 16;
-          auto raw = (col < kPrimitiveDim) ? left[row][col] : right[row][col - kPrimitiveDim];
-          packet.at(elem) = fp22_to_fp8_e4m3(raw);
-        }
-        uop.staged_store_packets.push_back(to_tmem_packet(packet));
-      }
-      return;
-    }
-
-    std::abort();
-  }
-
   bool stage_store_read(MemUop& uop) {
-    if (uop.remaining_cmem_reads == 0) {
+    if (uop.remaining_cmem_dump_subtiles == 0) {
       return false;
     }
 
     const auto& slot = c_slots_.at(uop.slot_id);
-    auto beat_idx = CMem::dump_beats(slot.fmt_c) - uop.remaining_cmem_reads;
-    uint32_t subtile[kPrimitiveDim][kPrimitiveDim] = {};
-    cmem_.read_subtile_fp22(uop.slot_id, beat_idx, subtile);
-
-    if ((beat_idx & 1u) == 0) {
-      for (uint32_t i = 0; i < kPrimitiveDim; ++i) {
-        for (uint32_t j = 0; j < kPrimitiveDim; ++j) {
-          uop.staged_store_left_subtile[i][j] = subtile[i][j];
-        }
-      }
-      uop.staged_store_left_valid = true;
-    } else {
-      if (!uop.staged_store_left_valid) {
-        std::abort();
-      }
-      append_store_packets_for_subtile_pair(uop, slot.fmt_d, uop.staged_store_left_subtile, subtile);
-      uop.staged_store_left_valid = false;
+    auto subtile_idx = CMem::dump_subtiles(slot.fmt_c) - uop.remaining_cmem_dump_subtiles;
+    std::vector<CMem::packet_t> packets;
+    if (!cmem_.dump_subtile_packets(uop.slot_id, slot.fmt_d, subtile_idx, &packets)) {
+      std::abort();
+    }
+    for (const auto& packet : packets) {
+      uop.staged_store_packets.push_back(to_tmem_packet(packet));
     }
 
-    --uop.remaining_cmem_reads;
+    --uop.remaining_cmem_dump_subtiles;
     return true;
   }
 
   bool emit_store_packet(MemUop& uop) {
     if (uop.staged_store_packet_cursor >= uop.staged_store_packets.size()
-     || uop.remaining_tmem_writes == 0) {
+     || uop.remaining_tmem_write_packets == 0) {
       return false;
     }
 
@@ -1427,7 +1373,7 @@ private:
 	    }
     ++uop.next_store_packet_idx;
     ++uop.staged_store_packet_cursor;
-    --uop.remaining_tmem_writes;
+    --uop.remaining_tmem_write_packets;
     if (uop.staged_store_packet_cursor >= uop.staged_store_packets.size()) {
       uop.staged_store_packets.clear();
       uop.staged_store_packet_cursor = 0;
@@ -1563,22 +1509,22 @@ private:
       switch (target) {
       case TcuTarget::A: {
         const auto& slot = a_slots_.at(slot_id);
-        op.remaining_tmem_reads = a_packet_count((payload_fmt != kUnsetPayloadFmt) ? payload_fmt : slot.fmt_a)
+        op.remaining_tmem_read_packets = a_packet_count((payload_fmt != kUnsetPayloadFmt) ? payload_fmt : slot.fmt_a)
                                 + ((slot.a_sparse_mode != vt::sparse_none) ? meta_packet_count(slot.a_sparse_mode) : 0);
-        op.remaining_amem_writes = AMem::fill_beats();
-        op.remaining_meta_writes = (slot.a_sparse_mode != vt::sparse_none) ? MetaMem::fill_beats() : 0;
+        op.remaining_amem_fill_lines = AMem::fill_lines();
+        op.remaining_metamem_fill_packets = (slot.a_sparse_mode != vt::sparse_none) ? MetaMem::fill_packets() : 0;
         mark_a_pending(a_slots_.at(slot_id), true);
       } break;
       case TcuTarget::B: {
         const auto& slot = b_slots_.at(slot_id);
-        op.remaining_tmem_reads = b_packet_count((payload_fmt != kUnsetPayloadFmt) ? payload_fmt : slot.fmt_b);
-        op.remaining_bmem_writes = BMem::fill_beats();
+        op.remaining_tmem_read_packets = b_packet_count((payload_fmt != kUnsetPayloadFmt) ? payload_fmt : slot.fmt_b);
+        op.remaining_bmem_fill_lines = BMem::fill_lines();
         mark_b_pending(b_slots_.at(slot_id), true);
       } break;
       case TcuTarget::C: {
         const auto& slot = c_slots_.at(slot_id);
-        op.remaining_tmem_reads = c_load_packet_count((payload_fmt != kUnsetPayloadFmt) ? payload_fmt : slot.fmt_c);
-        op.remaining_cmem_writes = CMem::fill_beats((payload_fmt != kUnsetPayloadFmt) ? payload_fmt : slot.fmt_c);
+        op.remaining_tmem_read_packets = c_load_packet_count((payload_fmt != kUnsetPayloadFmt) ? payload_fmt : slot.fmt_c);
+        op.remaining_cmem_fill_subtiles = CMem::fill_subtiles((payload_fmt != kUnsetPayloadFmt) ? payload_fmt : slot.fmt_c);
         mark_c_pending(c_slots_.at(slot_id), true);
       } break;
       default:
@@ -1671,8 +1617,8 @@ private:
     op.tile_idx = args.tile_id;
     op.async_id = store_slot.store_async_id;
     op.separate_handle = use_window;
-    op.remaining_cmem_reads = CMem::dump_beats(store_slot.fmt_c);
-    op.remaining_tmem_writes = d_store_packet_count(store_slot.fmt_d);
+    op.remaining_cmem_dump_subtiles = CMem::dump_subtiles(store_slot.fmt_c);
+    op.remaining_tmem_write_packets = d_store_packet_count(store_slot.fmt_d);
     mem_ops_.push_back(op);
     perf_stats_.mem_queue_max = std::max<uint64_t>(perf_stats_.mem_queue_max, mem_ops_.size());
   }
@@ -1742,7 +1688,8 @@ private:
     perf_stats_.pending_wmma_jobs_max = std::max<uint64_t>(perf_stats_.pending_wmma_jobs_max, pending_wmma_jobs_.size() + (active_wmma_job_valid_ ? 1 : 0));
   }
 
-  void service_mem_ops() {
+  // Advance the TensorUnit local load/store pipeline by one cycle.
+  void advance_tensor_memory_pipeline() {
     if (mem_ops_.empty()) {
       return;
     }
@@ -1794,7 +1741,7 @@ private:
           break;
         }
 
-        if (!progressed && uop.remaining_tmem_reads != 0) {
+        if (!progressed && uop.remaining_tmem_read_packets != 0) {
           if (try_acquire_fill_read_port(uop)) {
             progressed = stage_fill_read(uop);
           } else if (!local_blocked) {
@@ -1830,7 +1777,7 @@ private:
             ++perf_stats_.stall_tmem_write_port_busy;
             continue;
           }
-        } else if (uop.remaining_cmem_reads != 0) {
+        } else if (uop.remaining_cmem_dump_subtiles != 0) {
           if (cmem_read_budget_ == 0) {
             ++perf_stats_.stall_cmem_port_busy;
             continue;
@@ -1838,57 +1785,57 @@ private:
           --cmem_read_budget_;
           progressed = stage_store_read(uop);
         }
-      } else if (uop.remaining_amem_writes != 0 || uop.remaining_bmem_writes != 0
-              || uop.remaining_cmem_writes != 0 || uop.remaining_cmem_reads != 0
-              || uop.remaining_meta_writes != 0) {
-        if (uop.remaining_amem_writes != 0) {
+      } else if (uop.remaining_amem_fill_lines != 0 || uop.remaining_bmem_fill_lines != 0
+              || uop.remaining_cmem_fill_subtiles != 0 || uop.remaining_cmem_dump_subtiles != 0
+              || uop.remaining_metamem_fill_packets != 0) {
+        if (uop.remaining_amem_fill_lines != 0) {
           if (amem_write_budget_ == 0) {
             ++perf_stats_.stall_amem_port_busy;
             continue;
           }
           --amem_write_budget_;
-          --uop.remaining_amem_writes;
+          --uop.remaining_amem_fill_lines;
           progressed = true;
         }
-        if (uop.remaining_bmem_writes != 0) {
+        if (uop.remaining_bmem_fill_lines != 0) {
           if (bmem_write_budget_ == 0) {
             ++perf_stats_.stall_bmem_port_busy;
             continue;
           }
           --bmem_write_budget_;
-          --uop.remaining_bmem_writes;
+          --uop.remaining_bmem_fill_lines;
           progressed = true;
         }
-        if (uop.remaining_cmem_writes != 0) {
+        if (uop.remaining_cmem_fill_subtiles != 0) {
           if (cmem_write_budget_ == 0) {
             ++perf_stats_.stall_cmem_port_busy;
             continue;
           }
           --cmem_write_budget_;
-          --uop.remaining_cmem_writes;
+          --uop.remaining_cmem_fill_subtiles;
           progressed = true;
         }
-        if (uop.remaining_cmem_reads != 0) {
+        if (uop.remaining_cmem_dump_subtiles != 0) {
           if (cmem_read_budget_ == 0) {
             ++perf_stats_.stall_cmem_port_busy;
             continue;
           }
           --cmem_read_budget_;
-          --uop.remaining_cmem_reads;
+          --uop.remaining_cmem_dump_subtiles;
           progressed = true;
         }
-        if (uop.remaining_meta_writes != 0) {
+        if (uop.remaining_metamem_fill_packets != 0) {
           if (meta_write_budget_ == 0) {
             ++perf_stats_.stall_meta_port_busy;
             continue;
           }
           --meta_write_budget_;
-          --uop.remaining_meta_writes;
+          --uop.remaining_metamem_fill_packets;
           progressed = true;
         }
-      } else if (uop.remaining_tmem_writes != 0) {
+      } else if (uop.remaining_tmem_write_packets != 0) {
         if (core_->try_acquire_tmem_write_port(uop.handle, uop.next_store_packet_idx)) {
-          --uop.remaining_tmem_writes;
+          --uop.remaining_tmem_write_packets;
           progressed = true;
         } else {
           ++perf_stats_.stall_tmem_write_port_busy;
@@ -1946,7 +1893,8 @@ private:
     }
   }
 
-  void dispatch_compute_uop() {
+  // Issue at most one WMMA primitive into the TensorCore frontend per cycle.
+  void issue_wmma_primitives() {
     bool has_work = active_wmma_job_valid_ || !pending_wmma_jobs_.empty();
     if (!tensorcore_.ready(true)) {
       if (has_work) {
@@ -2026,7 +1974,8 @@ private:
     }
   }
 
-  void tick_tensorcore() {
+  // Advance the TensorCore arithmetic pipeline and retire one completed primitive if available.
+  void advance_tensorcore_pipeline() {
     configure_open_tensorcore_precision(tensorcore_fmt_out_);
     tensorcore_.tick(true);
 

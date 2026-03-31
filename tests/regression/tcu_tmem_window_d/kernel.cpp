@@ -39,7 +39,7 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   ctx::fill_fragment(fragB, 0);
   ctx::fill_fragment(fragC, 0);
 
-  uint32_t handle = vt::tmem_alloc(arg->bank_span);
+  uint32_t handle = vt::tmem_alloc(arg->c_bank_span);
 
   uint32_t a_load_id = vt::tma_load(handle, kTmaADescId, kAWindowId);
   uint32_t b_load_id = vt::tma_load(handle, kTmaBDescId, kBWindowId);

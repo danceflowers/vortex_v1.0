@@ -114,10 +114,10 @@ int main() {
   std::vector<uint8_t> h_a(kABytes, 0);
   std::vector<uint8_t> h_b(kBBytes, 0);
   std::vector<uint8_t> h_c(2 * kCBytes, 0);
-  host_utils::pack_ab_tile(h_a, 0, a_tile, false);
-  host_utils::pack_ab_tile(h_b, 0, b_tile, true);
-  host_utils::pack_c_tile(h_c, 0, c_init_tile);
-  host_utils::pack_c_tile(h_c, kCBytes, c_zero_tile);
+  std::memcpy(h_a.data(), a_tile, kABytes);
+  std::memcpy(h_b.data(), b_tile, kBBytes);
+  std::memcpy(h_c.data(), c_init_tile, kCBytes);
+  std::memcpy(h_c.data() + kCBytes, c_zero_tile, kCBytes);
 
   tma_descriptor_t tma_descs[kTmaDescCount] = {};
   mma_descriptor_t mma_descs[1] = {};
@@ -217,8 +217,9 @@ int main() {
   kernel_arg.grid_dim[1] = 1;
   kernel_arg.block_dim[0] = NUM_THREADS;
   kernel_arg.block_dim[1] = 1;
-  kernel_arg.bank_span = kBankSpan;
-
+  kernel_arg.a_bank_span = kABankSpan;
+  kernel_arg.b_bank_span = kBBankSpan;
+  kernel_arg.c_bank_span = kCBankSpan;
   RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
   RT_CHECK(vx_upload_bytes(device, &kernel_arg, sizeof(kernel_arg), &args_buffer));
 
@@ -236,7 +237,7 @@ int main() {
   constexpr float tolerance = 1e-6f;
   for (uint32_t snap = 0; snap < 2; ++snap) {
     std::vector<output_t> h_output(kTileDim * kTileDim, host_utils::encode_output(0.0f));
-    host_utils::scatter_c_tile(h_output, h_output_bytes.data() + snap * kCBytes, 0, 0);
+    std::memcpy(h_output.data(), h_output_bytes.data() + snap * kCBytes, kCBytes);
 
     std::vector<float> h_output_float;
     host_utils::convert_output_matrix_to_float(h_output_float, h_output);

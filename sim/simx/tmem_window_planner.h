@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -25,6 +26,14 @@ enum class TmemWindowTarget : uint8_t {
   C,
   D,
   Meta,
+};
+
+enum class TmemWindowLayoutKind : uint8_t {
+  LinearPacketStream = 0,
+  MathRowMajor,
+  ALineNative,
+  BLineNative,
+  CSubtileNative,
 };
 
 struct TensorShape2D {
@@ -53,6 +62,7 @@ struct TmemWindowPlannerInput {
 struct TmemWindowPlan {
   uint32_t window_id = 0;
   TmemWindowTarget target = TmemWindowTarget::A;
+  TmemWindowLayoutKind layout_kind = TmemWindowLayoutKind::LinearPacketStream;
   TensorShape2D elem_shape = {};
   uint32_t fmt = 0;
   uint32_t sparse_mode = 0;
@@ -101,6 +111,16 @@ public:
                                         uint32_t window_id,
                                         TmemWindowPlan* out,
                                         std::string* reason = nullptr);
+
+  static bool uses_math_packet_adapter(const TmemWindowPlan& window);
+  static bool pack_math_packet(const TmemWindowPlan& window,
+                               const std::vector<uint8_t>& payload,
+                               uint32_t packet_idx,
+                               std::array<uint8_t, kPacketBytes>* out);
+  static bool unpack_math_packet(const TmemWindowPlan& window,
+                                 uint32_t packet_idx,
+                                 const std::array<uint8_t, kPacketBytes>& packet,
+                                 std::vector<uint8_t>* payload);
 
 private:
   static bool append_dense_window(TmemLayoutPlan* plan,

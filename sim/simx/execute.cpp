@@ -55,6 +55,8 @@ static inline bool has_mma_descriptor(const IntrTcuArgs& args) {
   return args.descriptor != kInvalidTcuDescriptorId;
 }
 
+// Resolve the preloaded MMA descriptor into effective operand formats and
+// matrix-shape metadata used by the TensorUnit macro-op path.
 static inline void resolve_mma_descriptor(Core* core, IntrTcuArgs* args) {
   if (!has_mma_descriptor(*args)) {
     return;
@@ -1512,10 +1514,12 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       } break;
       case TcuType::TMA_LOAD: {
         auto handle = rs1_data.at(thread_start).u32;
-        auto control = rs2_data.at(thread_start).u32;
-        tpuArgs.window_id = tcu_tmem_op_ctl_window_id(control);
-        auto desc_id = tcu_tmem_op_ctl_desc_id(control);
-        auto async_id = core_->tma_load(wid, handle, desc_id, tpuArgs.window_id);
+        auto tmem_control_word = rs2_data.at(thread_start).u32;
+        tpuArgs.window_id = tcu_tmem_op_ctl_window_id(tmem_control_word);
+        auto descriptor_id = tcu_tmem_op_ctl_desc_id(tmem_control_word);
+        // TMA launch enters the Core-side async tensor engine and returns an
+        // async id that later feeds TMA_WAIT / TC_COMMIT synchronization.
+        auto async_id = core_->tma_load(wid, handle, descriptor_id, tpuArgs.window_id);
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t))
             continue;
@@ -1526,10 +1530,10 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       } break;
       case TcuType::TMA_STORE: {
         auto handle = rs1_data.at(thread_start).u32;
-        auto control = rs2_data.at(thread_start).u32;
-        tpuArgs.window_id = tcu_tmem_op_ctl_window_id(control);
-        auto desc_id = tcu_tmem_op_ctl_desc_id(control);
-        auto async_id = core_->tma_store(wid, handle, desc_id, tpuArgs.window_id);
+        auto tmem_control_word = rs2_data.at(thread_start).u32;
+        tpuArgs.window_id = tcu_tmem_op_ctl_window_id(tmem_control_word);
+        auto descriptor_id = tcu_tmem_op_ctl_desc_id(tmem_control_word);
+        auto async_id = core_->tma_store(wid, handle, descriptor_id, tpuArgs.window_id);
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t))
             continue;
@@ -1564,11 +1568,11 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       } break;
       case TcuType::TMEM_SHIFT: {
         auto handle = rs1_data.at(thread_start).u32;
-        auto shift_control = rs2_data.at(thread_start).u32;
-        tpuArgs.window_id = tcu_tmem_op_ctl_window_id(shift_control);
-        auto flags = tcu_tmem_op_ctl_flags(shift_control);
-        auto refill_desc_id = (flags & kTcuTmemOpFlagRefill) != 0
-                            ? tcu_tmem_op_ctl_desc_id(shift_control)
+        auto tmem_control_word = rs2_data.at(thread_start).u32;
+        tpuArgs.window_id = tcu_tmem_op_ctl_window_id(tmem_control_word);
+        auto shift_flags = tcu_tmem_op_ctl_flags(tmem_control_word);
+        auto refill_desc_id = (shift_flags & kTcuTmemOpFlagRefill) != 0
+                            ? tcu_tmem_op_ctl_desc_id(tmem_control_word)
                             : 0;
         auto async_id = core_->tmem_shift(wid, handle, tpuArgs.window_id, refill_desc_id);
         for (uint32_t t = thread_start; t < num_threads; ++t) {
@@ -1582,11 +1586,14 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       case TcuType::MMA_LOAD: {
         resolve_mma_descriptor(core_, &tpuArgs);
         auto handle = rs1_data.at(thread_start).u32;
-        auto control = rs2_data.at(thread_start).u32;
-        tpuArgs.target = tcu_mma_mem_ctl_target(control);
-        tpuArgs.slot_id = tcu_mma_mem_ctl_slot_id(control);
-        tpuArgs.window_id = tcu_mma_mem_ctl_window_id(control);
-        tpuArgs.tile_id = tcu_mma_mem_ctl_tile_id(control);
+        auto mma_memory_control_word = rs2_data.at(thread_start).u32;
+        tpuArgs.target = tcu_mma_mem_ctl_target(mma_memory_control_word);
+        tpuArgs.slot_id = tcu_mma_mem_ctl_slot_id(mma_memory_control_word);
+        tpuArgs.window_id = tcu_mma_mem_ctl_window_id(mma_memory_control_word);
+        tpuArgs.tile_id = tcu_mma_mem_ctl_tile_id(mma_memory_control_word);
+        // MMA_LOAD resolves one logical tensor-memory tile into local operand
+        // slot state. Actual TMEM packet progression and local line writes are
+        // handled by TensorUnit after this macro-op is admitted.
         tensor_unit_->mma_load(wid, handle, tpuArgs, trace_data.get());
         if (trace_data->retry) {
           core_->set_stall_reason(wid, WarpStallReason::AsyncTensor);
@@ -1597,11 +1604,11 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       case TcuType::MMA_STORE: {
         resolve_mma_descriptor(core_, &tpuArgs);
         auto handle = rs1_data.at(thread_start).u32;
-        auto control = rs2_data.at(thread_start).u32;
-        tpuArgs.target = tcu_mma_mem_ctl_target(control);
-        tpuArgs.slot_id = tcu_mma_mem_ctl_slot_id(control);
-        tpuArgs.window_id = tcu_mma_mem_ctl_window_id(control);
-        tpuArgs.tile_id = tcu_mma_mem_ctl_tile_id(control);
+        auto mma_memory_control_word = rs2_data.at(thread_start).u32;
+        tpuArgs.target = tcu_mma_mem_ctl_target(mma_memory_control_word);
+        tpuArgs.slot_id = tcu_mma_mem_ctl_slot_id(mma_memory_control_word);
+        tpuArgs.window_id = tcu_mma_mem_ctl_window_id(mma_memory_control_word);
+        tpuArgs.tile_id = tcu_mma_mem_ctl_tile_id(mma_memory_control_word);
         tensor_unit_->mma_store(wid, handle, tpuArgs, trace_data.get());
         if (trace_data->retry) {
           core_->set_stall_reason(wid, WarpStallReason::AsyncTensor);

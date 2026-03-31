@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <vector>
 
+// MetaMem stores one sparse metadata packet per slot. The packet is later read
+// as four 16B logical lines, one line for each A primitive block.
 class MetaMem {
 public:
   using packet_t = std::array<uint8_t, 64>;
@@ -37,11 +39,11 @@ public:
     return 1;
   }
 
-  static constexpr uint32_t fill_beats() {
+  static constexpr uint32_t fill_packets() {
     return 1;
   }
 
-  bool write_fill_beat(uint32_t slot_id, const packet_t& packet) {
+  bool write_fill_packet(uint32_t slot_id, const packet_t& packet) {
     if (slot_id >= kNumSlots) {
       return false;
     }
@@ -54,7 +56,7 @@ public:
     if (slot_id >= kNumSlots || packets.size() < packet_count()) {
       return false;
     }
-    return write_fill_beat(slot_id, packets.front());
+    return write_fill_packet(slot_id, packets.front());
   }
 
   bool fill_tile(const std::vector<packet_t>& packets) {
