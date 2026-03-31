@@ -219,7 +219,7 @@ public:
   void tmem_rel_permit();
   uint32_t tma_load(uint32_t wid, uint32_t handle, uint32_t desc_id, uint32_t window_id = 0);
   uint32_t tma_store(uint32_t wid, uint32_t handle, uint32_t desc_id, uint32_t window_id = 0);
-  uint32_t tmem_shift(uint32_t wid, uint32_t handle, uint32_t window_id = 0, uint32_t refill_desc_id = 0);
+  uint32_t tmem_shift(uint32_t wid, uint32_t handle, uint32_t window_id = 0, uint32_t refill_descriptor_id = 0);
   uint32_t mma_load_async_issue(uint32_t wid, uint32_t handle, uint32_t desc_id);
   uint32_t mma_store_async_issue(uint32_t wid, uint32_t handle, uint32_t desc_id);
   uint32_t wmma_async_issue(uint32_t wid);
@@ -340,8 +340,16 @@ private:
   };
 
   // AsyncTensorOp models one Core-side asynchronous tensor transaction.
-  // TMA load/store and TMEM shift are advanced here cycle by cycle before the
-  // TensorUnit consumes the resulting TMEM-visible state.
+  //
+  // Hardware view:
+  // - issue/launch happens in the execute stage and assigns an async id
+  // - the Core-side async tensor engine then advances launch latency, TMEM
+  //   packet traffic and optional shift-refill traffic one cycle at a time
+  // - the TensorUnit later consumes the resulting TMEM-visible state
+  //
+  // The fields below are grouped by: identity, launch timing, TMEM packet
+  // cursors, logical TMEM regions, and staging buffers used by the async
+  // engine.
   struct AsyncTensorOp {
     uint32_t async_id = 0;
     AsyncTensorOpType type = AsyncTensorOpType::TmaLoad;
@@ -350,13 +358,15 @@ private:
     uint32_t handle = 0;
     uint32_t descriptor_id = 0;
     uint32_t window_id = 0;
-    uint32_t refill_desc_id = 0;
+    uint32_t refill_descriptor_id = 0;
     uint64_t issue_cycle = 0;
     uint64_t first_service_cycle = 0;
     bool completed = false;
     bool committed = false;
     uint32_t barrier_id = 0;
     bool transaction_initialized = false;
+    // Remaining fixed launch/setup latency before the first TMEM packet may
+    // move. This models hardware launch delay, not packet transfer time.
     uint32_t remaining_launch_cycles = 0;
     uint32_t remaining_tmem_read_packets = 0;
     uint32_t remaining_tmem_write_packets = 0;
@@ -364,18 +374,18 @@ private:
     uint32_t next_meta_packet_idx = 0;
     uint32_t payload_size_bytes = 0;
     uint32_t meta_size_bytes = 0;
-    uint32_t refill_size_bytes = 0;
-    uint32_t transfer_col_base = 0;
-    uint32_t transfer_col_span = 0;
-    uint32_t meta_col_base = 0;
-    uint32_t meta_col_span = 0;
+    uint32_t refill_math_row_bytes = 0;
+    uint32_t transfer_region_col_base = 0;
+    uint32_t transfer_region_col_span = 0;
+    uint32_t meta_region_col_base = 0;
+    uint32_t meta_region_col_span = 0;
     bool use_meta_region = false;
-    bool shift_body_applied = false;
+    bool main_shift_body_complete = false;
     TmaDescriptor tma_desc = {};
-    std::vector<uint8_t> payload_buffer;
-    std::vector<uint8_t> meta_buffer;
-    uint32_t remaining_refill_write_packets = 0;
-    uint32_t next_refill_packet_idx = 0;
+    std::vector<uint8_t> payload_staging_buffer;
+    std::vector<uint8_t> meta_staging_buffer;
+    uint32_t remaining_refill_line_packets = 0;
+    uint32_t next_refill_line_packet_idx = 0;
   };
 
   struct MBarrierEntry {
@@ -403,7 +413,7 @@ private:
   uint32_t next_async_id_;
 
   void advance_async_tensor_engine();
-  void advance_async_tensor_transaction(AsyncTensorOp& op);
+  void advance_one_async_tensor_transaction(AsyncTensorOp& op);
   void finalize_async_tensor_op(AsyncTensorOp& op);
   void resume_async_waiters(uint32_t async_id);
   WarpMask warpgroup_mask(uint32_t wgid) const;

@@ -25,6 +25,12 @@ using namespace vortex;
 
 namespace {
 
+// Tmem.cpp implements the back half of the tensor-memory path:
+// - logical TMEM allocations and planned windows
+// - logical (column, line) to physical (bank, row, byte) mapping
+// - per-cycle ingress/egress arbitration
+// - logical-line and math-row shift helpers used by TMEM_SHIFT
+
 uint32_t configured_tmem_bank_count() {
   constexpr uint32_t kDefault = Tmem::kDefaultPhysicalBanks;
   auto value = std::getenv("VORTEX_SIMX_TMEM_BANKS");
@@ -520,13 +526,16 @@ bool Tmem::window_packet_location(uint32_t handle,
   return true;
 }
 
-bool Tmem::window_line_chunk_location(uint32_t handle,
-                                      uint32_t window_id,
-                                      uint32_t line_idx,
-                                      uint32_t chunk_idx,
-                                      uint32_t* logical_col_base,
-                                      uint32_t* logical_line_base,
-                                      uint32_t* logical_col_span) const {
+// Resolve one logical line chunk within a planned window into an absolute
+// logical TMEM region. This is used by top-line refill traffic, which is
+// expressed as line chunks rather than generic tile packets.
+bool Tmem::resolve_window_line_chunk_region(uint32_t handle,
+                                            uint32_t window_id,
+                                            uint32_t line_idx,
+                                            uint32_t chunk_idx,
+                                            uint32_t* logical_col_base,
+                                            uint32_t* logical_line_base,
+                                            uint32_t* logical_col_span) const {
   const TmemAllocation* allocation = nullptr;
   const TmemWindowPlan* window = nullptr;
   if (!lookup_allocation(handle, &allocation)
@@ -563,14 +572,17 @@ bool Tmem::window_line_chunk_location(uint32_t handle,
   return true;
 }
 
-bool Tmem::window_linear_packet_info(uint32_t handle,
-                                     uint32_t window_id,
-                                     uint32_t packet_idx,
-                                     uint32_t* logical_col_base,
-                                     uint32_t* logical_line_base,
-                                     uint32_t* logical_col_span,
-                                     uint32_t* byte_offset,
-                                     uint32_t* valid_bytes) const {
+// Resolve one packet in the window-linear view used by legacy traffic and
+// line-oriented refill helpers. The returned byte_offset/valid_bytes describe
+// where this packet falls inside the window's logical rectangle.
+bool Tmem::resolve_window_linear_packet_region(uint32_t handle,
+                                               uint32_t window_id,
+                                               uint32_t packet_idx,
+                                               uint32_t* logical_col_base,
+                                               uint32_t* logical_line_base,
+                                               uint32_t* logical_col_span,
+                                               uint32_t* byte_offset,
+                                               uint32_t* valid_bytes) const {
   const TmemAllocation* allocation = nullptr;
   const TmemWindowPlan* window = nullptr;
   if (!lookup_allocation(handle, &allocation)
@@ -652,7 +664,7 @@ bool Tmem::read_window_linear_packet(uint32_t handle, uint32_t window_id, uint32
   uint32_t col_span = 0;
   uint32_t byte_offset = 0;
   uint32_t valid_bytes = 0;
-  if (!window_linear_packet_info(handle, window_id, packet_idx,
+  if (!resolve_window_linear_packet_region(handle, window_id, packet_idx,
                                  &col_base, &line_base, &col_span,
                                  &byte_offset, &valid_bytes)) {
     return false;
@@ -673,7 +685,7 @@ bool Tmem::write_window_linear_packet(uint32_t handle, uint32_t window_id, uint3
   uint32_t col_span = 0;
   uint32_t byte_offset = 0;
   uint32_t valid_bytes = 0;
-  if (!window_linear_packet_info(handle, window_id, packet_idx,
+  if (!resolve_window_linear_packet_region(handle, window_id, packet_idx,
                                  &col_base, &line_base, &col_span,
                                  &byte_offset, &valid_bytes)) {
     return false;
@@ -729,7 +741,7 @@ bool Tmem::write_window_line_chunk(uint32_t handle,
   uint32_t col_base = 0;
   uint32_t line_base = 0;
   uint32_t col_span = 0;
-  if (!window_line_chunk_location(handle, window_id, line_idx, chunk_idx, &col_base, &line_base, &col_span)) {
+  if (!resolve_window_line_chunk_region(handle, window_id, line_idx, chunk_idx, &col_base, &line_base, &col_span)) {
     return false;
   }
   for (uint32_t col = 0; col < col_span; ++col) {
@@ -739,7 +751,10 @@ bool Tmem::write_window_line_chunk(uint32_t handle,
   return true;
 }
 
-bool Tmem::shift_window_down(uint32_t handle, uint32_t window_id) {
+// Shift the raw logical TMEM lines inside one window down by one line. This
+// helper is only correct for windows whose external semantics already match
+// logical TMEM lines.
+bool Tmem::shift_window_logical_lines_down(uint32_t handle, uint32_t window_id) {
   const TmemAllocation* allocation = nullptr;
   const TmemWindowPlan* window = nullptr;
   if (!lookup_allocation(handle, &allocation) || !lookup_window(handle, window_id, &window)) {
@@ -767,10 +782,14 @@ bool Tmem::shift_window_down(uint32_t handle, uint32_t window_id) {
   return true;
 }
 
-bool Tmem::shift_window_math_row_down(uint32_t handle,
-                                      uint32_t window_id,
-                                      const uint8_t* refill_row,
-                                      uint32_t refill_size_bytes) {
+// Shift one window down by one mathematical matrix row. When the window uses a
+// math-packet adapter, TMEM reconstructs the mathematical image, performs the
+// row shift, optionally writes a refill top row, then repacks packets back into
+// the TMEM window layout.
+bool Tmem::shift_window_math_rows_down(uint32_t handle,
+                                       uint32_t window_id,
+                                       const uint8_t* refill_math_row,
+                                       uint32_t refill_math_row_bytes) {
   const TmemAllocation* allocation = nullptr;
   const TmemWindowPlan* window = nullptr;
   if (!lookup_allocation(handle, &allocation) || !lookup_window(handle, window_id, &window)) {
@@ -779,15 +798,15 @@ bool Tmem::shift_window_math_row_down(uint32_t handle,
 
   auto elem_bytes = fmt_bytes(window->fmt);
   if (0 == elem_bytes || window->elem_shape.empty() || !TmemWindowPlanner::uses_math_packet_adapter(*window)) {
-    if (!shift_window_down(handle, window_id)) {
+    if (!shift_window_logical_lines_down(handle, window_id)) {
       return false;
     }
-    if (refill_row != nullptr && refill_size_bytes != 0) {
+    if (refill_math_row != nullptr && refill_math_row_bytes != 0) {
       auto col_base = resolve_window_col_base(*allocation, *window);
       auto top_line = window->logical_line_base;
-      auto copy_bytes = std::min<uint32_t>(window->logical_col_span, refill_size_bytes);
+      auto copy_bytes = std::min<uint32_t>(window->logical_col_span, refill_math_row_bytes);
       for (uint32_t i = 0; i < copy_bytes; ++i) {
-        write_logical_byte(col_base + i, top_line, refill_row[i]);
+        write_logical_byte(col_base + i, top_line, refill_math_row[i]);
       }
     }
     assert_valid();
@@ -815,8 +834,8 @@ bool Tmem::shift_window_math_row_down(uint32_t handle,
     std::memmove(math_bytes.data() + row_bytes, math_bytes.data(), (rows - 1) * row_bytes);
   }
   std::fill_n(math_bytes.data(), row_bytes, 0);
-  if (refill_row != nullptr && refill_size_bytes != 0) {
-    std::copy_n(refill_row, std::min<uint32_t>(row_bytes, refill_size_bytes), math_bytes.data());
+  if (refill_math_row != nullptr && refill_math_row_bytes != 0) {
+    std::copy_n(refill_math_row, std::min<uint32_t>(row_bytes, refill_math_row_bytes), math_bytes.data());
   }
 
   for (uint32_t tile_idx = 0; tile_idx < window->tile_count; ++tile_idx) {
@@ -1114,7 +1133,7 @@ bool Tmem::try_acquire_window_linear_packet(uint64_t cycle,
   uint32_t col_span = 0;
   uint32_t byte_offset = 0;
   uint32_t valid_bytes = 0;
-  if (!window_linear_packet_info(handle, window_id, packet_idx,
+  if (!resolve_window_linear_packet_region(handle, window_id, packet_idx,
                                  &col_base, &line_base, &col_span,
                                  &byte_offset, &valid_bytes)) {
     return false;
@@ -1159,7 +1178,7 @@ bool Tmem::try_acquire_window_line_chunk(uint64_t cycle,
   uint32_t col_base = 0;
   uint32_t line_base = 0;
   uint32_t col_span = 0;
-  if (!window_line_chunk_location(handle, window_id, line_idx, chunk_idx, &col_base, &line_base, &col_span)) {
+  if (!resolve_window_line_chunk_region(handle, window_id, line_idx, chunk_idx, &col_base, &line_base, &col_span)) {
     return false;
   }
 
@@ -1234,7 +1253,7 @@ void Tmem::refund_window_linear_packet(uint64_t cycle,
   uint32_t col_span = 0;
   uint32_t byte_offset = 0;
   uint32_t valid_bytes = 0;
-  if (!window_linear_packet_info(handle, window_id, packet_idx,
+  if (!resolve_window_linear_packet_region(handle, window_id, packet_idx,
                                  &col_base, &line_base, &col_span,
                                  &byte_offset, &valid_bytes)) {
     return;
@@ -1271,7 +1290,7 @@ void Tmem::refund_window_line_chunk(uint64_t cycle,
   uint32_t col_base = 0;
   uint32_t line_base = 0;
   uint32_t col_span = 0;
-  if (!window_line_chunk_location(handle, window_id, line_idx, chunk_idx, &col_base, &line_base, &col_span)) {
+  if (!resolve_window_line_chunk_region(handle, window_id, line_idx, chunk_idx, &col_base, &line_base, &col_span)) {
     return;
   }
   auto& packet_budget = write ? write_packet_budget_ : read_packet_budget_;

@@ -31,6 +31,15 @@ using namespace vortex;
 
 namespace {
 
+// Core.cpp owns the front half of the tensor path:
+// - descriptor interpretation and default window planning
+// - Core-side asynchronous tensor transactions (TMA/TMEM_SHIFT)
+// - the packet adapter between mathematical row-major windows and TMEM
+//   window packets
+//
+// TensorUnit later consumes TMEM-visible state and advances the local operand
+// memories and TensorCore pipeline.
+
 uint32_t ceil_div(uint32_t value, uint32_t divisor) {
   return (value + divisor - 1) / divisor;
 }
@@ -267,9 +276,9 @@ bool build_sparse_meta_window_plan(const TmaDescriptor& desc,
 
 TmemWindowPlan build_legacy_window_plan(uint32_t window_id,
                                         const TmaDescriptor& desc,
-                                        uint32_t transfer_col_base,
-                                        uint32_t transfer_col_span) {
-  (void)transfer_col_base;
+                                        uint32_t transfer_region_col_base,
+                                        uint32_t transfer_region_col_span) {
+  (void)transfer_region_col_base;
   TmemWindowPlan window{};
   auto shape = TensorShape2D{desc.rows, desc.cols};
   auto fmt = infer_window_fmt(desc);
@@ -292,7 +301,7 @@ TmemWindowPlan build_legacy_window_plan(uint32_t window_id,
     window.target = map_window_target(desc);
   }
   if (!built_from_shape) {
-    auto packet_line_bytes = std::min<uint32_t>(Tmem::kPacketBytes, std::max<uint32_t>(1, transfer_col_span));
+    auto packet_line_bytes = std::min<uint32_t>(Tmem::kPacketBytes, std::max<uint32_t>(1, transfer_region_col_span));
     window.logical_col_span = packet_line_bytes;
     window.logical_line_span = std::max<uint32_t>(1, ceil_div(std::max<uint32_t>(1, desc.size_bytes), packet_line_bytes));
     window.logical_tile_col_span = packet_line_bytes;
@@ -380,26 +389,26 @@ bool place_window_after_existing(const TmemAllocation& allocation,
       && (window->logical_line_base + window->logical_line_span) <= TmemWindowPlanner::kLogicalLines;
 }
 
-void pack_math_window_packet(const TmemWindowPlan& window,
-                             const std::vector<uint8_t>& payload,
-                             uint32_t packet_idx,
-                             TmemPacket* out) {
+void encode_math_window_packet(const TmemWindowPlan& window,
+                               const std::vector<uint8_t>& math_window_bytes,
+                               uint32_t packet_idx,
+                               TmemPacket* out) {
   if (nullptr == out) {
     return;
   }
-  if (!TmemWindowPlanner::pack_math_packet(window, payload, packet_idx, &out->bytes)) {
+  if (!TmemWindowPlanner::pack_math_packet(window, math_window_bytes, packet_idx, &out->bytes)) {
     out->bytes.fill(0);
   }
 }
 
-void unpack_math_window_packet(const TmemWindowPlan& window,
+void decode_math_window_packet(const TmemWindowPlan& window,
                                uint32_t packet_idx,
                                const TmemPacket& packet,
-                               std::vector<uint8_t>* payload) {
-  if (nullptr == payload) {
+                               std::vector<uint8_t>* math_window_bytes) {
+  if (nullptr == math_window_bytes) {
     return;
   }
-  (void)TmemWindowPlanner::unpack_math_packet(window, packet_idx, packet.bytes, payload);
+  (void)TmemWindowPlanner::unpack_math_packet(window, packet_idx, packet.bytes, math_window_bytes);
 }
 
 }
@@ -1033,28 +1042,28 @@ void Core::initialize_async_tensor_transaction(AsyncTensorOp& op) {
     }
     op.tma_desc = desc;
     op.use_meta_region = (static_cast<TcuPayloadKind>(desc.payload_kind) == TcuPayloadKind::SparseMeta);
-    op.transfer_col_base = op.use_meta_region ? desc.meta_tmem_base : desc.tmem_base;
-    op.transfer_col_span = op.use_meta_region ? desc.meta_col_span : desc.bank_span;
-    if (0 == op.transfer_col_span) {
+    op.transfer_region_col_base = op.use_meta_region ? desc.meta_tmem_base : desc.tmem_base;
+    op.transfer_region_col_span = op.use_meta_region ? desc.meta_col_span : desc.bank_span;
+    if (0 == op.transfer_region_col_span) {
       const TmemAllocation* allocation = nullptr;
       if (!lookup_tmem_allocation(op.handle, &allocation)) {
         op.completed = true;
         op.transaction_initialized = true;
         return;
       }
-      op.transfer_col_base = allocation->payload_col_base;
-      op.transfer_col_span = allocation->col_span;
+      op.transfer_region_col_base = allocation->payload_col_base;
+      op.transfer_region_col_span = allocation->col_span;
     }
 
     uint32_t capacity = 0;
-    if (!tmem_region_query(op.transfer_col_base, op.transfer_col_span, &capacity)) {
+    if (!tmem_region_query(op.transfer_region_col_base, op.transfer_region_col_span, &capacity)) {
       op.completed = true;
       op.transaction_initialized = true;
       return;
     }
 
     auto legacy_window = build_legacy_window_plan(op.window_id, op.tma_desc,
-                                                  op.transfer_col_base, op.transfer_col_span);
+                                                  op.transfer_region_col_base, op.transfer_region_col_span);
     const TmemWindowPlan* existing_window = nullptr;
     bool preserve_payload_window = tmem_.lookup_window(op.handle, op.window_id, &existing_window)
                                 && preserve_existing_math_window(existing_window, op.tma_desc);
@@ -1100,7 +1109,7 @@ void Core::initialize_async_tensor_transaction(AsyncTensorOp& op) {
     op.payload_size_bytes = std::min<uint32_t>(tma_.payload_size_bytes(desc), capacity);
     if (!tma_.load_payload(desc,
                            capacity,
-                           &op.payload_buffer,
+                           &op.payload_staging_buffer,
                            [this](void* data, uint64_t addr, uint32_t size) {
                              this->dcache_read(data, addr, size);
                            })) {
@@ -1114,16 +1123,16 @@ void Core::initialize_async_tensor_transaction(AsyncTensorOp& op) {
                                 && TmemWindowPlanner::uses_math_packet_adapter(*payload_window);
 
     uint32_t meta_packets = 0;
-    op.meta_col_base = desc.meta_tmem_base;
-    op.meta_col_span = desc.meta_col_span;
+    op.meta_region_col_base = desc.meta_tmem_base;
+    op.meta_region_col_span = desc.meta_col_span;
     op.meta_size_bytes = 0;
-    op.meta_buffer.clear();
+    op.meta_staging_buffer.clear();
     if (!op.use_meta_region && desc.meta_addr != 0 && desc.meta_size_bytes != 0 && desc.meta_col_span != 0) {
       uint32_t meta_capacity = 0;
-      if (!tmem_region_query(op.meta_col_base, op.meta_col_span, &meta_capacity)
+      if (!tmem_region_query(op.meta_region_col_base, op.meta_region_col_span, &meta_capacity)
        || !tma_.load_meta(desc,
                           meta_capacity,
-                          &op.meta_buffer,
+                          &op.meta_staging_buffer,
                           [this](void* data, uint64_t addr, uint32_t size) {
                             this->dcache_read(data, addr, size);
                           })) {
@@ -1167,28 +1176,28 @@ void Core::initialize_async_tensor_transaction(AsyncTensorOp& op) {
     }
     op.tma_desc = desc;
     op.use_meta_region = (static_cast<TcuPayloadKind>(desc.payload_kind) == TcuPayloadKind::SparseMeta);
-    op.transfer_col_base = op.use_meta_region ? desc.meta_tmem_base : desc.tmem_base;
-    op.transfer_col_span = op.use_meta_region ? desc.meta_col_span : desc.bank_span;
-    if (0 == op.transfer_col_span) {
+    op.transfer_region_col_base = op.use_meta_region ? desc.meta_tmem_base : desc.tmem_base;
+    op.transfer_region_col_span = op.use_meta_region ? desc.meta_col_span : desc.bank_span;
+    if (0 == op.transfer_region_col_span) {
       const TmemAllocation* allocation = nullptr;
       if (!lookup_tmem_allocation(op.handle, &allocation)) {
         op.completed = true;
         op.transaction_initialized = true;
         return;
       }
-      op.transfer_col_base = allocation->payload_col_base;
-      op.transfer_col_span = allocation->col_span;
+      op.transfer_region_col_base = allocation->payload_col_base;
+      op.transfer_region_col_span = allocation->col_span;
     }
 
     uint32_t capacity = 0;
-    if (!tmem_region_query(op.transfer_col_base, op.transfer_col_span, &capacity)) {
+    if (!tmem_region_query(op.transfer_region_col_base, op.transfer_region_col_span, &capacity)) {
       op.completed = true;
       op.transaction_initialized = true;
       return;
     }
 
     auto legacy_window = build_legacy_window_plan(op.window_id, op.tma_desc,
-                                                  op.transfer_col_base, op.transfer_col_span);
+                                                  op.transfer_region_col_base, op.transfer_region_col_span);
     const TmemWindowPlan* existing_window = nullptr;
     bool preserve_payload_window = tmem_.lookup_window(op.handle, op.window_id, &existing_window)
                                 && preserve_existing_math_window(existing_window, op.tma_desc);
@@ -1236,7 +1245,7 @@ void Core::initialize_async_tensor_transaction(AsyncTensorOp& op) {
     bool use_math_payload_window = tmem_.lookup_window(op.handle, op.window_id, &payload_window)
                                 && TmemWindowPlanner::uses_math_packet_adapter(*payload_window);
     if (use_math_payload_window) {
-      op.payload_buffer.assign(op.payload_size_bytes, 0);
+      op.payload_staging_buffer.assign(op.payload_size_bytes, 0);
     }
     uint32_t payload_packets = 0;
     if (use_math_payload_window) {
@@ -1270,7 +1279,7 @@ void Core::initialize_async_tensor_transaction(AsyncTensorOp& op) {
     }
     op.remaining_tmem_read_packets = packets;
     op.remaining_tmem_write_packets = packets;
-    if (op.refill_desc_id != 0) {
+    if (op.refill_descriptor_id != 0) {
       const TmemWindowPlan* window = nullptr;
       uint32_t math_row_bytes = 0;
       if (!tmem_.lookup_window(op.handle, op.window_id, &window)
@@ -1284,17 +1293,17 @@ void Core::initialize_async_tensor_transaction(AsyncTensorOp& op) {
         math_row_bytes = window->logical_col_span;
       }
       TmaDescriptor desc;
-      if (!read_tma_descriptor(op.refill_desc_id, &desc)
+      if (!read_tma_descriptor(op.refill_descriptor_id, &desc)
        || desc.rows != 1) {
         op.completed = true;
         op.transaction_initialized = true;
         return;
       }
       op.tma_desc = desc;
-      op.refill_size_bytes = std::min<uint32_t>(tma_.payload_size_bytes(desc), math_row_bytes);
+      op.refill_math_row_bytes = std::min<uint32_t>(tma_.payload_size_bytes(desc), math_row_bytes);
       if (!tma_.load_payload(desc,
                              math_row_bytes,
-                             &op.payload_buffer,
+                             &op.payload_staging_buffer,
                              [this](void* data, uint64_t addr, uint32_t size) {
                                this->dcache_read(data, addr, size);
                              })) {
@@ -1303,7 +1312,7 @@ void Core::initialize_async_tensor_transaction(AsyncTensorOp& op) {
         return;
       }
       op.remaining_launch_cycles = tma_.estimate_load_latency(desc);
-      op.remaining_refill_write_packets = (op.refill_size_bytes + Tmem::kPacketBytes - 1) / Tmem::kPacketBytes;
+      op.remaining_refill_line_packets = (op.refill_math_row_bytes + Tmem::kPacketBytes - 1) / Tmem::kPacketBytes;
     }
   } break;
   case AsyncTensorOpType::MmaLoad:
@@ -1660,7 +1669,14 @@ void Core::finalize_async_tensor_op(AsyncTensorOp& op) {
   try_complete_mbarrier(op.barrier_id);
 }
 
-void Core::advance_async_tensor_transaction(AsyncTensorOp& op) {
+// Advance one already-issued Core-side async tensor transaction by one cycle.
+//
+// Hardware view:
+// - consume fixed launch/setup latency first
+// - then move at most one TMEM packet (or one refill line packet) per cycle
+//   subject to TMEM ingress/egress and bank availability
+// - mark TMEM-visible state ready only after the final required packet lands
+void Core::advance_one_async_tensor_transaction(AsyncTensorOp& op) {
   initialize_async_tensor_transaction(op);
   if (op.completed) {
     finalize_async_tensor_op(op);
@@ -1709,9 +1725,9 @@ void Core::advance_async_tensor_transaction(AsyncTensorOp& op) {
           }
           TmemPacket packet;
           if (use_math_payload_window) {
-            pack_math_window_packet(*payload_window, op.payload_buffer, op.next_payload_packet_idx, &packet);
+            encode_math_window_packet(*payload_window, op.payload_staging_buffer, op.next_payload_packet_idx, &packet);
           } else {
-            packet = make_packet(op.payload_buffer, op.next_payload_packet_idx);
+            packet = make_packet(op.payload_staging_buffer, op.next_payload_packet_idx);
           }
           bool written = use_math_payload_window
                        ? tmem_.write_window_packet(op.handle, op.window_id, op.next_payload_packet_idx, packet)
@@ -1743,22 +1759,22 @@ void Core::advance_async_tensor_transaction(AsyncTensorOp& op) {
                         ? (use_math_meta_window
                             ? try_acquire_tmem_window_write_port(op.handle, meta_shadow_window_id(op.window_id), op.next_meta_packet_idx)
                             : try_acquire_tmem_window_linear_write_port(op.handle, meta_shadow_window_id(op.window_id), op.next_meta_packet_idx))
-                        : try_acquire_tmem_region_write_port(op.meta_col_base, op.meta_col_span, op.next_meta_packet_idx);
+                        : try_acquire_tmem_region_write_port(op.meta_region_col_base, op.meta_region_col_span, op.next_meta_packet_idx);
           if (!acquired) {
             ++perf_stats_.stall_tmem_write_port_busy;
             return;
           }
           TmemPacket packet;
           if (use_math_meta_window) {
-            pack_math_window_packet(*meta_window, op.meta_buffer, op.next_meta_packet_idx, &packet);
+            encode_math_window_packet(*meta_window, op.meta_staging_buffer, op.next_meta_packet_idx, &packet);
           } else {
-            packet = make_packet(op.meta_buffer, op.next_meta_packet_idx);
+            packet = make_packet(op.meta_staging_buffer, op.next_meta_packet_idx);
           }
           bool written = use_meta_window
                        ? (use_math_meta_window
                           ? tmem_.write_window_packet(op.handle, meta_shadow_window_id(op.window_id), op.next_meta_packet_idx, packet)
                           : tmem_.write_window_linear_packet(op.handle, meta_shadow_window_id(op.window_id), op.next_meta_packet_idx, packet))
-                       : tmem_.region_write_packet(op.meta_col_base, op.meta_col_span, op.next_meta_packet_idx, packet);
+                       : tmem_.region_write_packet(op.meta_region_col_base, op.meta_region_col_span, op.next_meta_packet_idx, packet);
           if (!written) {
             op.completed = true;
             finalize_async_tensor_op(op);
@@ -1796,7 +1812,7 @@ void Core::advance_async_tensor_transaction(AsyncTensorOp& op) {
           return;
         }
         if (use_math_payload_window) {
-          unpack_math_window_packet(*payload_window, op.next_payload_packet_idx, packet, &op.payload_buffer);
+          decode_math_window_packet(*payload_window, op.next_payload_packet_idx, packet, &op.payload_staging_buffer);
         } else {
           auto offset = op.next_payload_packet_idx * Tmem::kPacketBytes;
           auto valid_bytes = std::min<uint32_t>(Tmem::kPacketBytes, op.payload_size_bytes - offset);
@@ -1810,9 +1826,9 @@ void Core::advance_async_tensor_transaction(AsyncTensorOp& op) {
         ++op.next_payload_packet_idx;
         --op.remaining_tmem_read_packets;
         if (0 == op.remaining_tmem_read_packets) {
-          if (use_math_payload_window && !op.payload_buffer.empty()) {
+          if (use_math_payload_window && !op.payload_staging_buffer.empty()) {
             tma_.store_payload(op.tma_desc,
-                               op.payload_buffer.data(),
+                               op.payload_staging_buffer.data(),
                                op.payload_size_bytes,
                                [this](const void* data, uint64_t addr, uint32_t size) {
                                  this->dcache_write(data, addr, size);
@@ -1846,7 +1862,7 @@ void Core::advance_async_tensor_transaction(AsyncTensorOp& op) {
       return;
     }
     bool use_window = (op.window_id != 0) || tmem_.lookup_window(op.handle, op.window_id, nullptr);
-    if (!op.shift_body_applied) {
+    if (!op.main_shift_body_complete) {
       auto packet_idx = op.next_payload_packet_idx;
       if (op.remaining_tmem_read_packets != 0) {
         bool acquired = use_window
@@ -1883,10 +1899,10 @@ void Core::advance_async_tensor_transaction(AsyncTensorOp& op) {
       if (op.remaining_tmem_read_packets != 0 || op.remaining_tmem_write_packets != 0) {
         return;
       }
-      op.shift_body_applied = true;
-      if (op.remaining_refill_write_packets == 0) {
+      op.main_shift_body_complete = true;
+      if (op.remaining_refill_line_packets == 0) {
         bool shifted = use_window
-                     ? tmem_.shift_window_math_row_down(op.handle, op.window_id, nullptr, 0)
+                     ? tmem_.shift_window_math_rows_down(op.handle, op.window_id, nullptr, 0)
                      : tmem_region_shift_down(allocation->payload_col_base, allocation->col_span, allocation->row_bytes);
         if (!shifted) {
           op.completed = true;
@@ -1900,8 +1916,8 @@ void Core::advance_async_tensor_transaction(AsyncTensorOp& op) {
       }
     }
 
-    if (op.remaining_refill_write_packets != 0) {
-      auto chunk_idx = op.next_refill_packet_idx;
+    if (op.remaining_refill_line_packets != 0) {
+      auto chunk_idx = op.next_refill_line_packet_idx;
       bool acquired = use_window
                     ? try_acquire_tmem_window_write_port(op.handle, op.window_id, chunk_idx)
                     : try_acquire_tmem_region_write_port(allocation->payload_col_base, allocation->col_span, chunk_idx);
@@ -1909,15 +1925,15 @@ void Core::advance_async_tensor_transaction(AsyncTensorOp& op) {
         ++perf_stats_.stall_tmem_write_port_busy;
         return;
       }
-      ++op.next_refill_packet_idx;
-      --op.remaining_refill_write_packets;
-      if (op.remaining_refill_write_packets != 0) {
+      ++op.next_refill_line_packet_idx;
+      --op.remaining_refill_line_packets;
+      if (op.remaining_refill_line_packets != 0) {
         return;
       }
       bool shifted = use_window
-                   ? tmem_.shift_window_math_row_down(op.handle, op.window_id,
-                                                      op.payload_buffer.data(),
-                                                      op.refill_size_bytes)
+                   ? tmem_.shift_window_math_rows_down(op.handle, op.window_id,
+                                                      op.payload_staging_buffer.data(),
+                                                      op.refill_math_row_bytes)
                    : tmem_region_shift_down(allocation->payload_col_base, allocation->col_span, allocation->row_bytes);
       if (!shifted) {
         op.completed = true;
@@ -1948,7 +1964,7 @@ void Core::advance_async_tensor_engine() {
   for (auto& entry : async_tensor_ops_) {
     auto& op = entry.second;
     if (!op.completed && perf_stats_.cycles >= op.first_service_cycle) {
-      advance_async_tensor_transaction(op);
+      advance_one_async_tensor_transaction(op);
     }
   }
 }
@@ -2032,7 +2048,7 @@ uint32_t Core::tma_store(uint32_t wid, uint32_t handle, uint32_t desc_id, uint32
   return async_id;
 }
 
-uint32_t Core::tmem_shift(uint32_t wid, uint32_t handle, uint32_t window_id, uint32_t refill_desc_id) {
+uint32_t Core::tmem_shift(uint32_t wid, uint32_t handle, uint32_t window_id, uint32_t refill_descriptor_id) {
   advance_async_tensor_engine();
   auto wgid = arch_.warpgroup_id(wid);
   TmemAllocation* allocation = nullptr;
@@ -2048,7 +2064,7 @@ uint32_t Core::tmem_shift(uint32_t wid, uint32_t handle, uint32_t window_id, uin
   op.wgid = wgid;
   op.handle = handle;
   op.window_id = window_id;
-  op.refill_desc_id = refill_desc_id;
+  op.refill_descriptor_id = refill_descriptor_id;
   op.issue_cycle = perf_stats_.cycles;
   op.first_service_cycle = perf_stats_.cycles + 1;
   async_tensor_ops_[async_id] = std::move(op);

@@ -19,6 +19,12 @@
 
 using namespace vortex;
 
+// TmaModel is the descriptor/launch-side front-end of the tensor memory
+// accelerator. It translates software-visible descriptors into staging buffers,
+// launch latency estimates and packet counts. The Core async tensor engine
+// consumes those results later when it drives TMEM ingress/egress cycle by
+// cycle.
+
 TmaModel::TmaModel(bool realistic_load)
   : descriptor_tables_loaded_(false)
   , realistic_load_(realistic_load) {
@@ -117,6 +123,9 @@ bool TmaModel::load_payload(const TmaDescriptor& desc,
                             uint32_t capacity,
                             std::vector<uint8_t>* out,
                             const ReadCallback& dcache_read) const {
+  // TMA payload traffic is still described in mathematical row-major order at
+  // this boundary. Any conversion into TMEM-internal window layout happens
+  // later inside the Core/TMEM packet adapter path.
   if (nullptr == out || !dcache_read) {
     return false;
   }
@@ -135,6 +144,8 @@ bool TmaModel::load_meta(const TmaDescriptor& desc,
                          uint32_t capacity,
                          std::vector<uint8_t>* out,
                          const ReadCallback& dcache_read) const {
+  // Sparse metadata is modeled as a separate row-major byte image here. TMEM
+  // may later place it into a dedicated shadow window.
   if (nullptr == out || !dcache_read || desc.meta_addr == 0 || desc.meta_size_bytes == 0 || desc.meta_col_span == 0) {
     return false;
   }
@@ -151,6 +162,9 @@ void TmaModel::store_payload(const TmaDescriptor& desc,
                              const uint8_t* data,
                              uint32_t size_bytes,
                              const WriteCallback& dcache_write) const {
+  // The TMA front-end stores the mathematical window image back to device
+  // memory. Any TMEM-specific packet layout has already been decoded before
+  // this point.
   if (0 == size_bytes || nullptr == data || !dcache_write) {
     return;
   }

@@ -60,9 +60,16 @@ struct TmemAllocation {
 };
 
 // TMEM models the tensor scratchpad between mathematical matrix windows and
-// the physical banked SRAM array. Clients interact with allocations, windows,
-// packets and logical lines; TMEM resolves those accesses onto banks, rows and
-// per-cycle read/write arbitration.
+// the physical banked SRAM array.
+//
+// The interface is intentionally split into three views:
+// - mathematical windows, tiles and packets owned by TMA / TensorUnit
+// - logical TMEM columns and logical lines used by the window planner
+// - physical banks / rows / byte lanes used by the banked SRAM model
+//
+// Clients operate on allocations, windows, packets and logical lines; TMEM
+// resolves those accesses onto banks, rows and per-cycle read/write
+// arbitration.
 class Tmem {
 public:
   static constexpr uint32_t kPacketBytes = 64;
@@ -124,11 +131,11 @@ public:
   bool window_packet_count(uint32_t handle, uint32_t window_id, uint32_t* count) const;
   bool write_window_line_chunk(uint32_t handle, uint32_t window_id, uint32_t line_idx, uint32_t chunk_idx, const TmemPacket& in);
   bool window_line_chunk_count(uint32_t handle, uint32_t window_id, uint32_t* count) const;
-  bool shift_window_down(uint32_t handle, uint32_t window_id);
-  bool shift_window_math_row_down(uint32_t handle,
-                                  uint32_t window_id,
-                                  const uint8_t* refill_row,
-                                  uint32_t refill_size_bytes);
+  bool shift_window_logical_lines_down(uint32_t handle, uint32_t window_id);
+  bool shift_window_math_rows_down(uint32_t handle,
+                                   uint32_t window_id,
+                                   const uint8_t* refill_math_row,
+                                   uint32_t refill_math_row_bytes);
 
   bool read_packet(uint32_t handle, uint32_t packet_idx, TmemPacket* out) const;
   bool read_meta_packet(uint32_t handle, uint32_t packet_idx, TmemPacket* out) const;
@@ -196,21 +203,21 @@ private:
                               uint32_t* logical_line_base,
                               uint32_t* logical_col_span,
                               uint32_t* logical_line_span) const;
-  bool window_line_chunk_location(uint32_t handle,
-                                  uint32_t window_id,
-                                  uint32_t line_idx,
-                                  uint32_t chunk_idx,
-                                  uint32_t* logical_col_base,
-                                  uint32_t* logical_line_base,
-                                  uint32_t* logical_col_span) const;
-  bool window_linear_packet_info(uint32_t handle,
-                                 uint32_t window_id,
-                                 uint32_t packet_idx,
-                                 uint32_t* logical_col_base,
-                                 uint32_t* logical_line_base,
-                                 uint32_t* logical_col_span,
-                                 uint32_t* byte_offset,
-                                 uint32_t* valid_bytes) const;
+  bool resolve_window_line_chunk_region(uint32_t handle,
+                                        uint32_t window_id,
+                                        uint32_t line_idx,
+                                        uint32_t chunk_idx,
+                                        uint32_t* logical_col_base,
+                                        uint32_t* logical_line_base,
+                                        uint32_t* logical_col_span) const;
+  bool resolve_window_linear_packet_region(uint32_t handle,
+                                           uint32_t window_id,
+                                           uint32_t packet_idx,
+                                           uint32_t* logical_col_base,
+                                           uint32_t* logical_line_base,
+                                           uint32_t* logical_col_span,
+                                           uint32_t* byte_offset,
+                                           uint32_t* valid_bytes) const;
   uint32_t line_chunk_bank(uint32_t logical_line,
                            uint32_t chunk_idx) const;
   uint32_t packet_lane_bank(uint32_t logical_col,

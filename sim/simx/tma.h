@@ -71,9 +71,14 @@ struct MmaDescriptor {
 
 // Front-end TMA timing/descriptor helper.
 //
-// This object models descriptor fetch, launch latency estimation and payload /
-// metadata marshaling. Per-cycle packet progression happens later in
-// Core::advance_async_tensor_engine once an AsyncTensorOp has been issued.
+// Hardware view:
+// - fetch descriptor tables from device memory
+// - estimate launch/setup latency for a TMA transaction
+// - marshal row-major payload / metadata bytes between device memory and the
+//   Core-side async tensor engine
+//
+// Per-cycle TMEM packet progression happens later in Core once an
+// AsyncTensorOp has been issued.
 class TmaModel {
 public:
   using ReadCallback = std::function<void(void*, uint64_t, uint32_t)>;
