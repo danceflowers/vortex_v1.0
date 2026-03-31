@@ -1,9 +1,0 @@
-`verilator_config
-
-lint_off -rule BLKANDNBLK -file "/mnt/d/wode_code_trunk/vortex/third_party/cvfpu/*"
-lint_off -rule UNOPTFLAT -file "/mnt/d/wode_code_trunk/vortex/third_party/cvfpu/*"
-lint_off -file "/mnt/d/wode_code_trunk/vortex/third_party/cvfpu/*"
-
-lint_off -rule BLKANDNBLK -file "/mnt/d/wode_code_trunk/vortex/third_party/hardfloat/*"
-lint_off -rule UNOPTFLAT -file "/mnt/d/wode_code_trunk/vortex/third_party/hardfloat/*"
-lint_off -file "/mnt/d/wode_code_trunk/vortex/third_party/hardfloat/*"

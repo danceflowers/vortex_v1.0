@@ -1,1 +1,0 @@
--std=c++17 -Wall -Wextra -Wfatal-errors -I/mnt/d/wode_code_trunk/vortex/runtime/include -I/mnt/d/wode_code_trunk/vortex/hw -I/include -I/mnt/d/wode_code_trunk/vortex/sim/common -I/mnt/d/wode_code_trunk/vortex/runtime/common -DXLEN_32 -fPIC -DXRTSIM -I/mnt/d/wode_code_trunk/vortex/sim/xrtsim -O2 -DNDEBUG
