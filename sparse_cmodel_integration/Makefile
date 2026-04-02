@@ -41,6 +41,7 @@ TEST_ID  ?= 2
 RM_MODE  ?= RNE
 SEED     ?= 0
 SPARSE_MODE ?= 0
+OUT_PREC ?=
 
 RUN_ARGS := --prec $(PREC) --test $(TEST_ID)
 ifneq ($(RM_MODE),RNE)
@@ -51,6 +52,9 @@ RUN_ARGS += --seed $(SEED)
 endif
 ifneq ($(SPARSE_MODE),0)
 RUN_ARGS += --sparse-mode $(SPARSE_MODE)
+endif
+ifneq ($(OUT_PREC),)
+RUN_ARGS += --out-prec $(OUT_PREC)
 endif
 
 .PHONY: all release debug run run-all test clean rebuild help print-config
@@ -106,6 +110,7 @@ help:
 	@echo   RM_MODE: RNE or RTZ or RDN or RUP or RMM
 	@echo   SEED: unsigned integer
 	@echo   SPARSE_MODE: 0 (dense) | 1 (2:4) | 2 (1:4)
+	@echo   OUT_PREC: FP8_E4M3 or FP8_E5M2 or FP16 or FP32
 	@echo Example:
 	@echo   mingw32-make run PREC=FP16 TEST_ID=2 RM_MODE=RNE
 

@@ -3,7 +3,6 @@
 #include "config_register.h"
 #include "tc_mul_add.h"
 #include "fp_types.h"
-#include "sparse_cmodel.h"
 
 struct TensorCoreTop {
     static constexpr int M = 8, K = 8, N = 8;
@@ -11,11 +10,14 @@ struct TensorCoreTop {
     uint16_t a_in[M][K];
     uint16_t b_in[K][N];
     uint32_t c_in[M][N];
+
     int jobs_completed = 0;
     int set_jobs = 0;
     bool input_loaded = false;
     int cycle_count = 0;
-    uint16_t d_out[M][N];
+
+    uint32_t d_out[M][N];
+    uint32_t d_out_fp22[M][N];
     bool d_valid[M][N];
 
     tc_mul_add tc_dot_product[M][N];
@@ -24,8 +26,9 @@ struct TensorCoreTop {
         for (int i = 0; i < M; i++) {
             for (int j = 0; j < N; j++) {
                 tc_dot_product[i][j].reset();
-                d_valid[i][j] = false;
                 d_out[i][j] = 0;
+                d_out_fp22[i][j] = 0;
+                d_valid[i][j] = false;
             }
         }
         input_loaded = false;
@@ -34,56 +37,28 @@ struct TensorCoreTop {
         jobs_completed = 0;
     }
 
-    void load_inputs(const uint16_t a[M][K], const uint16_t b[K][N],
-                     const uint32_t c[M][N]) {
-        for (int i = 0; i < M; ++i)
-            for (int k = 0; k < K; ++k)
-                a_in[i][k] = a[i][k];
-
-        for (int k = 0; k < K; ++k)
-            for (int j = 0; j < N; ++j)
-                b_in[k][j] = b[k][j];
-
-        for (int i = 0; i < M; ++i)
-            for (int j = 0; j < N; ++j)
-                c_in[i][j] = c[i][j];
-
-        uint32_t sparse_payload[M][K] = {};
-        uint8_t sparse_meta[M][2] = {};
-        const SparseMode mode = g_cfg.sparse_mode;
-        const bool use_sparse_path = (mode != SPARSE_DENSE);
-
-        if (use_sparse_path) {
-            for (int i = 0; i < M; ++i) {
-                prepare_sparse_a_payload_and_meta(a_in[i], mode, g_cfg.precisions.at(0),
-                                                  sparse_payload[i], sparse_meta[i]);
-            }
-        }
-
+    bool in_ready(bool out_ready = true) const {
         for (int i = 0; i < M; i++) {
             for (int j = 0; j < N; j++) {
-                if (use_sparse_path) {
-                    for (int k = 0; k < K; k++) {
-                        tc_dot_product[i][j].mul_add_input.a_in[k] = sparse_payload[i][k];
-                        tc_dot_product[i][j].mul_add_input.b_in[k] = b_in[k][j];
-                    }
-                    tc_dot_product[i][j].mul_add_input.meta[0] = sparse_meta[i][0];
-                    tc_dot_product[i][j].mul_add_input.meta[1] = sparse_meta[i][1];
-                    tc_dot_product[i][j].mul_add_input.a_is_compressed = true;
-                    tc_dot_product[i][j].mul_add_input.meta_valid = true;
-                } else {
-                    for (int k = 0; k < K; k++) {
-                        tc_dot_product[i][j].mul_add_input.a_in[k] = a_in[i][k];
-                        tc_dot_product[i][j].mul_add_input.b_in[k] = b_in[k][j];
-                    }
-                    tc_dot_product[i][j].mul_add_input.meta[0] = 0;
-                    tc_dot_product[i][j].mul_add_input.meta[1] = 0;
-                    tc_dot_product[i][j].mul_add_input.a_is_compressed = false;
-                    tc_dot_product[i][j].mul_add_input.meta_valid = false;
+                if (!tc_dot_product[i][j].in_ready(out_ready)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    void load_inputs(const uint16_t a[M][K],
+                     const uint16_t b[K][N],
+                     const uint32_t c[M][N]) {
+        for (int i = 0; i < M; i++) {
+            for (int j = 0; j < N; j++) {
+                for (int k = 0; k < K; k++) {
+                    tc_dot_product[i][j].mul_add_input.a_in[k] = a[i][k];
+                    tc_dot_product[i][j].mul_add_input.b_in[k] = b[k][j];
                 }
                 tc_dot_product[i][j].mul_add_input.prec = g_cfg.precisions.at(0);
-                tc_dot_product[i][j].mul_add_input.sparse_mode = mode;
-                tc_dot_product[i][j].mul_add_input.c_in = c_in[i][j];
+                tc_dot_product[i][j].mul_add_input.c_in = c[i][j];
                 tc_dot_product[i][j].mul_add_input.input_valid = true;
             }
         }
@@ -106,40 +81,35 @@ struct TensorCoreTop {
         }
     }
 
-    bool in_ready(bool out_ready = true)    const{
-        for (int i = 0;i < M; i++)  {
-            for (int j = 0;i < N; j++)  {
-                if(!tc_dot_product[i][j].in_ready(out_ready)){
-                    return  false;
+    bool run() {
+        tick(true);
+        bool all_done = true;
+        for (int i = 0; i < M && all_done; i++) {
+            for (int j = 0; j < N && all_done; j++) {
+                if (!tc_dot_product[i][j].out_valid()) {
+                    all_done = false;
                 }
             }
         }
-        return  true;
-    }
 
-    bool run() {
-        bool all_done = false;
-        tick(true);
-        all_done = true;
-        for (int i = 0; i < M && all_done; i++)
-            for (int j = 0; j < N && all_done; j++)
-                if (!tc_dot_product[i][j].out_valid()) all_done = false;
         if (all_done) {
             jobs_completed++;
-            for (int i = 0; i < M; i++)
+            for (int i = 0; i < M; i++) {
                 for (int j = 0; j < N; j++) {
                     d_out[i][j] = tc_dot_product[i][j].out_data();
+                    d_out_fp22[i][j] = tc_dot_product[i][j].out_fp22_data();
                     d_valid[i][j] = true;
                 }
+            }
         }
+
         return all_done;
     }
 };
 
 inline void reference_matmul(const uint16_t a_fp9[8][8], const uint16_t b_fp9[8][8],
                              const uint32_t c_fp22[8][8], double d_fp[8][8],
-                             RoundingMode rm = RNE)
-{
+                             RoundingMode rm = RNE) {
     (void)rm;
     for (int i = 0; i < 8; i++) {
         for (int j = 0; j < 8; j++) {

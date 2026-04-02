@@ -393,6 +393,24 @@ inline uint32_t fp22_to_fp32(uint32_t fp22) {
     return ((uint32_t)s << 31) | ((uint32_t)e << 23) | ((uint32_t)m << 10);
 }
 
+inline uint32_t convert_fp22_to_out(uint32_t fp22,
+                                    PrecisionType out_prec,
+                                    RoundingMode rm = RNE) {
+    switch (out_prec) {
+        case PREC_FP8_E4M3:
+            return (uint32_t)fp22_to_fp8_e4m3(fp22, rm);
+        case PREC_FP8_E5M2:
+            return (uint32_t)fp22_to_fp8_e5m2(fp22, rm);
+        case PREC_FP16:
+            return (uint32_t)fp22_to_fp16(fp22, rm);
+        case PREC_FP32:
+            return fp22_to_fp32(fp22);
+        case PREC_FP4_E2M1:
+        default:
+            return (uint32_t)fp22_to_fp8_e5m2(fp22, rm);
+    }
+}
+
 // Convert C bias to FP22 based on output format
 inline uint32_t convert_c_to_fp22(uint32_t raw_bits, PrecisionType prec) {
     switch (prec) {
@@ -401,31 +419,5 @@ inline uint32_t convert_c_to_fp22(uint32_t raw_bits, PrecisionType prec) {
         case PREC_FP16:     return fp16_to_fp22(raw_bits & 0xFFFF);
         case PREC_FP4_E2M1: return fp9_to_fp22(fp4_to_fp9(raw_bits & 0xF));
         default: return 0;
-    }
-}
-
-inline uint32_t convert_fp22_to_out(uint32_t fp22,
-                                    PrecisionType out_prec,
-                                    RoundingMode rm) {
-    (void)rm; 
-
-    double v = fp22_to_double(fp22);
-
-    switch (out_prec) {
-        case PREC_FP8_E4M3:
-            return (uint32_t)double_to_fp8_e4m3(v);
-        case PREC_FP8_E5M2:
-            return (uint32_t)double_to_fp8_e5m2(v);
-        case PREC_FP16:
-            return (uint32_t)double_to_fp16(v);
-        case PREC_FP32: {
-            float f = (float)v;
-            uint32_t bits = 0;
-            std::memcpy(&bits, &f, sizeof(float));
-            return bits;
-        }
-        case PREC_FP4_E2M1:
-        default:
-            return (uint32_t)double_to_fp4(v);
     }
 }

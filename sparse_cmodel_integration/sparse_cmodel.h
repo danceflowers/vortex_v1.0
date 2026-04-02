@@ -92,6 +92,7 @@ inline void input_parser_bypass_expand_sparse_operands(const uint32_t packed_a_p
                                                        PrecisionType prec,
                                                        uint32_t routed_a[8],
                                                        uint32_t routed_b[8]) {
+    (void)prec;
     for (int i = 0; i < 8; ++i) {
         routed_a[i] = 0;
         routed_b[i] = 0;
@@ -107,16 +108,26 @@ inline void input_parser_bypass_expand_sparse_operands(const uint32_t packed_a_p
 
     const int lanes_per_group = sparse_group_nnz(mode);
     int payload_cursor = 0;
-    int lane_cursor = 0;
 
+    // IMPORTANT:
+    // Route sparse operands back onto their ORIGINAL K-lanes rather than
+    // compacting them into lanes [0..nnz-1]. The downstream add tree in
+    // tc_mul_add has a fixed dense reduction topology: (0,4)(1,5)(2,6)(3,7).
+    // If 2:4 operands are compacted sequentially, the floating-point
+    // accumulation order changes and 2:4 mode no longer matches the dense-path
+    // topology with zeros inserted. 1:4 is usually unaffected because there is
+    // only one non-zero per group, but 2:4 is sensitive to this lane mapping.
     for (int g = 0; g < 2; ++g) {
         uint8_t idx0 = 0, idx1 = 0;
         decode_sparse_meta_group(packed_meta[g], mode, idx0, idx1);
-        const uint8_t idx[2] = {idx0, idx1};
-        for (int lane = 0; lane < lanes_per_group; ++lane) {
-            routed_a[lane_cursor] = packed_a_payload[payload_cursor++];
-            routed_b[lane_cursor] = dense_b[g * 4 + idx[lane]];
-            ++lane_cursor;
+        const int base = g * 4;
+
+        routed_a[base + idx0] = packed_a_payload[payload_cursor++];
+        routed_b[base + idx0] = dense_b[base + idx0];
+
+        if (lanes_per_group == 2) {
+            routed_a[base + idx1] = packed_a_payload[payload_cursor++];
+            routed_b[base + idx1] = dense_b[base + idx1];
         }
     }
 }

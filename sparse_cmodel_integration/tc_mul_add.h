@@ -5,7 +5,6 @@
 #include "tc_mul_pipe.h"
 #include "tc_add_pipe.h"
 #include "fp22_to_fp8.h"
-#include "sparse_cmodel.h"
 
 struct tc_mul_add {
     std::array<mul_pipe, 8> mul_array;
@@ -17,37 +16,10 @@ struct tc_mul_add {
     struct {
         uint32_t a_in[8];
         uint32_t b_in[8];
-        uint8_t meta[2];
         uint32_t c_in;
         PrecisionType prec;
-        SparseMode sparse_mode;
-        bool a_is_compressed;
-        bool meta_valid;
         bool input_valid;
     } mul_add_input;
-
-    void reset() {
-        for (int i = 0; i < 8; i++) mul_array[i].reset();
-        for (int i = 0; i < 4; i++) add_level0[i].reset();
-        for (int i = 0; i < 2; i++) add_level1[i].reset();
-        add_level2.reset();
-        final_add.reset();
-        r1.c_in = 0;
-        r1.valid = false;
-        r2.c_in = 0;
-        r2.result = 0;
-        r2.valid = false;
-        for (int i = 0; i < 8; ++i) {
-            mul_add_input.a_in[i] = 0;
-            mul_add_input.b_in[i] = 0;
-        }
-        mul_add_input.meta[0] = 0;
-        mul_add_input.meta[1] = 0;
-        mul_add_input.sparse_mode = SPARSE_DENSE;
-        mul_add_input.a_is_compressed = false;
-        mul_add_input.meta_valid = false;
-        mul_add_input.input_valid = false;
-    }
 
     struct {
         uint32_t c_in;
@@ -58,9 +30,35 @@ struct tc_mul_add {
 
     struct {
         uint32_t c_in;
-        uint32_t result;
+        uint32_t result;          // post-quantized output bits
+        uint32_t raw_fp22_result; // pre-quantized FP22 result for debug
         bool valid;
     } r2;
+
+    void reset() {
+        for (int i = 0; i < 8; i++) mul_array[i].reset();
+        for (int i = 0; i < 4; i++) add_level0[i].reset();
+        for (int i = 0; i < 2; i++) add_level1[i].reset();
+        add_level2.reset();
+        final_add.reset();
+        r1.c_in = 0;
+        for (int i = 0; i < 8; ++i) {
+            r1.a_conv_val[i] = 0;
+            r1.b_conv_val[i] = 0;
+        }
+        r1.valid = false;
+        r2.c_in = 0;
+        r2.result = 0;
+        r2.raw_fp22_result = 0;
+        r2.valid = false;
+        mul_add_input.c_in = 0;
+        mul_add_input.prec = PREC_FP8_E5M2;
+        mul_add_input.input_valid = false;
+        for (int i = 0; i < 8; ++i) {
+            mul_add_input.a_in[i] = 0;
+            mul_add_input.b_in[i] = 0;
+        }
+    }
 
     bool out_valid() const {
         return r2.valid;
@@ -84,6 +82,10 @@ struct tc_mul_add {
         return r2.result;
     }
 
+    const uint32_t& out_fp22_data() const {
+        return r2.raw_fp22_result;
+    }
+
     void tick(bool out_ready, const Config& g_cfg) {
         bool s7_ready = out_ready || !r2.valid;
         bool s6_ready = final_add.in_ready(s7_ready);
@@ -100,11 +102,15 @@ struct tc_mul_add {
         if (s7_ready) {
             if (r6_valid) {
                 uint32_t fp22 = final_add.out_data();
-                r2.result = convert_fp22_to_out(fp22,
-                                                g_cfg.out_precisions.at(0),
-                                                g_cfg.rm);
+                PrecisionType out_prec = g_cfg.out_precisions.empty()
+                    ? PREC_FP8_E5M2
+                    : g_cfg.out_precisions.at(0);
+                r2.raw_fp22_result = fp22;
+                r2.result = convert_fp22_to_out(fp22, out_prec, g_cfg.rm);
                 r2.valid = true;
             } else {
+                r2.raw_fp22_result = 0;
+                r2.result = 0;
                 r2.valid = false;
             }
         }
@@ -124,7 +130,7 @@ struct tc_mul_add {
             } else {
                 final_add.add_input.input_valid = false;
             }
-            final_add.tick(out_ready, g_cfg);
+            final_add.tick(s7_ready, g_cfg);
         }
 
         bool r4_valid = true;
@@ -143,80 +149,51 @@ struct tc_mul_add {
         bool r3_valid = true;
         for (int i = 0; i < 4; ++i) r3_valid &= add_level0[i].out_valid();
         if (s4_ready) {
-            if (r3_valid) {
-                for (int i = 0; i < 2; ++i) {
+            for (int i = 0; i < 2; ++i) {
+                if (r3_valid) {
                     add_level1[i].add_input.a_in = add_level0[i].out_data();
                     add_level1[i].add_input.b_in = add_level0[i + 2].out_data();
                     add_level1[i].add_input.input_valid = true;
-                    add_level1[i].tick(s5_ready, g_cfg, add_level0[i].r2.c_in);
-                }
-            } else {
-                for (int i = 0; i < 2; ++i) {
+                } else {
                     add_level1[i].add_input.input_valid = false;
-                    add_level1[i].tick(s5_ready, g_cfg, add_level0[i].r2.c_in);
                 }
+                add_level1[i].tick(s5_ready, g_cfg, add_level0[i].r2.c_in);
             }
         }
 
         bool r2_valid = true;
         for (int i = 0; i < 8; ++i) r2_valid &= mul_array[i].out_valid();
         if (s3_ready) {
-            if (r2_valid) {
-                for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < 4; ++i) {
+                if (r2_valid) {
                     add_level0[i].add_input.a_in = mul_array[i].out_data();
                     add_level0[i].add_input.b_in = mul_array[i + 4].out_data();
                     add_level0[i].add_input.input_valid = true;
-                    add_level0[i].tick(s4_ready, g_cfg, mul_array[i].r3.c_in);
-                }
-            } else {
-                for (int i = 0; i < 4; ++i) {
+                } else {
                     add_level0[i].add_input.input_valid = false;
-                    add_level0[i].tick(s4_ready, g_cfg, mul_array[i].r3.c_in);
                 }
+                add_level0[i].tick(s4_ready, g_cfg, mul_array[i].r3.c_in);
             }
         }
 
         if (s2_ready) {
-            if (r1.valid) {
-                for (int i = 0; i < 8; ++i) {
+            for (int i = 0; i < 8; ++i) {
+                if (r1.valid) {
                     mul_array[i].mul_input.a_fp9 = r1.a_conv_val[i];
                     mul_array[i].mul_input.b_fp9 = r1.b_conv_val[i];
                     mul_array[i].mul_input.input_valid = true;
-                    mul_array[i].tick(s3_ready, g_cfg, r1.c_in);
-                }
-            } else {
-                for (int i = 0; i < 8; ++i) {
+                } else {
                     mul_array[i].mul_input.input_valid = false;
-                    mul_array[i].tick(s3_ready, g_cfg, r1.c_in);
                 }
+                mul_array[i].tick(s3_ready, g_cfg, r1.c_in);
             }
         }
 
         if (s1_ready) {
             if (mul_add_input.input_valid) {
-                uint32_t routed_a_raw[8] = {0};
-                uint32_t routed_b_raw[8] = {0};
-
-                if (mul_add_input.sparse_mode != SPARSE_DENSE &&
-                    mul_add_input.a_is_compressed && mul_add_input.meta_valid) {
-                    input_parser_bypass_expand_sparse_operands(
-                        mul_add_input.a_in,
-                        mul_add_input.b_in,
-                        mul_add_input.meta,
-                        mul_add_input.sparse_mode,
-                        mul_add_input.prec,
-                        routed_a_raw,
-                        routed_b_raw);
-                } else {
-                    for (int i = 0; i < 8; ++i) {
-                        routed_a_raw[i] = mul_add_input.a_in[i];
-                        routed_b_raw[i] = mul_add_input.b_in[i];
-                    }
-                }
-
                 for (int i = 0; i < 8; ++i) {
-                    r1.a_conv_val[i] = convert_to_fp9(routed_a_raw[i], mul_add_input.prec);
-                    r1.b_conv_val[i] = convert_to_fp9(routed_b_raw[i], mul_add_input.prec);
+                    r1.a_conv_val[i] = convert_to_fp9(mul_add_input.a_in[i], mul_add_input.prec);
+                    r1.b_conv_val[i] = convert_to_fp9(mul_add_input.b_in[i], mul_add_input.prec);
                 }
                 r1.c_in = mul_add_input.c_in;
                 r1.valid = true;
