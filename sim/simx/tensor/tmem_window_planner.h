@@ -187,7 +187,8 @@ public:
   static bool pack_math_packet(const TmemWindowPlan& window,
                                const std::vector<uint8_t>& payload,
                                uint32_t packet_idx,
-                               std::array<uint8_t, kPacketBytes>* out);
+                               std::array<uint8_t, kPacketBytes>* out,
+                               bool transpose = false);
   static bool unpack_math_packet(const TmemWindowPlan& window,
                                  uint32_t packet_idx,
                                  const std::array<uint8_t, kPacketBytes>& packet,

@@ -84,9 +84,9 @@ public:
   using ReadCallback = std::function<void(void*, uint64_t, uint32_t)>;
   using WriteCallback = std::function<void(const void*, uint64_t, uint32_t)>;
 
-  static constexpr uint32_t kLoadBaseLatency = 24;
+  static constexpr uint32_t kLoadBaseLatency = 12;   // descriptor fetch + addr xlat + pipeline setup
   static constexpr uint32_t kLoadBytesPerCycle = 64;
-  static constexpr uint32_t kStoreBaseLatency = 24;
+  static constexpr uint32_t kStoreBaseLatency = 12;
   static constexpr uint32_t kStoreBytesPerCycle = 64;
   static constexpr uint32_t kTransposePenalty = 8;
 

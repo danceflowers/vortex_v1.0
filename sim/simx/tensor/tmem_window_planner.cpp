@@ -523,7 +523,8 @@ bool TmemWindowPlanner::packet_math_region(const TmemWindowPlan& window,
 bool TmemWindowPlanner::pack_math_packet(const TmemWindowPlan& window,
                                          const std::vector<uint8_t>& payload,
                                          uint32_t packet_idx,
-                                         std::array<uint8_t, kPacketBytes>* out) {
+                                         std::array<uint8_t, kPacketBytes>* out,
+                                         bool transpose) {
   if (nullptr == out || !uses_math_packet_adapter(window)) {
     return false;
   }
@@ -540,6 +541,9 @@ bool TmemWindowPlanner::pack_math_packet(const TmemWindowPlan& window,
     return false;
   }
 
+  // 转置时 payload 的源布局是 cols×rows (行列互换)
+  auto src_row_bytes = transpose ? (rows * elem_bytes) : row_bytes;
+
   uint32_t offset = 0;
   for (uint32_t pr = 0; pr < packet_rows; ++pr) {
     auto math_row = math_row_base + pr;
@@ -547,7 +551,13 @@ bool TmemWindowPlanner::pack_math_packet(const TmemWindowPlan& window,
       auto math_col = math_col_base + pc;
       for (uint32_t b = 0; b < elem_bytes; ++b) {
         if (math_row < rows && math_col < cols) {
-          auto payload_off = math_row * row_bytes + math_col * elem_bytes + b;
+          uint32_t payload_off;
+          if (transpose) {
+            // 源 (math_col, math_row): dest[row][col] ← src[col][row]
+            payload_off = math_col * src_row_bytes + math_row * elem_bytes + b;
+          } else {
+            payload_off = math_row * row_bytes + math_col * elem_bytes + b;
+          }
           if (payload_off < payload.size()) {
             out->at(offset) = payload.at(payload_off);
           }

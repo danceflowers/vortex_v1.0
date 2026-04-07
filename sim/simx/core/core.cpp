@@ -2503,9 +2503,26 @@ uint32_t Core::tmem_alloc(uint32_t col_span, uint32_t mma_desc_id) {
       throw std::runtime_error(
         "TMEM_ALLOC: window plan failed — " + plan_reason);
     }
-    // TODO: 将 layout plan 存入 allocation 元数据供 TMA/MMA auto-routing 使用
+
+    // 分配 TMEM 列, 然后将 layout plan 存入 allocation 元数据
+    uint32_t handle = 0;
+    if (nullptr != tmem_system_) {
+      handle = tmem_system_->alloc(col_span);
+    } else {
+      handle = tmem_.alloc(col_span);
+    }
+    if (handle != 0) {
+      // 持久化 layout plan 和 mma_desc_id 到 allocation
+      TmemAllocation* alloc = nullptr;
+      if (lookup_tmem_allocation(handle, &alloc) && alloc != nullptr) {
+        alloc->mma_desc_id = mma_desc_id;
+        alloc->prebuilt_layout = layout;
+      }
+    }
+    return handle;
   }
 
+  // 无 MMA descriptor 绑定的后备路径
   if (nullptr != tmem_system_) {
     return tmem_system_->alloc(col_span);
   }
