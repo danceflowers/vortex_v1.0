@@ -39,11 +39,10 @@
 #define MATRIX_K 512
 #endif
 
-// Window shape: 16×16 → A=16×16, B=16×16, C=D=16×16
-// 每个 16×16 A/B window 含 2 个 k8 tile → 一次 TMA 搬运 k16
-#define WIN_M 16
-#define WIN_N 16
-#define WIN_K 16
+// Window shape: 32×32 → A=32×32, B=32×32, C=D=32×32 (m32n32k32)
+#define WIN_M 32
+#define WIN_N 32
+#define WIN_K 32
 
 // 硬件计算原语 tile: A=16×8, B=8×16, C/D=16×16
 #define TILE_M 16
@@ -51,20 +50,34 @@
 #define TILE_K 8
 
 // 每个 window 内的 tile 数
-#define A_TILES_PER_WIN ((WIN_M / TILE_M) * (WIN_K / TILE_K))  // 1×2=2
-#define B_TILES_PER_WIN ((WIN_K / TILE_K) * (WIN_N / TILE_N))  // 2×1=2
+#define A_TILES_PER_WIN  ((WIN_M / TILE_M) * (WIN_K / TILE_K))  // 2×4=8
+#define B_TILES_PER_WIN  ((WIN_K / TILE_K) * (WIN_N / TILE_N))  // 4×2=8
+#define CD_TILES_PER_WIN ((WIN_M / TILE_M) * (WIN_N / TILE_N))  // 2×2=4
 
-// 全局 tile 计数
-#define M_TILES (MATRIX_M / WIN_M)   // 32
-#define N_TILES (MATRIX_N / WIN_N)   // 32
-#define K_PHASES (MATRIX_K / WIN_K)  // 32
+// A/B window 内 tile 布局
+#define A_TILE_COLS (WIN_K / TILE_K)  // 4 (K 维 tile 列数)
+#define B_TILE_COLS (WIN_N / TILE_N)  // 2 (N 维 tile 列数)
+#define C_TILE_COLS (WIN_N / TILE_N)  // 2
+
+// K 维 tile 数 (一个 window 内)
+#define K_TILES_PER_WIN (WIN_K / TILE_K)  // 4
+
+// 全局 group 计数
+#define M_GROUPS (MATRIX_M / WIN_M)  // 16
+#define N_GROUPS (MATRIX_N / WIN_N)  // 16
+#define K_PHASES (MATRIX_K / WIN_K)  // 16
+
+// 每个 32×32 output block 内有 4 个 16×16 output tile
+// CMem 只有 2 slot，分 2 批处理: 批0=(m=0,n=0/1), 批1=(m=1,n=0/1)
+#define OUTPUT_BATCHES   2
+#define TILES_PER_BATCH  2  // 每批 2 个 output tile 用 c_slot 0/1
 
 typedef vortex::tensor::descriptor_table_arg_t descriptor_table_arg_t;
 
 typedef struct {
   descriptor_table_arg_t desc_tables;
   uint32_t block_dim[2];
-  uint32_t col_span;       // TMEM allocation 列数 (16/32/64)
+  uint32_t col_span;
 } kernel_arg_t;
 
 typedef struct __attribute__((packed)) {
