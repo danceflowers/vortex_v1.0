@@ -77,7 +77,8 @@ typedef struct __attribute__((packed)) {
   uint16_t meta_col_span;
   uint8_t tile_role;
   uint8_t payload_kind;
-  uint8_t reserved[2];
+  uint8_t transpose;
+  uint8_t reserved;
 } tma_descriptor_t;
 
 typedef struct __attribute__((packed)) {
@@ -88,9 +89,7 @@ typedef struct __attribute__((packed)) {
   uint8_t ws;
   uint8_t sp;
   uint8_t sparse_mode;
-  uint8_t transpose_a;
-  uint8_t transpose_b;
-  uint8_t reserved[3];
+  uint8_t reserved[5];
   uint16_t a_rows;
   uint16_t a_cols;
   uint16_t b_rows;

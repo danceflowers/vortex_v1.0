@@ -413,16 +413,26 @@ bool TmemWindowPlanner::validate_mma_shapes(const TmemWindowPlannerInput& input,
 }
 
 uint32_t TmemWindowPlanner::compute_min_col_span(const TmemWindowPlannerInput& input) {
-  auto max_row_bytes = [](const TensorShape2D& shape, uint32_t fmt) -> uint32_t {
-    if (shape.empty()) return 0;
-    return static_cast<uint32_t>(shape.cols) * fmt_bytes(fmt);
+  // 有效 col_span: 16 × 2^n = {16, 32, 64}
+  static constexpr uint32_t kValidColSpans[] = {16, 32, 64};
+
+  auto window_lines = [](const TensorShape2D& shape, uint32_t fmt, uint32_t col_span) -> uint32_t {
+    if (shape.empty() || fmt_bytes(fmt) == 0) return 0;
+    uint32_t total_bytes = static_cast<uint32_t>(shape.rows)
+                         * static_cast<uint32_t>(shape.cols) * fmt_bytes(fmt);
+    return ceil_div(total_bytes, col_span);
   };
-  uint32_t min_col = 0;
-  min_col = std::max(min_col, max_row_bytes(input.a_shape, input.fmt_a));
-  min_col = std::max(min_col, max_row_bytes(input.b_shape, input.fmt_b));
-  min_col = std::max(min_col, max_row_bytes(input.c_shape, input.fmt_c));
-  min_col = std::max(min_col, max_row_bytes(input.d_shape, input.fmt_d));
-  return std::max<uint32_t>(kMinAllocationCols, align_up(min_col, kMinAllocationCols));
+
+  for (auto col : kValidColSpans) {
+    uint32_t total = window_lines(input.a_shape, input.fmt_a, col)
+                   + window_lines(input.b_shape, input.fmt_b, col)
+                   + window_lines(input.c_shape, input.fmt_c, col)
+                   + window_lines(input.d_shape, input.fmt_d, col);
+    if (total <= kLogicalLines) {
+      return col;
+    }
+  }
+  return 0;  // 无法容纳 — 编译器应拒绝此精度/形状组合
 }
 
 bool TmemWindowPlanner::build_dense_plan(const TmemWindowPlannerInput& input,

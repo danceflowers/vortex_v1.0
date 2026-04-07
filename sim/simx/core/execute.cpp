@@ -72,8 +72,9 @@ static inline void resolve_mma_descriptor(Core* core, IntrTcuArgs* args) {
   args->ws = desc.ws;
   args->sp = desc.sp;
   args->a_sparse_mode = desc.sparse_mode;
-  args->transpose_a = desc.transpose_a;
-  args->transpose_b = desc.transpose_b;
+  // transpose 已移至 TMA descriptor, 计算侧不再需要
+  args->transpose_a = 0;
+  args->transpose_b = 0;
 }
 #endif
 
@@ -1589,11 +1590,9 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         auto mma_memory_control_word = rs2_data.at(thread_start).u32;
         tpuArgs.target = tcu_mma_mem_ctl_target(mma_memory_control_word);
         tpuArgs.slot_id = tcu_mma_mem_ctl_slot_id(mma_memory_control_word);
-        tpuArgs.window_id = tcu_mma_mem_ctl_window_id(mma_memory_control_word);
         tpuArgs.tile_id = tcu_mma_mem_ctl_tile_id(mma_memory_control_word);
-        // MMA_LOAD resolves one logical tensor-memory tile into local operand
-        // slot state. Actual TMEM packet progression and local line writes are
-        // handled by TensorUnit after this macro-op is admitted.
+        // auto-routing: window_id 从 target 推导
+        tpuArgs.window_id = tcu_mma_mem_ctl_window_id_from_target(tpuArgs.target);
         tensor_unit_->mma_load(wid, handle, tpuArgs, trace_data.get());
         if (trace_data->retry) {
           core_->set_stall_reason(wid, WarpStallReason::AsyncTensor);
@@ -1607,8 +1606,9 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         auto mma_memory_control_word = rs2_data.at(thread_start).u32;
         tpuArgs.target = tcu_mma_mem_ctl_target(mma_memory_control_word);
         tpuArgs.slot_id = tcu_mma_mem_ctl_slot_id(mma_memory_control_word);
-        tpuArgs.window_id = tcu_mma_mem_ctl_window_id(mma_memory_control_word);
         tpuArgs.tile_id = tcu_mma_mem_ctl_tile_id(mma_memory_control_word);
+        // auto-routing: store 写入 D window (target_c → window 3)
+        tpuArgs.window_id = 3; // D window
         tensor_unit_->mma_store(wid, handle, tpuArgs, trace_data.get());
         if (trace_data->retry) {
           core_->set_stall_reason(wid, WarpStallReason::AsyncTensor);

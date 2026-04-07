@@ -2457,12 +2457,19 @@ void Core::compact_async_tmem_ops_fifo() {
 uint32_t Core::tmem_alloc(uint32_t col_span, uint32_t mma_desc_id) {
   advance_async_tensor_engine();
 
+  // col_span 必须是 {16, 32, 64} 之一 (16 × 2^n)
+  if (col_span != 16 && col_span != 32 && col_span != 64) {
+    throw std::runtime_error(
+      "TMEM_ALLOC: col_span=" + std::to_string(col_span)
+      + " invalid, must be 16, 32, or 64");
+  }
+
   // 如果绑定了 MMA descriptor，验证 col_span 并预构建 window layout plan
   MmaDescriptor mma_desc{};
   bool has_desc = (mma_desc_id != 0) && read_mma_descriptor(mma_desc_id, &mma_desc);
 
   if (has_desc) {
-    // 构建 planner input，计算最小 col_span
+    // 构建 planner input — 每个 window 使用各自的精度
     TmemWindowPlannerInput planner_input{};
     planner_input.a_shape = {mma_desc.a_rows, mma_desc.a_cols};
     planner_input.b_shape = {mma_desc.b_rows, mma_desc.b_cols};
@@ -2476,18 +2483,27 @@ uint32_t Core::tmem_alloc(uint32_t col_span, uint32_t mma_desc_id) {
     planner_input.allocation_col_span = col_span;
 
     auto min_col = TmemWindowPlanner::compute_min_col_span(planner_input);
+    if (min_col == 0) {
+      throw std::runtime_error(
+        "TMEM_ALLOC: window shape + precision combination cannot fit in TMEM "
+        "(exceeds 128 lines even at col_span=64)");
+    }
     if (col_span < min_col) {
-      col_span = min_col;
+      throw std::runtime_error(
+        "TMEM_ALLOC: col_span=" + std::to_string(col_span)
+        + " too small, minimum " + std::to_string(min_col)
+        + " required for this shape+precision");
     }
     planner_input.allocation_col_span = col_span;
 
-    // 预构建 layout plan (A/B/C/D windows)
+    // 预构建 layout plan (A/B/C/D windows) 并持久化到 allocation 元数据
     TmemLayoutPlan layout{};
     std::string plan_reason;
     if (!TmemWindowPlanner::build_dense_plan(planner_input, &layout, &plan_reason)) {
-      std::cerr << "TMEM alloc: window plan failed — " << plan_reason << std::endl;
+      throw std::runtime_error(
+        "TMEM_ALLOC: window plan failed — " + plan_reason);
     }
-    // layout plan 会在后续 TMA_LOAD/MMA_LOAD 时通过 ensure_tmem_window_bound 使用
+    // TODO: 将 layout plan 存入 allocation 元数据供 TMA/MMA auto-routing 使用
   }
 
   if (nullptr != tmem_system_) {

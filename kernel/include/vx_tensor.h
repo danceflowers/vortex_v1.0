@@ -89,7 +89,8 @@ struct tma_descriptor_t {
   uint16_t meta_col_span;
   uint8_t tile_role;
   uint8_t payload_kind;
-  uint8_t reserved[2];
+  uint8_t transpose;      // 转置标志: TMA 以转置寻址从 DRAM 读取
+  uint8_t reserved;
 } __attribute__((packed));
 
 struct mma_descriptor_t {
@@ -100,9 +101,7 @@ struct mma_descriptor_t {
   uint8_t ws;
   uint8_t sp;
   uint8_t sparse_mode;
-  uint8_t transpose_a;
-  uint8_t transpose_b;
-  uint8_t reserved[3];
+  uint8_t reserved[5];     // transpose 已移至 tma_descriptor_t
   uint16_t a_rows;
   uint16_t a_cols;
   uint16_t b_rows;
@@ -120,30 +119,26 @@ inline __attribute__((always_inline)) constexpr mma_descriptor_t make_mma_descri
                                                                                      uint16_t b_rows = 0,
                                                                                      uint16_t b_cols = 0,
                                                                                      uint16_t c_rows = 0,
-                                                                                     uint16_t c_cols = 0,
-                                                                                     uint8_t transpose_a = 0,
-                                                                                     uint8_t transpose_b = 0) {
+                                                                                     uint16_t c_cols = 0) {
   return mma_descriptor_t{At::id, Bt::id, Ct::id, Dt::id,
-                          ws, sp, sparse_mode, transpose_a, transpose_b, {0, 0, 0},
+                          ws, sp, sparse_mode, {0, 0, 0, 0, 0},
                           a_rows, a_cols, b_rows, b_cols, c_rows, c_cols};
 }
 
 // 便捷接口: 从 (M, N, K) 推导各操作数 window shape
 //   A = M × K,  B = K × N,  C = D = M × N
 // ws 与 window shape 正交: 任何 shape 都可以 ws=0(非驻留) 或 ws=1(驻留)
+// transpose 已移至 TMA descriptor (数据搬运侧)
 template <typename At, typename Bt, typename Ct, typename Dt = Ct>
 inline __attribute__((always_inline)) constexpr mma_descriptor_t make_mma_descriptor_mnk(
     uint16_t M, uint16_t N, uint16_t K,
     uint8_t ws = 0,
-    uint8_t transpose_a = 0,
-    uint8_t transpose_b = 0,
     uint8_t sparse_mode = 0) {
   return make_mma_descriptor<At, Bt, Ct, Dt>(
       ws, 0, sparse_mode,
       M, K,    // A = M × K
       K, N,    // B = K × N
-      M, N,    // C = M × N
-      transpose_a, transpose_b);
+      M, N);   // C = M × N
 }
 
 inline __attribute__((always_inline)) uint16_t tmem_handle_base(uint32_t handle) {
@@ -155,12 +150,10 @@ inline __attribute__((always_inline)) uint16_t tmem_handle_span(uint32_t handle)
 }
 
 static constexpr uint32_t mma_mem_ctl_target_bits = 2;
-static constexpr uint32_t mma_mem_ctl_window_bits = 8;
 static constexpr uint32_t mma_mem_ctl_tile_bits = 16;
 static constexpr uint32_t mma_mem_ctl_slot_bits = 2;
 static constexpr uint32_t mma_mem_ctl_target_shift = 0;
-static constexpr uint32_t mma_mem_ctl_window_shift = mma_mem_ctl_target_shift + mma_mem_ctl_target_bits;
-static constexpr uint32_t mma_mem_ctl_tile_shift = mma_mem_ctl_window_shift + mma_mem_ctl_window_bits;
+static constexpr uint32_t mma_mem_ctl_tile_shift = mma_mem_ctl_target_shift + mma_mem_ctl_target_bits;
 static constexpr uint32_t mma_mem_ctl_slot_shift = mma_mem_ctl_tile_shift + mma_mem_ctl_tile_bits;
 
 inline __attribute__((always_inline)) constexpr uint32_t mma_mem_ctl_mask(uint32_t bits) {
@@ -175,14 +168,22 @@ inline __attribute__((always_inline)) constexpr uint32_t encode_tmem_op_control(
        | ((flags & mma_mem_ctl_mask(tcu_tmem_op_ctl_flags_bits)) << tcu_tmem_op_ctl_flags_shift);
 }
 
+// auto-routing: 硬件从 target 自动推导 window (A→0, B→1, C→2, D→3)
+inline __attribute__((always_inline)) constexpr uint32_t encode_mma_mem_control(tcu_target target,
+                                                                                uint32_t slot_id,
+                                                                                uint32_t tile_id) {
+  return ((static_cast<uint32_t>(target) & mma_mem_ctl_mask(mma_mem_ctl_target_bits)) << mma_mem_ctl_target_shift)
+       | ((tile_id & mma_mem_ctl_mask(mma_mem_ctl_tile_bits)) << mma_mem_ctl_tile_shift)
+       | ((slot_id & mma_mem_ctl_mask(mma_mem_ctl_slot_bits)) << mma_mem_ctl_slot_shift);
+}
+
+// 兼容旧接口 (window_id 参数被忽略)
 inline __attribute__((always_inline)) constexpr uint32_t encode_mma_mem_control(tcu_target target,
                                                                                 uint32_t slot_id,
                                                                                 uint32_t window_id,
                                                                                 uint32_t tile_id) {
-  return ((static_cast<uint32_t>(target) & mma_mem_ctl_mask(mma_mem_ctl_target_bits)) << mma_mem_ctl_target_shift)
-       | ((window_id & mma_mem_ctl_mask(mma_mem_ctl_window_bits)) << mma_mem_ctl_window_shift)
-       | ((tile_id & mma_mem_ctl_mask(mma_mem_ctl_tile_bits)) << mma_mem_ctl_tile_shift)
-       | ((slot_id & mma_mem_ctl_mask(mma_mem_ctl_slot_bits)) << mma_mem_ctl_slot_shift);
+  (void)window_id;
+  return encode_mma_mem_control(target, slot_id, tile_id);
 }
 
 inline __attribute__((always_inline)) void bind_tmem_payload_region(tma_descriptor_t* desc, uint32_t handle) {
@@ -354,39 +355,37 @@ inline __attribute__((always_inline)) void mma_load_mem(uint32_t handle,
     : "memory");
 }
 
+// auto-routing: 无需 window_id, 硬件从 target 推导
 template <uint32_t DescId>
 inline __attribute__((always_inline)) void mma_load_a_slot(uint32_t handle,
-                                                           uint32_t window_id,
                                                            uint32_t tile_id,
                                                            uint32_t slot_id) {
   if (slot_id >= max_operand_slots) {
     __builtin_trap();
   }
-  auto control = encode_mma_mem_control(tcu_target_a, slot_id, window_id, tile_id);
+  auto control = encode_mma_mem_control(tcu_target_a, slot_id, tile_id);
   mma_load_mem<DescId>(handle, control);
 }
 
 template <uint32_t DescId>
 inline __attribute__((always_inline)) void mma_load_b_slot(uint32_t handle,
-                                                           uint32_t window_id,
                                                            uint32_t tile_id,
                                                            uint32_t slot_id) {
   if (slot_id >= max_operand_slots) {
     __builtin_trap();
   }
-  auto control = encode_mma_mem_control(tcu_target_b, slot_id, window_id, tile_id);
+  auto control = encode_mma_mem_control(tcu_target_b, slot_id, tile_id);
   mma_load_mem<DescId>(handle, control);
 }
 
 template <uint32_t DescId>
 inline __attribute__((always_inline)) void mma_load_c_slot(uint32_t handle,
-                                                           uint32_t window_id,
                                                            uint32_t tile_id,
                                                            uint32_t slot_id) {
   if (slot_id >= max_operand_slots) {
     __builtin_trap();
   }
-  auto control = encode_mma_mem_control(tcu_target_c, slot_id, window_id, tile_id);
+  auto control = encode_mma_mem_control(tcu_target_c, slot_id, tile_id);
   mma_load_mem<DescId>(handle, control);
 }
 
@@ -400,16 +399,26 @@ inline __attribute__((always_inline)) void mma_store_mem(uint32_t handle,
     : "memory");
 }
 
+// store 写入 D window (auto-route: target_c → D window)
 template <uint32_t DescId>
 inline __attribute__((always_inline)) void mma_store_c_slot(uint32_t handle,
-                                                            uint32_t window_id,
                                                             uint32_t tile_id,
                                                             uint32_t slot_id) {
   if (slot_id >= max_operand_slots) {
     __builtin_trap();
   }
-  auto control = encode_mma_mem_control(tcu_target_c, slot_id, window_id, tile_id);
+  auto control = encode_mma_mem_control(tcu_target_c, slot_id, tile_id);
   mma_store_mem<DescId>(handle, control);
+}
+
+// 兼容旧接口 (window_id 被忽略)
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_store_c_slot(uint32_t handle,
+                                                            uint32_t window_id,
+                                                            uint32_t tile_id,
+                                                            uint32_t slot_id) {
+  (void)window_id;
+  mma_store_c_slot<DescId>(handle, tile_id, slot_id);
 }
 
 namespace detail {
