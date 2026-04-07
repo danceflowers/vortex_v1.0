@@ -377,7 +377,7 @@ instr_trace_t* Emulator::step() {
                   auto control = warp.ireg_file.at(src1.idx).at(t);
                   tcu_args.target = tcu_mma_mem_ctl_target(control);
                   tcu_args.slot_id = tcu_mma_mem_ctl_slot_id(control);
-                  tcu_args.window_id = tcu_mma_mem_ctl_window_id(control);
+                  tcu_args.window_id = tcu_mma_mem_ctl_window_id_from_target(tcu_args.target);
                   tcu_args.tile_id = tcu_mma_mem_ctl_tile_id(control);
                 }
                 break;
@@ -752,7 +752,7 @@ void Emulator::dump_warp_front_state(std::ostream& os, uint32_t wid) const {
           auto control = warp.ireg_file.at(src1.idx).at(t);
           tcu_args.target = tcu_mma_mem_ctl_target(control);
           tcu_args.slot_id = tcu_mma_mem_ctl_slot_id(control);
-          tcu_args.window_id = tcu_mma_mem_ctl_window_id(control);
+          tcu_args.window_id = tcu_mma_mem_ctl_window_id_from_target(tcu_args.target);
           tcu_args.tile_id = tcu_mma_mem_ctl_tile_id(control);
           os << " ctl=0x" << std::hex << control << std::dec;
         }
