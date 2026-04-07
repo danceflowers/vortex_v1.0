@@ -128,6 +128,24 @@ inline __attribute__((always_inline)) constexpr mma_descriptor_t make_mma_descri
                           a_rows, a_cols, b_rows, b_cols, c_rows, c_cols};
 }
 
+// 便捷接口: 从 (M, N, K) 推导各操作数 window shape
+//   A = M × K,  B = K × N,  C = D = M × N
+// ws 与 window shape 正交: 任何 shape 都可以 ws=0(非驻留) 或 ws=1(驻留)
+template <typename At, typename Bt, typename Ct, typename Dt = Ct>
+inline __attribute__((always_inline)) constexpr mma_descriptor_t make_mma_descriptor_mnk(
+    uint16_t M, uint16_t N, uint16_t K,
+    uint8_t ws = 0,
+    uint8_t transpose_a = 0,
+    uint8_t transpose_b = 0,
+    uint8_t sparse_mode = 0) {
+  return make_mma_descriptor<At, Bt, Ct, Dt>(
+      ws, 0, sparse_mode,
+      M, K,    // A = M × K
+      K, N,    // B = K × N
+      M, N,    // C = M × N
+      transpose_a, transpose_b);
+}
+
 inline __attribute__((always_inline)) uint16_t tmem_handle_base(uint32_t handle) {
   return handle & 0xff;
 }

@@ -343,6 +343,75 @@ bool TmemWindowPlanner::build_single_dense_window(TmemWindowTarget target,
   return true;
 }
 
+bool TmemWindowPlanner::validate_mma_shapes(const TmemWindowPlannerInput& input,
+                                             std::string* reason) {
+  // A(M×K) × B(K×N) → C(M×N),  D shape = C shape
+  if (!input.a_shape.empty() && !input.b_shape.empty()) {
+    // K 维度一致: A.cols == B.rows
+    if (input.a_shape.cols != input.b_shape.rows) {
+      std::ostringstream oss;
+      oss << "K dimension mismatch: A.cols=" << input.a_shape.cols
+          << " != B.rows=" << input.b_shape.rows;
+      set_reason(reason, oss.str());
+      return false;
+    }
+    // K 维度必须是 tile_k (8) 的倍数
+    if (input.a_shape.cols % kATileCols != 0) {
+      std::ostringstream oss;
+      oss << "K dimension " << input.a_shape.cols
+          << " is not a multiple of A tile cols (" << kATileCols << ")";
+      set_reason(reason, oss.str());
+      return false;
+    }
+  }
+  if (!input.a_shape.empty() && !input.c_shape.empty()) {
+    // M 维度一致: A.rows == C.rows
+    if (input.a_shape.rows != input.c_shape.rows) {
+      std::ostringstream oss;
+      oss << "M dimension mismatch: A.rows=" << input.a_shape.rows
+          << " != C.rows=" << input.c_shape.rows;
+      set_reason(reason, oss.str());
+      return false;
+    }
+  }
+  if (!input.b_shape.empty() && !input.c_shape.empty()) {
+    // N 维度一致: B.cols == C.cols
+    if (input.b_shape.cols != input.c_shape.cols) {
+      std::ostringstream oss;
+      oss << "N dimension mismatch: B.cols=" << input.b_shape.cols
+          << " != C.cols=" << input.c_shape.cols;
+      set_reason(reason, oss.str());
+      return false;
+    }
+  }
+  // D shape 必须等于 C shape
+  if (!input.c_shape.empty() && !input.d_shape.empty()) {
+    if (input.c_shape.rows != input.d_shape.rows || input.c_shape.cols != input.d_shape.cols) {
+      std::ostringstream oss;
+      oss << "D shape (" << input.d_shape.rows << "x" << input.d_shape.cols
+          << ") must equal C shape (" << input.c_shape.rows << "x" << input.c_shape.cols << ")";
+      set_reason(reason, oss.str());
+      return false;
+    }
+  }
+  // M, N 维度必须是 16 的倍数
+  if (!input.a_shape.empty() && input.a_shape.rows % kATileRows != 0) {
+    std::ostringstream oss;
+    oss << "M dimension " << input.a_shape.rows
+        << " is not a multiple of " << kATileRows;
+    set_reason(reason, oss.str());
+    return false;
+  }
+  if (!input.b_shape.empty() && input.b_shape.cols % kBTileCols != 0) {
+    std::ostringstream oss;
+    oss << "N dimension " << input.b_shape.cols
+        << " is not a multiple of " << kBTileCols;
+    set_reason(reason, oss.str());
+    return false;
+  }
+  return true;
+}
+
 uint32_t TmemWindowPlanner::compute_min_col_span(const TmemWindowPlannerInput& input) {
   auto max_row_bytes = [](const TensorShape2D& shape, uint32_t fmt) -> uint32_t {
     if (shape.empty()) return 0;
@@ -360,6 +429,11 @@ bool TmemWindowPlanner::build_dense_plan(const TmemWindowPlannerInput& input,
                                          TmemLayoutPlan* out,
                                          std::string* reason) {
   if (nullptr == out) {
+    return false;
+  }
+
+  // 验证 shapes 数学一致性
+  if (!validate_mma_shapes(input, reason)) {
     return false;
   }
 
