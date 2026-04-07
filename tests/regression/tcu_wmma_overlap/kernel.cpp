@@ -49,19 +49,19 @@ static inline void load_ab(uint32_t handle, uint32_t a_tid, uint32_t b_tid,
 // ---------------------------------------------------------------------------
 // kernel_body — 双缓冲流水线 (2 allocations)
 //
-// 两个 TMEM allocation 交替使用: handle[0] 和 handle[1]
-// 当 compute 读取 handle[cur] 的 A/B window 时,
-// TMA 同时向 handle[nxt] 搬运下一个 K-phase 的 A/B 数据。
+// 两个 TMEM allocation 交替使用: handle 和 handle
+// 当 compute 读取 handle 的 A/B window 时,
+// TMA 同时向 handle 搬运下一个 K-phase 的 A/B 数据。
 //
-// TMA 写入 handle[nxt] (TMEM 列 [32..63]) 和
-// mma_load 读取 handle[cur] (TMEM 列 [0..31]) 不冲突 → 可并行。
+// TMA 写入 handle (TMEM 列 [32..63]) 和
+// mma_load 读取 handle (TMEM 列 [0..31]) 不冲突 → 可并行。
 //
 // CMem 不属于 TMEM allocation, 是全局共享的。
 // 输出驻留模式下 FIFO 持续累加, 不受 handle 切换影响。
 // ---------------------------------------------------------------------------
 static inline void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
-  uint32_t m_group = blockIdx.x;
-  if (m_group >= kMGroups) return;
+  // 单 warp 处理所有 M-groups (TMEM 是核心共享资源)
+  for (uint32_t m_group = 0; m_group < kMGroups; ++m_group) {
 
   ctx::fragment_a   fragA;
   ctx::fragment_b   fragB;
@@ -70,48 +70,43 @@ static inline void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   ctx::fill_fragment(fragB, 0);
   ctx::fill_fragment(fragC, 0);
 
-  // 2 个 allocation, 各占 32 lines (fp8 all, col=64)
-  uint32_t handle[2];
-  handle[0] = vt::tmem_alloc(arg->col_span, kMmaDescId);
-  handle[1] = vt::tmem_alloc(arg->col_span, kMmaDescId);
+  // 单 allocation: 全部 A/B/C/D windows
+  // TMEM 是核心共享资源, 多 warp 串行使用
+  uint32_t handle = vt::tmem_alloc(arg->col_span, kMmaDescId);
 
   for (uint32_t ng = 0; ng < kNGroups; ++ng) {
 
     for (uint32_t batch = 0; batch < OUTPUT_BATCHES; ++batch) {
       uint32_t m_blk = batch;
 
-      // 加载 C = 0 (用 handle[0] 的 C window)
-      (void)vt::tma_load(handle[0], kCInId);
+      // 加载 C = 0 → TMEM C window (window_id=2)
+      (void)vt::tma_load(handle, kCInId, /*window_id=*/2);
       for (uint32_t n_blk = 0; n_blk < TILES_PER_BATCH; ++n_blk) {
         vt::mbarrier_init(kBarC, 1);
-        vt::mma_load_c_slot<kMmaDescId>(handle[0], c_tile(m_blk, n_blk), n_blk);
+        vt::mma_load_c_slot<kMmaDescId>(handle, c_tile(m_blk, n_blk), n_blk);
         (void)vt::tc_commit(kBarC);
         vt::mbarrier_arrive(kBarC);
         vt::mbarrier_wait(kBarC);
       }
 
-      // 预加载第一个 K-phase 到 handle[0]
-      (void)vt::tma_load(handle[0], a_desc(m_group, 0));
-      (void)vt::tma_load(handle[0], b_desc(0, ng));
+      // 预加载第一个 K-phase: A→window 0, B→window 1
+      (void)vt::tma_load(handle, a_desc(m_group, 0), /*window_id=*/0);
+      (void)vt::tma_load(handle, b_desc(0, ng), /*window_id=*/1);
 
-      // ---- K 循环: 双缓冲流水线 ----
+      // ---- K 循环 ----
       for (uint32_t kp = 0; kp < kKPhases; ++kp) {
-        uint32_t cur = kp & 1;
-        uint32_t nxt = 1 - cur;
-
-        // 预取下一 K-phase 到另一个 handle (与当前 compute 重叠)
         if (kp + 1 < kKPhases) {
-          (void)vt::tma_load(handle[nxt], a_desc(m_group, kp + 1));
-          (void)vt::tma_load(handle[nxt], b_desc(kp + 1, ng));
+          (void)vt::tma_load(handle, a_desc(m_group, kp + 1), /*window_id=*/0);
+          (void)vt::tma_load(handle, b_desc(kp + 1, ng), /*window_id=*/1);
         }
 
-        // 在 handle[cur] 上计算: 2 output tiles × 4 k8 steps
+        // 计算: 2 output tiles × 4 k8 steps
         // 先处理完一个 output tile 的所有 k8 再切换 (减少 FIFO switch)
         for (uint32_t n_blk = 0; n_blk < TILES_PER_BATCH; ++n_blk) {
           uint32_t c_slot = n_blk;
           for (uint32_t ks = 0; ks < kKTilesWin; ++ks) {
             uint32_t ab_slot = ks & 1;
-            load_ab(handle[cur], a_tile(m_blk, ks), b_tile(ks, n_blk), ab_slot);
+            load_ab(handle, a_tile(m_blk, ks), b_tile(ks, n_blk), ab_slot);
             vt::mbarrier_wait(kBarAB + ab_slot);
             ctx::mma_sync_slots<kMmaDescId>(ab_slot, ab_slot, c_slot,
                                              fragC, fragA, fragB, fragC);
@@ -119,24 +114,23 @@ static inline void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
         }
       }
 
-      // 存储 (用最后一个 K-phase 的 handle)
-      uint32_t last_h = (kKPhases - 1) & 1;
+      // 存储
       vt::tc_wait();
       for (uint32_t n_blk = 0; n_blk < TILES_PER_BATCH; ++n_blk) {
-        vt::mma_store_c_slot<kMmaDescId>(handle[last_h], c_tile(m_blk, n_blk), n_blk);
+        vt::mma_store_c_slot<kMmaDescId>(handle, c_tile(m_blk, n_blk), n_blk);
       }
       vt::tc_wait();
-      (void)vt::tma_store(handle[last_h], d_desc(m_group, ng));
+      (void)vt::tma_store(handle, d_desc(m_group, ng), /*window_id=*/3);
     }
   }
 
-  vt::tmem_free(handle[1]);
-  vt::tmem_free(handle[0]);
+  vt::tmem_free(handle);
+  } // m_group loop
 }
 
 int main() {
   auto arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
-  uint32_t grid_dim = kMGroups;
+  uint32_t grid_dim = 1;  // 单 warp: TMEM 是核心共享, 不能多 warp 同时占用
   return vx_spawn_threads(1, &grid_dim, arg->block_dim,
                           (vx_kernel_func_cb)kernel_body, arg);
 }

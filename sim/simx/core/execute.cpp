@@ -1491,7 +1491,9 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       case TcuType::TMEM_ALLOC: {
         auto col_span = std::max<uint32_t>(1, rs1_data.at(thread_start).u32);
         auto mma_desc_id = rs2_data.at(thread_start).u32; // rs2: MMA descriptor ID (0 = legacy)
+        std::cerr << "[TMEM_ALLOC] col_span=" << col_span << " desc_id=" << mma_desc_id << std::endl;
         auto handle = core_->tmem_alloc(col_span, mma_desc_id);
+        std::cerr << "[TMEM_ALLOC] handle=" << handle << std::endl;
         if (handle == 0) {
           throw std::runtime_error(
             "TMEM allocation failed: requested " + std::to_string(col_span)

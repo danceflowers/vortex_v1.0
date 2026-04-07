@@ -42,7 +42,7 @@ static constexpr uint32_t kTileK   = TILE_K;
 static constexpr uint32_t kMatM    = MATRIX_M;
 static constexpr uint32_t kMatN    = MATRIX_N;
 static constexpr uint32_t kMatK    = MATRIX_K;
-static constexpr uint32_t kColSpan = 32;  // 2 allocs × 32 cols = 64 (TMEM max)
+static constexpr uint32_t kColSpan = 64;  // 单 allocation 用全部 64 cols
 
 // Window 数据大小
 static constexpr uint32_t kAWinBytes = kWinM * kWinK * sizeof(input_a_t);  // 1024
@@ -251,6 +251,9 @@ int main() {
       auto& d = tma[a_desc(mg, kp)];
       d.addr = a_addr + (mg * kKPhases + kp) * kAWinBytes;
       d.size_bytes = kAWinBytes;
+      d.rows = kWinM;
+      d.cols = kWinK;
+      d.elem_bytes = sizeof(input_a_t);
       d.tile_role = kRoleA;
     }
   for (uint32_t kp = 0; kp < kKPhases; ++kp)
@@ -258,16 +261,25 @@ int main() {
       auto& d = tma[b_desc(kp, ng)];
       d.addr = b_addr + (kp * kNGroups + ng) * kBWinBytes;
       d.size_bytes = kBWinBytes;
+      d.rows = kWinK;
+      d.cols = kWinN;
+      d.elem_bytes = sizeof(input_b_t);
       d.tile_role = kRoleB;
     }
   tma[kCInId].addr = c_addr;
   tma[kCInId].size_bytes = kCWinBytes;
+  tma[kCInId].rows = kWinM;
+  tma[kCInId].cols = kWinN;
+  tma[kCInId].elem_bytes = sizeof(output_t);
   tma[kCInId].tile_role = kRoleC;
   for (uint32_t mg = 0; mg < kMGroups; ++mg)
     for (uint32_t ng = 0; ng < kNGroups; ++ng) {
       auto& d = tma[d_desc(mg, ng)];
       d.addr = out_addr + (mg * kNGroups + ng) * kCWinBytes;
       d.size_bytes = kCWinBytes;
+      d.rows = kWinM;
+      d.cols = kWinN;
+      d.elem_bytes = sizeof(output_t);
       d.tile_role = kRoleC;
     }
 
