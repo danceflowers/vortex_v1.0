@@ -28,37 +28,43 @@
 #define SPARSE_MODE 0
 #endif
 
-// Matrix dimensions (512x512x512 GEMM: D = A * B, C=0)
+// Matrix dimensions
 #ifndef MATRIX_M
 #define MATRIX_M 512
 #endif
-
 #ifndef MATRIX_N
 #define MATRIX_N 512
 #endif
-
 #ifndef MATRIX_K
 #define MATRIX_K 512
 #endif
 
-// Tile dimensions (each WMMA covers m16 n16 k16, i.e. 2 x k8 sub-tiles)
+// Window shape: 16×16 → A=16×16, B=16×16, C=D=16×16
+// 每个 16×16 A/B window 含 2 个 k8 tile → 一次 TMA 搬运 k16
+#define WIN_M 16
+#define WIN_N 16
+#define WIN_K 16
+
+// 硬件计算原语 tile: A=16×8, B=8×16, C/D=16×16
 #define TILE_M 16
 #define TILE_N 16
-#define TILE_K 16
+#define TILE_K 8
 
-// Derived tile counts
-#define M_TILES (MATRIX_M / TILE_M)
-#define N_TILES (MATRIX_N / TILE_N)
-#define K_PHASES (MATRIX_K / TILE_K)
+// 每个 window 内的 tile 数
+#define A_TILES_PER_WIN ((WIN_M / TILE_M) * (WIN_K / TILE_K))  // 1×2=2
+#define B_TILES_PER_WIN ((WIN_K / TILE_K) * (WIN_N / TILE_N))  // 2×1=2
+
+// 全局 tile 计数
+#define M_TILES (MATRIX_M / WIN_M)   // 32
+#define N_TILES (MATRIX_N / WIN_N)   // 32
+#define K_PHASES (MATRIX_K / WIN_K)  // 32
 
 typedef vortex::tensor::descriptor_table_arg_t descriptor_table_arg_t;
 
 typedef struct {
   descriptor_table_arg_t desc_tables;
   uint32_t block_dim[2];
-  uint32_t a_bank_span;
-  uint32_t b_bank_span;
-  uint32_t c_bank_span;
+  uint32_t col_span;       // TMEM allocation 列数 (16/32/64)
 } kernel_arg_t;
 
 typedef struct __attribute__((packed)) {

@@ -5,73 +5,54 @@
 namespace vt = vortex::tensor;
 using ctx = vt::wmma_context_ab<NUM_THREADS, vt::ATYPE, vt::BTYPE, vt::OTYPE>;
 
-static constexpr uint32_t kMTiles   = M_TILES;   // 32
-static constexpr uint32_t kNTiles   = N_TILES;   // 32
-static constexpr uint32_t kKPhases  = K_PHASES;  // 32
-static constexpr uint32_t kPipelineStages = 2;
+static constexpr uint32_t kMTiles   = M_TILES;
+static constexpr uint32_t kNTiles   = N_TILES;
+static constexpr uint32_t kKPhases  = K_PHASES;
+static constexpr uint32_t kATilesPerWin = A_TILES_PER_WIN;  // 2
 static constexpr uint32_t kMmaDescId = 0;
 
 // ---------------------------------------------------------------------------
 // Descriptor-table layout (shared with host):
-//   A descs : [0                       .. kMTiles*kKPhases          )
-//   B descs : [kBDescBase              .. kBDescBase+kKPhases*kNTiles)
-//   C_in    : kCInDescId               (single zero-buffer descriptor)
-//   C_out   : [kCOutDescBase           .. kCOutDescBase+kMTiles*kNTiles)
+//   A descs : [0 .. kMTiles*kKPhases)              per (m, k_phase)
+//   B descs : [kBBase .. kBBase+kKPhases*kNTiles)   per (k_phase, n)
+//   C_in    : kCInId                                single zero-buffer
+//   D_out   : [kDBase .. kDBase+kMTiles*kNTiles)    per (m, n)
 // ---------------------------------------------------------------------------
-static constexpr uint32_t kADescCount  = kMTiles * kKPhases;
-static constexpr uint32_t kBDescBase   = kADescCount;
-static constexpr uint32_t kCInDescId   = kADescCount + kKPhases * kNTiles;
-static constexpr uint32_t kCOutDescBase = kCInDescId + 1;
+static constexpr uint32_t kACount  = kMTiles * kKPhases;
+static constexpr uint32_t kBBase   = kACount;
+static constexpr uint32_t kCInId   = kACount + kKPhases * kNTiles;
+static constexpr uint32_t kDBase   = kCInId + 1;
 
-static inline uint32_t a_desc_id(uint32_t m, uint32_t k) {
-  return m * kKPhases + k;
-}
-static inline uint32_t b_desc_id(uint32_t k, uint32_t n) {
-  return kBDescBase + k * kNTiles + n;
-}
-static inline uint32_t c_out_desc_id(uint32_t m, uint32_t n) {
-  return kCOutDescBase + m * kNTiles + n;
-}
+static inline uint32_t a_desc(uint32_t m, uint32_t k) { return m * kKPhases + k; }
+static inline uint32_t b_desc(uint32_t k, uint32_t n) { return kBBase + k * kNTiles + n; }
+static inline uint32_t d_desc(uint32_t m, uint32_t n) { return kDBase + m * kNTiles + n; }
 
 // Barrier IDs
-static inline uint32_t ab_barrier_id(uint32_t stage) { return stage; }
-static constexpr uint32_t kCLoadBarrier = 2;
+static constexpr uint32_t kBarrier0 = 0;
+static constexpr uint32_t kBarrier1 = 1;
+static constexpr uint32_t kCBarrier = 2;
 
-// ---------------------------------------------------------------------------
-// Async helpers
-// ---------------------------------------------------------------------------
-static inline void issue_async_mma_load_ab(uint32_t handle_a,
-                                           uint32_t handle_b,
-                                           uint32_t slot_id,
-                                           uint32_t barrier_id) {
-  vt::mbarrier_init(barrier_id, 1);
-  vt::mma_load_a_slot<kMmaDescId>(handle_a, 0, 0, slot_id);
-  vt::mma_load_b_slot<kMmaDescId>(handle_b, 0, 0, slot_id);
-  (void)vt::tc_commit(barrier_id);
-  vt::mbarrier_arrive(barrier_id);
-}
-
-static inline void issue_async_mma_load_c(uint32_t handle_c,
-                                          uint32_t slot_id,
-                                          uint32_t barrier_id) {
-  vt::mbarrier_init(barrier_id, 1);
-  vt::mma_load_c_slot<kMmaDescId>(handle_c, 0, 0, slot_id);
-  (void)vt::tc_commit(barrier_id);
-  vt::mbarrier_arrive(barrier_id);
+static inline void issue_mma_load_ab(uint32_t handle,
+                                     uint32_t a_tile, uint32_t b_tile,
+                                     uint32_t slot, uint32_t barrier) {
+  vt::mbarrier_init(barrier, 1);
+  vt::mma_load_a_slot<kMmaDescId>(handle, a_tile, slot);
+  vt::mma_load_b_slot<kMmaDescId>(handle, b_tile, slot);
+  (void)vt::tc_commit(barrier);
+  vt::mbarrier_arrive(barrier);
 }
 
 // ---------------------------------------------------------------------------
-// kernel_body — each warp processes one row of M-tiles across all N-tiles.
+// kernel_body — 32 warps (warpgroup), each processes one M-row of N-tiles.
 //
-// TMEM budget (fp8/fp8/fp16):
-//   2 x A-buffers  (ping-pong over K)   = 2 * a_bank_span
-//   2 x B-buffers  (ping-pong over K)   = 2 * b_bank_span
-//   2 x C-buffers  (ping-pong over N)   = 2 * c_bank_span
-//                                       = 2*16 + 2*16 + 2*32 = 128 cols
+// Window shape: 16×16 (m16n16k16)
+//   A window: 16×16 → 2 tiles (k8_step 0,1)
+//   B window: 16×16 → 2 tiles (k8_step 0,1)
+//   C/D window: 16×16 → 1 tile
 //
-// Pipeline:
-//   outer loop : N-tiles  →  C slot ping-pong (slot 0/1)
-//   inner loop : K-phases →  A/B slot ping-pong, output-stationary accumulate
+// Output-resident (ws=1): FIFO accumulates across all K-phases.
+// AMem/BMem ping-pong: slot 0/1 alternates within each k16 window.
+// CMem ping-pong: slot 0/1 alternates between consecutive N-tiles.
 // ---------------------------------------------------------------------------
 static inline void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   uint32_t m_tile = blockIdx.x;
@@ -84,87 +65,63 @@ static inline void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   ctx::fill_fragment(fragB, 0);
   ctx::fill_fragment(fragC, 0);
 
-  // ---- allocate TMEM -------------------------------------------------------
-  uint32_t handle_a[kPipelineStages];
-  uint32_t handle_b[kPipelineStages];
-  uint32_t handle_c[2];
-  for (uint32_t s = 0; s < kPipelineStages; ++s) {
-    handle_a[s] = vt::tmem_alloc(arg->a_bank_span);
-    handle_b[s] = vt::tmem_alloc(arg->b_bank_span);
-  }
-  handle_c[0] = vt::tmem_alloc(arg->c_bank_span);
-  handle_c[1] = vt::tmem_alloc(arg->c_bank_span);
+  // 一个 allocation: A+B+C+D windows, col_span 由 host 传入
+  uint32_t handle = vt::tmem_alloc(arg->col_span, kMmaDescId);
 
-  uint32_t c_store_async[2] = {};
-  bool     c_store_live[2]  = {false, false};
+  uint32_t d_store_async[2] = {};
+  bool     d_store_live[2]  = {false, false};
 
-  // ---- outer N-tile loop (C ping-pong) ------------------------------------
+  // ---- 外层 N-tile 循环 (CMem ping-pong) ----
   for (uint32_t n_tile = 0; n_tile < kNTiles; ++n_tile) {
     uint32_t c_slot = n_tile & 1;
 
-    // wait for the previous tma_store that used this C handle
-    if (c_store_live[c_slot]) {
-      vt::tma_wait(c_store_async[c_slot]);
-      c_store_live[c_slot] = false;
+    // 等待同一 c_slot 的上一次 TMA store 完成
+    if (d_store_live[c_slot]) {
+      vt::tma_wait(d_store_async[c_slot]);
+      d_store_live[c_slot] = false;
     }
 
-    // load C = 0 : DRAM → TMEM → CMem[c_slot]
-    (void)vt::tma_load(handle_c[c_slot], kCInDescId);
-    issue_async_mma_load_c(handle_c[c_slot], c_slot, kCLoadBarrier);
-    vt::mbarrier_wait(kCLoadBarrier);
+    // 加载 C = 0: DRAM → TMEM(C window) → CMem[c_slot]
+    (void)vt::tma_load(handle, kCInId);
+    vt::mbarrier_init(kCBarrier, 1);
+    vt::mma_load_c_slot<kMmaDescId>(handle, 0, c_slot);
+    (void)vt::tc_commit(kCBarrier);
+    vt::mbarrier_arrive(kCBarrier);
+    vt::mbarrier_wait(kCBarrier);
 
-    // prefetch first pipeline stages of A/B from DRAM → TMEM
-    for (uint32_t s = 0; s < kPipelineStages && s < kKPhases; ++s) {
-      (void)vt::tma_load(handle_a[s], a_desc_id(m_tile, s));
-      (void)vt::tma_load(handle_b[s], b_desc_id(s, n_tile));
-    }
-    uint32_t next_prefetch = kPipelineStages;
-
-    // ---- inner K-phase loop (A/B ping-pong, output-stationary) ------------
+    // ---- 内层 K-phase 循环 (A/B ping-pong, output-resident 累加) ----
     for (uint32_t k = 0; k < kKPhases; ++k) {
-      uint32_t ab_slot = k & 1;
+      // TMA 搬运一个 16×16 A/B window (含 2 个 k8 tile)
+      (void)vt::tma_load(handle, a_desc(m_tile, k));
+      (void)vt::tma_load(handle, b_desc(k, n_tile));
 
-      // TMEM → AMem/BMem[ab_slot]
-      issue_async_mma_load_ab(handle_a[ab_slot], handle_b[ab_slot],
-                              ab_slot, ab_barrier_id(ab_slot));
-      vt::mbarrier_wait(ab_barrier_id(ab_slot));
+      // 遍历 window 内的 2 个 k8 tile, AMem/BMem slot ping-pong
+      for (uint32_t t = 0; t < kATilesPerWin; ++t) {
+        uint32_t ab_slot = t & 1;
+        issue_mma_load_ab(handle, t, t, ab_slot, ab_slot);
+        vt::mbarrier_wait(ab_slot);
 
-      // overlap: prefetch next K-phase into the freed TMEM buffer
-      if (next_prefetch < kKPhases) {
-        (void)vt::tma_load(handle_a[ab_slot],
-                           a_desc_id(m_tile, next_prefetch));
-        (void)vt::tma_load(handle_b[ab_slot],
-                           b_desc_id(next_prefetch, n_tile));
-        ++next_prefetch;
+        // WMMA: CMem[c_slot] += AMem[ab_slot] * BMem[ab_slot]
+        ctx::mma_sync_slots<kMmaDescId>(ab_slot, ab_slot, c_slot,
+                                         fragC, fragA, fragB, fragC);
       }
-
-      // WMMA: CMem[c_slot] += AMem[ab_slot] * BMem[ab_slot]
-      ctx::mma_sync_slots<kMmaDescId>(ab_slot, ab_slot, c_slot,
-                                       fragC, fragA, fragB, fragC);
     }
 
-    // store accumulated output: CMem[c_slot] → TMEM → DRAM
+    // 存储累加结果: CMem → TMEM(D window) → DRAM
     vt::tc_wait();
-    vt::mma_store_c_slot<kMmaDescId>(handle_c[c_slot], 0, 0, c_slot);
+    vt::mma_store_c_slot<kMmaDescId>(handle, 0, c_slot);
     vt::tc_wait();
-    c_store_async[c_slot] =
-        vt::tma_store(handle_c[c_slot], c_out_desc_id(m_tile, n_tile));
-    c_store_live[c_slot] = true;
+    d_store_async[c_slot] = vt::tma_store(handle, d_desc(m_tile, n_tile));
+    d_store_live[c_slot] = true;
   }
 
-  // drain any outstanding store
+  // 排空未完成的 store
   for (uint32_t s = 0; s < 2; ++s) {
-    if (c_store_live[s])
-      vt::tma_wait(c_store_async[s]);
+    if (d_store_live[s])
+      vt::tma_wait(d_store_async[s]);
   }
 
-  // ---- free TMEM (reverse allocation order) --------------------------------
-  vt::tmem_free(handle_c[1]);
-  vt::tmem_free(handle_c[0]);
-  for (int s = kPipelineStages - 1; s >= 0; --s) {
-    vt::tmem_free(handle_b[s]);
-    vt::tmem_free(handle_a[s]);
-  }
+  vt::tmem_free(handle);
 }
 
 int main() {
