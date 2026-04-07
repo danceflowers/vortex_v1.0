@@ -768,15 +768,6 @@ inline uint32_t tcu_mma_mem_make_control(TcuTarget target,
        | ((slot_id & tcu_control_field_mask(kTcuMmaMemCtlSlotBits)) << kTcuMmaMemCtlSlotShift);
 }
 
-// 兼容旧接口 (window_id 忽略)
-inline uint32_t tcu_mma_mem_make_control(TcuTarget target,
-                                         uint32_t slot_id,
-                                         uint32_t window_id,
-                                         uint32_t tile_id) {
-  (void)window_id;
-  return tcu_mma_mem_make_control(target, slot_id, tile_id);
-}
-
 inline TcuTarget tcu_mma_mem_ctl_target(uint32_t control) {
   auto raw = (control >> kTcuMmaMemCtlTargetShift) & tcu_control_field_mask(kTcuMmaMemCtlTargetBits);
   switch (raw) {

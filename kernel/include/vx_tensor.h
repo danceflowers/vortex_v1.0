@@ -177,15 +177,6 @@ inline __attribute__((always_inline)) constexpr uint32_t encode_mma_mem_control(
        | ((slot_id & mma_mem_ctl_mask(mma_mem_ctl_slot_bits)) << mma_mem_ctl_slot_shift);
 }
 
-// 兼容旧接口 (window_id 参数被忽略)
-inline __attribute__((always_inline)) constexpr uint32_t encode_mma_mem_control(tcu_target target,
-                                                                                uint32_t slot_id,
-                                                                                uint32_t window_id,
-                                                                                uint32_t tile_id) {
-  (void)window_id;
-  return encode_mma_mem_control(target, slot_id, tile_id);
-}
-
 inline __attribute__((always_inline)) void bind_tmem_payload_region(tma_descriptor_t* desc, uint32_t handle) {
   desc->tmem_base = tmem_handle_base(handle);
   desc->bank_span = tmem_handle_span(handle);
@@ -205,7 +196,7 @@ inline __attribute__((always_inline)) uint32_t tmem_alloc(uint32_t col_span, uin
   return handle;
 }
 
-// 兼容旧接口: 不绑定 MMA descriptor (desc_id = 0)
+// 无 descriptor 绑定的分配 (legacy 路径, desc_id=0)
 inline __attribute__((always_inline)) uint32_t tmem_alloc(uint32_t col_span) {
   return tmem_alloc(col_span, 0);
 }
@@ -411,13 +402,21 @@ inline __attribute__((always_inline)) void mma_store_c_slot(uint32_t handle,
   mma_store_mem<DescId>(handle, control);
 }
 
-// 兼容旧接口 (window_id 被忽略)
+// 4 参数重载: window_id 被硬件忽略 (auto-routing), 保留供现有测试编译
 template <uint32_t DescId>
-inline __attribute__((always_inline)) void mma_store_c_slot(uint32_t handle,
-                                                            uint32_t window_id,
-                                                            uint32_t tile_id,
-                                                            uint32_t slot_id) {
-  (void)window_id;
+inline __attribute__((always_inline)) void mma_load_a_slot(uint32_t handle, uint32_t /*window_id*/, uint32_t tile_id, uint32_t slot_id) {
+  mma_load_a_slot<DescId>(handle, tile_id, slot_id);
+}
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_load_b_slot(uint32_t handle, uint32_t /*window_id*/, uint32_t tile_id, uint32_t slot_id) {
+  mma_load_b_slot<DescId>(handle, tile_id, slot_id);
+}
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_load_c_slot(uint32_t handle, uint32_t /*window_id*/, uint32_t tile_id, uint32_t slot_id) {
+  mma_load_c_slot<DescId>(handle, tile_id, slot_id);
+}
+template <uint32_t DescId>
+inline __attribute__((always_inline)) void mma_store_c_slot(uint32_t handle, uint32_t /*window_id*/, uint32_t tile_id, uint32_t slot_id) {
   mma_store_c_slot<DescId>(handle, tile_id, slot_id);
 }
 
