@@ -42,7 +42,7 @@ static constexpr uint32_t kTileK   = TILE_K;
 static constexpr uint32_t kMatM    = MATRIX_M;
 static constexpr uint32_t kMatN    = MATRIX_N;
 static constexpr uint32_t kMatK    = MATRIX_K;
-static constexpr uint32_t kColSpan = 64;  // 单 allocation 用全部 64 cols
+static constexpr uint32_t kColSpan = 32;  // 双缓冲: 2 alloc × 32 cols = 64 (TMEM 总量)
 
 // Window 数据大小
 static constexpr uint32_t kAWinBytes = kWinM * kWinK * sizeof(input_a_t);  // 1024
@@ -122,14 +122,12 @@ static void compute_tile_ref(float out[kTileM][kTileN],
       // 直接构造 k8 packet: 每个 packet = 一个 8×8 block (64 fp8 bytes)
       // A (16×8): 2 packets — packet[0]=rows 0-7, packet[1]=rows 8-15
       // B (8×16): 2 packets — packet[0]=cols 0-7, packet[1]=cols 8-15
-      std::vector<AMem::packet_t> a_pkt(AMem::packet_count(a_fmt));  // 2 for fp8
+      std::vector<AMem::packet_t> a_pkt(AMem::packet_count(a_fmt));
       std::vector<BMem::packet_t> b_pkt(BMem::packet_count(b_fmt));
       for (uint32_t line = 0; line < 2; ++line) {
-        // A: line=step_m, each line is 8 rows × 8 cols = 64 elements
         for (uint32_t r = 0; r < 8; ++r)
           for (uint32_t c = 0; c < 8; ++c)
             a_pkt[line][r * 8 + c] = a_tile_data[line * 8 + r][c];
-        // B: line=step_n, each line is 8 rows × 8 cols = 64 elements
         for (uint32_t r = 0; r < 8; ++r)
           for (uint32_t c = 0; c < 8; ++c)
             b_pkt[line][r * 8 + c] = b_tile_data[r][line * 8 + c];
@@ -251,9 +249,7 @@ int main() {
       auto& d = tma[a_desc(mg, kp)];
       d.addr = a_addr + (mg * kKPhases + kp) * kAWinBytes;
       d.size_bytes = kAWinBytes;
-      d.rows = kWinM;
-      d.cols = kWinK;
-      d.elem_bytes = sizeof(input_a_t);
+      d.rows = kWinM; d.cols = kWinK; d.elem_bytes = sizeof(input_a_t);
       d.tile_role = kRoleA;
     }
   for (uint32_t kp = 0; kp < kKPhases; ++kp)
@@ -261,26 +257,20 @@ int main() {
       auto& d = tma[b_desc(kp, ng)];
       d.addr = b_addr + (kp * kNGroups + ng) * kBWinBytes;
       d.size_bytes = kBWinBytes;
-      d.rows = kWinK;
-      d.cols = kWinN;
-      d.elem_bytes = sizeof(input_b_t);
+      d.rows = kWinK; d.cols = kWinN; d.elem_bytes = sizeof(input_b_t);
       d.tile_role = kRoleB;
     }
   tma[kCInId].addr = c_addr;
   tma[kCInId].size_bytes = kCWinBytes;
-  tma[kCInId].rows = kWinM;
-  tma[kCInId].cols = kWinN;
-  tma[kCInId].elem_bytes = sizeof(output_t);
+  tma[kCInId].rows = kWinM; tma[kCInId].cols = kWinN; tma[kCInId].elem_bytes = sizeof(output_t);
   tma[kCInId].tile_role = kRoleC;
   for (uint32_t mg = 0; mg < kMGroups; ++mg)
     for (uint32_t ng = 0; ng < kNGroups; ++ng) {
       auto& d = tma[d_desc(mg, ng)];
       d.addr = out_addr + (mg * kNGroups + ng) * kCWinBytes;
       d.size_bytes = kCWinBytes;
-      d.rows = kWinM;
-      d.cols = kWinN;
-      d.elem_bytes = sizeof(output_t);
-      d.tile_role = kRoleD;  // D window (tile_role=4 → window_id=3)
+      d.rows = kWinM; d.cols = kWinN; d.elem_bytes = sizeof(output_t);
+      d.tile_role = kRoleD;
     }
 
   // ---- MMA descriptor: m32n32k32, ws=1 ----
