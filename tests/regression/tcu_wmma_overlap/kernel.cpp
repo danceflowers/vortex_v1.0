@@ -79,8 +79,8 @@ static inline void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
     for (uint32_t batch = 0; batch < OUTPUT_BATCHES; ++batch) {
       uint32_t m_blk = batch;
 
-      // 加载 C = 0 → TMEM C window (window_id=2)
-      (void)vt::tma_load(handle, kCInId, /*window_id=*/2);
+      // 加载 C = 0 (auto-route: tile_role=C → window 2)
+      (void)vt::tma_load(handle, kCInId);
       for (uint32_t n_blk = 0; n_blk < TILES_PER_BATCH; ++n_blk) {
         vt::mbarrier_init(kBarC, 1);
         vt::mma_load_c_slot<kMmaDescId>(handle, c_tile(m_blk, n_blk), n_blk);
@@ -89,15 +89,15 @@ static inline void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
         vt::mbarrier_wait(kBarC);
       }
 
-      // 预加载第一个 K-phase: A→window 0, B→window 1
-      (void)vt::tma_load(handle, a_desc(m_group, 0), /*window_id=*/0);
-      (void)vt::tma_load(handle, b_desc(0, ng), /*window_id=*/1);
+      // 预加载第一个 K-phase (auto-route: A→window 0, B→window 1)
+      (void)vt::tma_load(handle, a_desc(m_group, 0));
+      (void)vt::tma_load(handle, b_desc(0, ng));
 
       // ---- K 循环 ----
       for (uint32_t kp = 0; kp < kKPhases; ++kp) {
         if (kp + 1 < kKPhases) {
-          (void)vt::tma_load(handle, a_desc(m_group, kp + 1), /*window_id=*/0);
-          (void)vt::tma_load(handle, b_desc(kp + 1, ng), /*window_id=*/1);
+          (void)vt::tma_load(handle, a_desc(m_group, kp + 1));
+          (void)vt::tma_load(handle, b_desc(kp + 1, ng));
         }
 
         // 计算: 2 output tiles × 4 k8 steps
@@ -120,7 +120,7 @@ static inline void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
         vt::mma_store_c_slot<kMmaDescId>(handle, c_tile(m_blk, n_blk), n_blk);
       }
       vt::tc_wait();
-      (void)vt::tma_store(handle, d_desc(m_group, ng), /*window_id=*/3);
+      (void)vt::tma_store(handle, d_desc(m_group, ng));
     }
   }
 

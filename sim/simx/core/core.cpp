@@ -2529,10 +2529,6 @@ uint32_t Core::tmem_alloc(uint32_t col_span, uint32_t mma_desc_id) {
   } else {
     fallback_handle = tmem_.alloc(col_span);
   }
-  if (fallback_handle == 0) {
-    std::cerr << "TMEM alloc debug: col_span=" << col_span
-              << " failed (payload_cols=" << kTmemPayloadCols << ")" << std::endl;
-  }
   return fallback_handle;
 }
 

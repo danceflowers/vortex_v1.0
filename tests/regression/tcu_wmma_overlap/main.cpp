@@ -49,7 +49,7 @@ static constexpr uint32_t kAWinBytes = kWinM * kWinK * sizeof(input_a_t);  // 10
 static constexpr uint32_t kBWinBytes = kWinK * kWinN * sizeof(input_b_t);  // 1024
 static constexpr uint32_t kCWinBytes = kWinM * kWinN * sizeof(output_t);   // 2048
 
-static constexpr uint8_t kRoleA = 1, kRoleB = 2, kRoleC = 3;
+static constexpr uint8_t kRoleA = 1, kRoleB = 2, kRoleC = 3, kRoleD = 4;
 
 // Descriptor layout
 static constexpr uint32_t kACount     = kMGroups * kKPhases;
@@ -280,7 +280,7 @@ int main() {
       d.rows = kWinM;
       d.cols = kWinN;
       d.elem_bytes = sizeof(output_t);
-      d.tile_role = kRoleC;
+      d.tile_role = kRoleD;  // D window (tile_role=4 → window_id=3)
     }
 
   // ---- MMA descriptor: m32n32k32, ws=1 ----

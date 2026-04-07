@@ -1491,9 +1491,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       case TcuType::TMEM_ALLOC: {
         auto col_span = std::max<uint32_t>(1, rs1_data.at(thread_start).u32);
         auto mma_desc_id = rs2_data.at(thread_start).u32; // rs2: MMA descriptor ID (0 = legacy)
-        std::cerr << "[TMEM_ALLOC] col_span=" << col_span << " desc_id=" << mma_desc_id << std::endl;
         auto handle = core_->tmem_alloc(col_span, mma_desc_id);
-        std::cerr << "[TMEM_ALLOC] handle=" << handle << std::endl;
         if (handle == 0) {
           throw std::runtime_error(
             "TMEM allocation failed: requested " + std::to_string(col_span)
@@ -1518,10 +1516,16 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       case TcuType::TMA_LOAD: {
         auto handle = rs1_data.at(thread_start).u32;
         auto tmem_control_word = rs2_data.at(thread_start).u32;
-        tpuArgs.window_id = tcu_tmem_op_ctl_window_id(tmem_control_word);
         auto descriptor_id = tcu_tmem_op_ctl_desc_id(tmem_control_word);
-        // TMA launch enters the Core-side async tensor engine and returns an
-        // async id that later feeds TMA_WAIT / TC_COMMIT synchronization.
+        // auto-routing: 从 TMA descriptor 的 tile_role 推导 window_id
+        {
+          Core::TmaDescriptor tma_desc{};
+          if (core_->read_tma_descriptor(descriptor_id, &tma_desc)) {
+            tpuArgs.window_id = (tma_desc.tile_role > 0) ? (tma_desc.tile_role - 1) : 0;
+          } else {
+            tpuArgs.window_id = tcu_tmem_op_ctl_window_id(tmem_control_word);
+          }
+        }
         auto async_id = core_->tma_load(wid, handle, descriptor_id, tpuArgs.window_id);
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t))
@@ -1534,8 +1538,20 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       case TcuType::TMA_STORE: {
         auto handle = rs1_data.at(thread_start).u32;
         auto tmem_control_word = rs2_data.at(thread_start).u32;
-        tpuArgs.window_id = tcu_tmem_op_ctl_window_id(tmem_control_word);
         auto descriptor_id = tcu_tmem_op_ctl_desc_id(tmem_control_word);
+        // auto-routing: store 的 tile_role=C(3) → window_id=3 (D window)
+        // 但 store descriptor 的 tile_role 可能也是 C(3), 需要区分 C/D
+        // store 始终写入 D window (id=3)
+        {
+          Core::TmaDescriptor tma_desc{};
+          if (core_->read_tma_descriptor(descriptor_id, &tma_desc)) {
+            // tile_role: A=1→0, B=2→1, C=3→2, D=4→3
+            // 对于 store, tile_role=C(3) 应路由到 D window(3)
+            tpuArgs.window_id = (tma_desc.tile_role > 0) ? (tma_desc.tile_role - 1) : 0;
+          } else {
+            tpuArgs.window_id = tcu_tmem_op_ctl_window_id(tmem_control_word);
+          }
+        }
         auto async_id = core_->tma_store(wid, handle, descriptor_id, tpuArgs.window_id);
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t))
