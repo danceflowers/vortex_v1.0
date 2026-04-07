@@ -42,7 +42,7 @@ static constexpr uint32_t kTileK   = TILE_K;
 static constexpr uint32_t kMatM    = MATRIX_M;
 static constexpr uint32_t kMatN    = MATRIX_N;
 static constexpr uint32_t kMatK    = MATRIX_K;
-static constexpr uint32_t kColSpan = 64;
+static constexpr uint32_t kColSpan = 32;  // 2 allocs × 32 cols = 64 (TMEM max)
 
 // Window 数据大小
 static constexpr uint32_t kAWinBytes = kWinM * kWinK * sizeof(input_a_t);  // 1024
