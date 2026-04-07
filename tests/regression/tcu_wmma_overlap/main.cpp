@@ -119,18 +119,21 @@ static void compute_tile_ref(float out[kTileM][kTileN],
         for (uint32_t c = 0; c < kTileN; ++c)
           b_tile_data[r][c] = b_win[(ks * kTileK + r) * kWinN + n_blk * kTileN + c];
 
-      // Pack 成 AMem/BMem 格式并计算 primitive
-      std::vector<uint8_t> a_bytes(kTileM * kTileK * sizeof(input_a_t), 0);
-      std::vector<uint8_t> b_bytes(kTileK * kTileN * sizeof(input_b_t), 0);
-      host_utils::pack_ab_tile(a_bytes, 0, a_tile_data, false);
-      host_utils::pack_ab_tile(b_bytes, 0, b_tile_data, true);
-
-      std::vector<AMem::packet_t> a_pkt(AMem::packet_count(a_fmt));
+      // 直接构造 k8 packet: 每个 packet = 一个 8×8 block (64 fp8 bytes)
+      // A (16×8): 2 packets — packet[0]=rows 0-7, packet[1]=rows 8-15
+      // B (8×16): 2 packets — packet[0]=cols 0-7, packet[1]=cols 8-15
+      std::vector<AMem::packet_t> a_pkt(AMem::packet_count(a_fmt));  // 2 for fp8
       std::vector<BMem::packet_t> b_pkt(BMem::packet_count(b_fmt));
-      for (size_t i = 0; i < a_pkt.size(); ++i)
-        std::copy_n(a_bytes.data() + i * 64, 64, a_pkt[i].begin());
-      for (size_t i = 0; i < b_pkt.size(); ++i)
-        std::copy_n(b_bytes.data() + i * 64, 64, b_pkt[i].begin());
+      for (uint32_t line = 0; line < 2; ++line) {
+        // A: line=step_m, each line is 8 rows × 8 cols = 64 elements
+        for (uint32_t r = 0; r < 8; ++r)
+          for (uint32_t c = 0; c < 8; ++c)
+            a_pkt[line][r * 8 + c] = a_tile_data[line * 8 + r][c];
+        // B: line=step_n, each line is 8 rows × 8 cols = 64 elements
+        for (uint32_t r = 0; r < 8; ++r)
+          for (uint32_t c = 0; c < 8; ++c)
+            b_pkt[line][r * 8 + c] = b_tile_data[r][line * 8 + c];
+      }
 
       AMem amem; BMem bmem;
       tensor_mem_test_utils::bulk_fill_tile_for_reference(&amem, a_fmt, a_pkt);
