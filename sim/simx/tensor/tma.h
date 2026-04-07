@@ -129,7 +129,8 @@ public:
                         const TmemWindowPlan& window,
                         uint32_t packet_idx,
                         TmemPacket* out,
-                        const ReadCallback& dcache_read) const;
+                        const ReadCallback& dcache_read,
+                        bool transpose = false) const;
 
   void store_math_packet(uint64_t base_addr,
                          uint32_t row_stride_bytes,
