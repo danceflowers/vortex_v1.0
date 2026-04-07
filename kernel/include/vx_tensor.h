@@ -177,13 +177,18 @@ inline __attribute__((always_inline)) void bind_tmem_meta_region(tma_descriptor_
   desc->meta_col_span = tmem_handle_span(handle);
 }
 
-inline __attribute__((always_inline)) uint32_t tmem_alloc(uint32_t bank_span) {
+inline __attribute__((always_inline)) uint32_t tmem_alloc(uint32_t col_span, uint32_t mma_desc_id) {
   uint32_t handle;
-  __asm__ volatile (".insn r %2, 1, 2, %0, %1, x0"
+  __asm__ volatile (".insn r %3, 1, 2, %0, %1, %2"
     : "=r"(handle)
-    : "r"(bank_span), "i"(RISCV_CUSTOM0)
+    : "r"(col_span), "r"(mma_desc_id), "i"(RISCV_CUSTOM0)
     : "memory");
   return handle;
+}
+
+// 兼容旧接口: 不绑定 MMA descriptor (desc_id = 0)
+inline __attribute__((always_inline)) uint32_t tmem_alloc(uint32_t col_span) {
+  return tmem_alloc(col_span, 0);
 }
 
 inline __attribute__((always_inline)) void tmem_free(uint32_t handle) {

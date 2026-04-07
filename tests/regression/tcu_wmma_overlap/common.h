@@ -9,7 +9,7 @@
 #endif
 
 #ifndef ITYPE
-#define ITYPE fp16
+#define ITYPE fp8
 #endif
 
 #ifndef ATYPE
@@ -21,20 +21,35 @@
 #endif
 
 #ifndef OTYPE
-#define OTYPE fp32
+#define OTYPE fp16
 #endif
 
 #ifndef SPARSE_MODE
 #define SPARSE_MODE 0
 #endif
 
-#ifndef WORKER_WARPS
-#define WORKER_WARPS 1
+// Matrix dimensions (512x512x512 GEMM: D = A * B, C=0)
+#ifndef MATRIX_M
+#define MATRIX_M 512
 #endif
 
-#ifndef TILE_COUNT
-#define TILE_COUNT WORKER_WARPS
+#ifndef MATRIX_N
+#define MATRIX_N 512
 #endif
+
+#ifndef MATRIX_K
+#define MATRIX_K 512
+#endif
+
+// Tile dimensions (each WMMA covers m16 n16 k16, i.e. 2 x k8 sub-tiles)
+#define TILE_M 16
+#define TILE_N 16
+#define TILE_K 16
+
+// Derived tile counts
+#define M_TILES (MATRIX_M / TILE_M)
+#define N_TILES (MATRIX_N / TILE_N)
+#define K_PHASES (MATRIX_K / TILE_K)
 
 typedef vortex::tensor::descriptor_table_arg_t descriptor_table_arg_t;
 
@@ -44,7 +59,6 @@ typedef struct {
   uint32_t a_bank_span;
   uint32_t b_bank_span;
   uint32_t c_bank_span;
-  uint32_t meta_col_span;
 } kernel_arg_t;
 
 typedef struct __attribute__((packed)) {
