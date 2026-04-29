@@ -1,0 +1,223 @@
+#pragma once
+
+// ============================================================================
+// AMem -- A 操作数 SRAM (单实例版本)
+// ============================================================================
+//
+// 存储组织:
+//   - 单实例，深度 = 4 行 (kDepth = 4)
+//   - 每行存储一个 8×8 primitive block (64 个 fp9 元素)
+//   - m16n16k16 tile: line 0/1 = K-phase 0 的两个 M-block
+//                     line 2/3 = K-phase 1 的两个 M-block
+//
+// Bank 分组:
+//   - 8 个 bank，每个 bank 持有 kBankElems = 8 个元素
+//
+// Fill 路径 (TMEM → AMem)：
+//   convert_fill_packets() / write_fill_line(line_idx, fmt, packets) 将外部
+//   fp8/fp16 精度转为 fp9 后写入指定行。
+//
+// Read 路径 (AMem → WMMA 计算单元):
+//   read_primitive(line_idx, out, transpose) 读出一个 8×8 block。
+//   line_idx 由发射引擎按 k_phase * 2 + storage_m 给出。
+// ============================================================================
+
+#include <array>
+#include <cstdint>
+#include <cstdlib>
+#include <vector>
+
+#include "tensor_cfg.h"
+#include "fp_types.h"
+
+class AMem {
+public:
+  using packet_t = std::array<uint8_t, 64>;
+
+  static constexpr uint32_t kDepth = 4;
+  static constexpr uint32_t kLineElems = 64;
+  static constexpr uint32_t kBankCount = 8;
+  static constexpr uint32_t kBankElems = kLineElems / kBankCount;
+
+  /// fill 一个完整 tile 需要写入的行数（全部 4 行）
+  static constexpr uint32_t fill_lines() {
+    return kDepth;
+  }
+
+  AMem() {
+    reset();
+  }
+
+  void reset() {
+    for (auto& line : lines_) {
+      for (auto& bank : line) {
+        bank.fill(0);
+      }
+    }
+    row_valid_.fill(false);
+  }
+
+  void clear() {
+    for (auto& line : lines_) {
+      for (auto& bank : line) {
+        bank.fill(0);
+      }
+    }
+    row_valid_.fill(false);
+  }
+
+  /// fill 一个完整 m16n16k16 tile 所需的 TMEM 包数:
+  /// fp16 = 8 包 (每行 2 包 × 4 行), fp8 = 4 包
+  static uint32_t packet_count(uint32_t fmt_a) {
+    return (fmt_a == vortex::tensor::fp16::id) ? 8 : 4;
+  }
+
+  static constexpr uint32_t all_bank_mask() {
+    return (1u << kBankCount) - 1u;
+  }
+
+  static uint32_t line_bank_mask(uint32_t line_idx) {
+    if (line_idx >= kDepth) {
+      std::abort();
+    }
+    uint32_t mask = 0;
+    for (uint32_t elem = 0; elem < kLineElems; ++elem) {
+      mask |= (1u << (elem / kBankElems));
+    }
+    return mask;
+  }
+
+  /// WMMA 读 primitive 时涉及的 bank 掩码
+  static uint32_t primitive_bank_mask(uint32_t line_idx,
+                                      bool transpose = false) {
+    (void)transpose;
+    return line_bank_mask(line_idx);
+  }
+
+  /// fill 一行需要的 TMEM 包数: fp16=2, fp8=1
+  static uint32_t packets_per_fill_line(uint32_t fmt_a) {
+    return (fmt_a == vortex::tensor::fp16::id) ? 2 : 1;
+  }
+
+  /// 精度转换: fp8/fp16 → fp9
+  static bool convert_fill_packets(uint32_t fmt_a,
+                                   const std::vector<packet_t>& packets,
+                                   uint16_t out[8][8]) {
+    auto needed = packets_per_fill_line(fmt_a);
+    if (packets.size() < needed) {
+      return false;
+    }
+
+    if (fmt_a == vortex::tensor::fp16::id) {
+      const auto& p0 = packets.at(0);
+      const auto& p1 = packets.at(1);
+      for (uint32_t elem = 0; elem < kLineElems; ++elem) {
+        auto byte_idx = elem * 2;
+        uint16_t fp16 = 0;
+        if (byte_idx < 64) {
+          fp16 = static_cast<uint16_t>(p0.at(byte_idx + 0) | (p0.at(byte_idx + 1) << 8));
+        } else {
+          auto local = byte_idx - 64;
+          fp16 = static_cast<uint16_t>(p1.at(local + 0) | (p1.at(local + 1) << 8));
+        }
+        out[elem / 8][elem % 8] = convert_to_fp9(fp16, PREC_FP16);
+      }
+      return true;
+    }
+
+    if (fmt_a == vortex::tensor::fp8::id) {
+      const auto& p = packets.at(0);
+      for (uint32_t elem = 0; elem < kLineElems; ++elem) {
+        out[elem / 8][elem % 8] = convert_to_fp9(p.at(elem), PREC_FP8_E4M3);
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  /// 便捷路径：转换 + 写入
+  bool write_fill_line(uint32_t fmt_a,
+                       uint32_t line_idx,
+                       const std::vector<packet_t>& packets) {
+    auto needed = packets_per_fill_line(fmt_a);
+    if (line_idx >= kDepth || packets.size() < needed) {
+      return false;
+    }
+
+    auto& dst = lines_.at(line_idx);
+    for (auto& bank : dst) {
+      bank.fill(0);
+    }
+    uint16_t converted[8][8] = {};
+    if (!convert_fill_packets(fmt_a, packets, converted)) {
+      return false;
+    }
+    for (uint32_t i = 0; i < 8; ++i) {
+      for (uint32_t j = 0; j < 8; ++j) {
+        store_elem(dst, i * 8 + j, converted[i][j]);
+      }
+    }
+    row_valid_.at(line_idx) = true;
+    return true;
+  }
+
+  /// 时序路径：已转换好的数据直接写入
+  bool write_converted_line(uint32_t line_idx,
+                            const uint16_t in[8][8]) {
+    if (line_idx >= kDepth) {
+      return false;
+    }
+    auto& dst = lines_.at(line_idx);
+    for (auto& bank : dst) {
+      bank.fill(0);
+    }
+    for (uint32_t i = 0; i < 8; ++i) {
+      for (uint32_t j = 0; j < 8; ++j) {
+        store_elem(dst, i * 8 + j, in[i][j]);
+      }
+    }
+    row_valid_.at(line_idx) = true;
+    return true;
+  }
+
+  /// 所有 4 行都填有有效数据
+  bool valid() const {
+    for (uint32_t line = 0; line < kDepth; ++line) {
+      if (!row_valid_.at(line)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /// WMMA 读 primitive: 读出 line_idx 对应的 8×8 block
+  void read_primitive(uint32_t line_idx,
+                      uint16_t out[8][8],
+                      bool transpose = false) const {
+    if (line_idx >= kDepth || !row_valid_.at(line_idx)) {
+      std::abort();
+    }
+    const auto& line = lines_.at(line_idx);
+    for (uint32_t i = 0; i < 8; ++i) {
+      for (uint32_t j = 0; j < 8; ++j) {
+        auto elem_idx = transpose ? (j * 8 + i) : (i * 8 + j);
+        out[i][j] = load_elem(line, elem_idx);
+      }
+    }
+  }
+
+private:
+  using row_t = std::array<std::array<uint16_t, kBankElems>, kBankCount>;
+
+  static void store_elem(row_t& row, uint32_t elem_idx, uint16_t value) {
+    row.at(elem_idx / kBankElems).at(elem_idx % kBankElems) = value;
+  }
+
+  static uint16_t load_elem(const row_t& row, uint32_t elem_idx) {
+    return row.at(elem_idx / kBankElems).at(elem_idx % kBankElems);
+  }
+
+  std::array<row_t, kDepth> lines_;
+  std::array<bool, kDepth> row_valid_;
+};
