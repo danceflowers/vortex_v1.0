@@ -71,8 +71,8 @@ bool TmaFrontend::read_tma_descriptor(uint32_t desc_id, TmaDescriptor* out) {
                                         });
 }
 
-bool TmaFrontend::read_mma_descriptor(uint32_t desc_id, MmaDescriptor* out) {
-  return tma_model_.read_mma_descriptor(core_->startup_arg(),
+bool TmaFrontend::read_idescriptor(uint32_t desc_id, IDescriptor* out) {
+  return tma_model_.read_idescriptor(core_->startup_arg(),
                                         desc_id,
                                         out,
                                         [this](void* data, uint64_t addr, uint32_t size) {

@@ -23,6 +23,11 @@
 #include "types.h"
 #include "arch.h"
 #include "mem.h"
+// Core owns the architectural pipeline plus the Core-side tensor background
+// engine. The tensor background engine advances TMA load/store and TMEM shift
+// transactions one cycle at a time before the later in-core pipeline stages
+// observe TMEM-visible state in the same global cycle.
+
 #include "core.h"
 #include "debug.h"
 #include "constants.h"
@@ -50,6 +55,14 @@ bool env_flag_enabled(const char* name, bool default_value) {
     return default_value;
   }
   return std::atoi(value) != 0;
+}
+
+uint64_t env_u64_value(const char* name, uint64_t default_value) {
+  auto value = std::getenv(name);
+  if (nullptr == value || '\0' == value[0]) {
+    return default_value;
+  }
+  return std::strtoull(value, nullptr, 0);
 }
 
 TmemWindowTarget map_window_target(const TmaDescriptor& desc) {
@@ -138,11 +151,11 @@ bool build_generic_math_window(uint32_t window_id,
   return true;
 }
 
-uint32_t effective_fmt_d(const MmaDescriptor& desc) {
+uint32_t effective_fmt_d(const IDescriptor& desc) {
   return desc.fmt_d;
 }
 
-TensorShape2D shape_for_target(const MmaDescriptor& desc, TcuTarget target) {
+TensorShape2D shape_for_target(const IDescriptor& desc, TcuTarget target) {
   switch (target) {
   case TcuTarget::A:
     return {desc.a_rows, desc.a_cols};
@@ -155,7 +168,7 @@ TensorShape2D shape_for_target(const MmaDescriptor& desc, TcuTarget target) {
   }
 }
 
-uint32_t fmt_for_target(const MmaDescriptor& desc, TcuTarget target, bool store_path) {
+uint32_t fmt_for_target(const IDescriptor& desc, TcuTarget target, bool store_path) {
   switch (target) {
   case TcuTarget::A:
     return desc.fmt_a;
@@ -183,61 +196,6 @@ TmemWindowTarget planner_target(TcuTarget target, bool store_path) {
 
 uint32_t meta_shadow_window_id(uint32_t window_id) {
   return window_id | 0x80000000u;
-}
-
-bool build_single_target_window_plan(const TmemAllocation& allocation,
-                                     const MmaDescriptor& desc,
-                                     TcuTarget target,
-                                     uint32_t window_id,
-                                     bool store_path,
-                                     TmemWindowPlan* out) {
-  (void)allocation;
-  if (nullptr == out) {
-    return false;
-  }
-  auto shape = shape_for_target(desc, target);
-  auto fmt = fmt_for_target(desc, target, store_path);
-  if (shape.empty() || fmt_elem_bytes(fmt) == 0) {
-    return false;
-  }
-  return TmemWindowPlanner::build_single_dense_window(planner_target(target, store_path),
-                                                      shape,
-                                                      fmt,
-                                                      desc.sparse_mode,
-                                                      window_id,
-                                                      out,
-                                                      nullptr);
-}
-
-bool build_sparse_meta_window_plan(const MmaDescriptor& desc,
-                                   uint32_t window_id,
-                                   TmemWindowPlan* out) {
-  if (nullptr == out || desc.sparse_mode == vortex::tensor::sparse_none || desc.a_rows == 0 || desc.a_cols == 0) {
-    return false;
-  }
-  TmemWindowPlan window{};
-  window.window_id = meta_shadow_window_id(window_id);
-  window.target = TmemWindowTarget::Meta;
-  window.layout_kind = TmemWindowLayoutKind::MathRowMajor;
-  window.elem_shape = {static_cast<uint16_t>(ceil_div(std::max<uint32_t>(1, desc.a_rows), 16u) * 4u),
-                       static_cast<uint16_t>(ceil_div(std::max<uint32_t>(1, desc.a_cols), 16u) * 16u)};
-  window.fmt = vortex::tensor::uint8::id;
-  window.sparse_mode = desc.sparse_mode;
-  window.logical_line_base = 0;
-  window.tile_rows = ceil_div(std::max<uint32_t>(1, desc.a_rows), 16u);
-  window.tile_cols = ceil_div(std::max<uint32_t>(1, desc.a_cols), 16u);
-  window.tile_count = window.tile_rows * window.tile_cols;
-  window.logical_col_span = Tmem::kPacketBytes;
-  window.logical_line_span = window.tile_count;
-  window.logical_tile_col_span = Tmem::kPacketBytes;
-  window.logical_tile_line_span = 1;
-  window.packet_cols = 16;
-  window.packet_rows = 4;
-  window.logical_packet_col_span = Tmem::kPacketBytes;
-  window.logical_packet_line_span = 1;
-  window.packets_per_tile = 1;
-  *out = window;
-  return true;
 }
 
 bool build_sparse_meta_window_plan(const TmaDescriptor& desc,
@@ -291,6 +249,7 @@ TmemWindowPlan build_legacy_window_plan(uint32_t window_id,
                                                          shape,
                                                          fmt,
                                                          0,
+                                                         0, // col_span: auto
                                                          window_id,
                                                          &window,
                                                          nullptr);
@@ -429,6 +388,13 @@ Core::Core(const SimContext& ctx,
   , arch_(arch)
 #ifdef EXT_TCU_ENABLE
   , tensor_unit_(TensorUnit::Create("tcu", arch, this))
+  , tma_frontend_(TmaFrontend::Create("tma_frontend", this, env_flag_enabled("VORTEX_SIMX_TMA_LOAD_REALISTIC", true)))
+  , tmem_system_(TmemSystem::Create("tmem_system", this))
+  , tensor_mem_req_in_(this)
+  , tensor_mem_rsp_out_(this)
+  , tensor_async_op_completion_in_(this)
+  , tma_frontend_async_op_completion_in_(this)
+  , tmem_system_async_op_completion_in_(this)
 #endif
 #ifdef EXT_V_ENABLE
   , vec_unit_(VecUnit::Create("vpu", arch, this))
@@ -446,13 +412,24 @@ Core::Core(const SimContext& ctx,
   , ibuffer_arbs_(ISSUE_WIDTH, {ArbiterType::RoundRobin, PER_ISSUE_WARPS})
 #ifdef EXT_TCU_ENABLE
   , tma_(env_flag_enabled("VORTEX_SIMX_TMA_LOAD_REALISTIC", true))
-  , mbarriers_(arch.num_barriers())
   , mbarrier_wait_targets_(arch.num_warps())
   , fence_wait_states_(arch.num_warps())
   , next_async_id_(1)
 #endif
 {
   char sname[100];
+
+#ifdef EXT_TCU_ENABLE
+  tensor_unit_->TensorMemReqOut.bind(&tmem_system_->TensorExecuteReqIn);
+  tmem_system_->TensorExecuteRspOut.bind(&tensor_unit_->TensorMemRspIn);
+  tma_frontend_->TmemReqOut.bind(&tmem_system_->TmaFrontendReqIn);
+  tmem_system_->TmaFrontendRspOut.bind(&tma_frontend_->TmemRspIn);
+  tmem_system_->RefillChunkReqOut.bind(&tma_frontend_->RefillChunkReqIn);
+  tma_frontend_->RefillChunkRspOut.bind(&tmem_system_->RefillChunkRspIn);
+  tensor_unit_->TensorAsyncOpCompletionOut.bind(&tensor_async_op_completion_in_);
+  tma_frontend_->AsyncOpCompletionOut.bind(&tma_frontend_async_op_completion_in_);
+  tmem_system_->AsyncOpCompletionOut.bind(&tmem_system_async_op_completion_in_);
+#endif
 
   for (uint32_t iw = 0; iw < ISSUE_WIDTH; ++iw) {
     operands_.at(iw) = Operands::Create(this);
@@ -596,13 +573,16 @@ void Core::reset() {
 
 #ifdef EXT_TCU_ENABLE
   tensor_unit_->reset();
+  tma_frontend_->reset();
+  tmem_system_->reset();
   tmem_.reset();
   tma_.reset();
   async_tensor_ops_.clear();
+  async_tmem_ops_fifo_.clear();
+  pending_tensor_mem_reqs_.clear();
   async_tensor_waiters_.clear();
-  for (auto& mbarrier : mbarriers_) {
-    mbarrier = {};
-  }
+  // mbarrier table is now an unordered_map keyed by LMEM address; reset = clear.
+  mbarriers_.clear();
   for (auto& wait_targets : mbarrier_wait_targets_) {
     wait_targets.clear();
   }
@@ -610,6 +590,8 @@ void Core::reset() {
     fence_wait = {};
   }
   next_async_id_ = 1;
+  visible_tma_load_busy_handles_.clear();
+  visible_tma_store_or_shift_busy_handles_.clear();
 #endif
 
   perf_stats_ = PerfStats();
@@ -617,7 +599,19 @@ void Core::reset() {
 
 void Core::tick() {
 #ifdef EXT_TCU_ENABLE
-  advance_async_tensor_engine();
+  execute_cycle_tma_load_reserved_handles_.clear();
+  execute_cycle_tma_store_or_shift_reserved_handles_.clear();
+  drain_tensor_execute_completion_notices();
+  if (!tma_frontend_async_op_completion_in_.empty()) {
+    auto completion = tma_frontend_async_op_completion_in_.front();
+    async_tensor_complete(completion.async_id);
+    tma_frontend_async_op_completion_in_.pop();
+  }
+  if (!tmem_system_async_op_completion_in_.empty()) {
+    auto completion = tmem_system_async_op_completion_in_.front();
+    async_tensor_complete(completion.async_id);
+    tmem_system_async_op_completion_in_.pop();
+  }
 #endif
   this->commit();
   this->execute();
@@ -625,9 +619,104 @@ void Core::tick() {
   this->decode();
   this->fetch();
   this->schedule();
+#ifdef EXT_TCU_ENABLE
+  auto watchdog_cycle = env_u64_value("VORTEX_SIMX_TENSOR_WATCHDOG_CYCLES", 0);
+  if (watchdog_cycle != 0 && perf_stats_.cycles >= watchdog_cycle) {
+    this->dump_tensor_debug_state(std::cerr);
+    std::abort();
+  }
+#endif
 
   ++perf_stats_.cycles;
   DPN(2, std::flush);
+}
+
+void Core::publish_visible_tensor_mem_state() {
+  visible_tma_load_busy_handles_.clear();
+  visible_tma_store_or_shift_busy_handles_.clear();
+  for (const auto& entry : async_tensor_ops_) {
+    const auto& op = entry.second;
+    if (op.completed) {
+      continue;
+    }
+    switch (op.type) {
+    case AsyncTensorOpType::TmaLoad:
+      visible_tma_load_busy_handles_.insert(op.handle);
+      break;
+    case AsyncTensorOpType::TmaStore:
+    case AsyncTensorOpType::TmemShift:
+      visible_tma_store_or_shift_busy_handles_.insert(op.handle);
+      break;
+    default:
+      break;
+    }
+  }
+  if (nullptr != tmem_system_) {
+    tmem_system_->publish_visible_state();
+    return;
+  }
+  tmem_.publish_visible_state();
+}
+
+uint64_t Core::startup_arg() const {
+  return emulator_.startup_arg();
+}
+
+void Core::dump_tensor_debug_state(std::ostream& os) const {
+#ifdef EXT_TCU_ENABLE
+  os << "==== tensor-debug-state begin ====\n";
+  os << "cycle=" << perf_stats_.cycles << "\n";
+  os << "emulator_running=" << emulator_.running()
+     << " fetch_empty=" << fetch_latch_.empty()
+     << " decode_empty=" << decode_latch_.empty()
+     << " pending_instrs=" << pending_instrs_.size()
+     << "\n";
+  for (uint32_t wid = 0; wid < arch_.num_warps(); ++wid) {
+    os << "  warp=" << wid
+       << " active=" << emulator_.active(wid)
+       << " stalled=" << emulator_.stalled(wid)
+       << " tmask=" << emulator_.warp_tmask_count(wid)
+       << " pc=0x" << std::hex << emulator_.warp_pc(wid) << std::dec
+       << " stall_reason=" << static_cast<uint32_t>(emulator_.stall_reason(wid))
+       << " ibuffer_empty=" << ibuffers_.at(wid).empty()
+       << "\n";
+    emulator_.dump_warp_front_state(os, wid);
+  }
+  os << "async_tensor_ops=" << async_tensor_ops_.size() << "\n";
+  os << "async_tensor_waiters=" << async_tensor_waiters_.size() << "\n";
+  for (const auto& entry : async_tensor_waiters_) {
+    os << "  waiters async_id=" << entry.first
+       << " mask=" << entry.second.to_string()
+       << "\n";
+  }
+  for (auto* trace : pending_instrs_) {
+    os << "  pending_trace " << *trace << "\n";
+  }
+  for (const auto& entry : async_tensor_ops_) {
+    const auto& op = entry.second;
+    os << "  async_id=" << op.async_id
+       << " type=" << static_cast<uint32_t>(op.type)
+       << " wid=" << op.wid
+       << " handle=" << op.handle
+       << " window=" << op.window_id
+       << " completed=" << op.completed
+       << " committed=" << op.committed
+       << " barrier=" << op.barrier_id
+       << "\n";
+  }
+  if (nullptr != tma_frontend_) {
+    tma_frontend_->dump_debug_state(os);
+  }
+  if (nullptr != tmem_system_) {
+    tmem_system_->dump_debug_state(os);
+  }
+  if (nullptr != tensor_unit_) {
+    tensor_unit_->dump_debug_state(os);
+  }
+  os << "==== tensor-debug-state end ====\n";
+#else
+  (void)os;
+#endif
 }
 
 void Core::schedule() {
@@ -907,15 +996,24 @@ void Core::set_satp(uint64_t satp) {
 
 #ifdef EXT_TCU_ENABLE
 
-bool Core::lookup_tmem_allocation(uint32_t handle, TmemAllocation** allocation) {
-  return tmem_.lookup_allocation(handle, allocation);
+bool Core::lookup_tmem_allocation(uint32_t taddr, TmemAllocation** allocation) {
+  if (nullptr != tmem_system_) {
+    return tmem_system_->lookup_allocation(taddr, allocation);
+  }
+  return tmem_.lookup_allocation(taddr, allocation);
 }
 
 bool Core::lookup_tmem_allocation(uint32_t handle, const TmemAllocation** allocation) const {
+  if (nullptr != tmem_system_) {
+    return tmem_system_->lookup_allocation(handle, allocation);
+  }
   return tmem_.lookup_allocation(handle, allocation);
 }
 
 bool Core::read_tma_descriptor(uint32_t desc_id, TmaDescriptor* out) {
+  if (nullptr != tma_frontend_) {
+    return tma_frontend_->read_tma_descriptor(desc_id, out);
+  }
   return tma_.read_tma_descriptor(emulator_.startup_arg(),
                                   desc_id,
                                   out,
@@ -924,8 +1022,11 @@ bool Core::read_tma_descriptor(uint32_t desc_id, TmaDescriptor* out) {
                                   });
 }
 
-bool Core::read_mma_descriptor(uint32_t desc_id, MmaDescriptor* out) {
-  return tma_.read_mma_descriptor(emulator_.startup_arg(),
+bool Core::read_idescriptor(uint32_t desc_id, IDescriptor* out) {
+  if (nullptr != tma_frontend_) {
+    return tma_frontend_->read_idescriptor(desc_id, out);
+  }
+  return tma_.read_idescriptor(emulator_.startup_arg(),
                                   desc_id,
                                   out,
                                   [this](void* data, uint64_t addr, uint32_t size) {
@@ -934,19 +1035,17 @@ bool Core::read_mma_descriptor(uint32_t desc_id, MmaDescriptor* out) {
 }
 
 void Core::reset_tmem_port_budgets() {
+  if (nullptr != tmem_system_) {
+    return;
+  }
   tmem_.reset_port_budgets(perf_stats_.cycles);
 }
 
 void Core::ensure_tmem_port_budgets() {
-  tmem_.ensure_port_budgets(perf_stats_.cycles);
-}
-
-bool Core::try_acquire_tmem_read_port(uint32_t handle, uint32_t packet_idx) {
-  if (!tmem_.try_acquire_read_packet(perf_stats_.cycles, handle, packet_idx)) {
-    return false;
+  if (nullptr != tmem_system_) {
+    return;
   }
-  ++perf_stats_.tmem_read_packets;
-  return true;
+  tmem_.ensure_port_budgets(perf_stats_.cycles);
 }
 
 bool Core::try_acquire_tmem_window_read_port(uint32_t handle, uint32_t window_id, uint32_t packet_idx) {
@@ -962,22 +1061,6 @@ bool Core::try_acquire_tmem_window_linear_read_port(uint32_t handle, uint32_t wi
     return false;
   }
   ++perf_stats_.tmem_read_packets;
-  return true;
-}
-
-bool Core::try_acquire_tmem_read_meta_port(uint32_t handle, uint32_t packet_idx) {
-  if (!tmem_.try_acquire_meta_read_packet(perf_stats_.cycles, handle, packet_idx)) {
-    return false;
-  }
-  ++perf_stats_.tmem_read_packets;
-  return true;
-}
-
-bool Core::try_acquire_tmem_write_port(uint32_t handle, uint32_t packet_idx) {
-  if (!tmem_.try_acquire_write_packet(perf_stats_.cycles, handle, packet_idx)) {
-    return false;
-  }
-  ++perf_stats_.tmem_write_packets;
   return true;
 }
 
@@ -1076,6 +1159,7 @@ void Core::initialize_async_tensor_transaction(AsyncTensorOp& op) {
                                                            {op.tma_desc.rows, op.tma_desc.cols},
                                                            infer_window_fmt(op.tma_desc),
                                                            0,
+                                                           op.transfer_region_col_span,
                                                            op.window_id,
                                                            &legacy_window,
                                                            nullptr);
@@ -1210,6 +1294,7 @@ void Core::initialize_async_tensor_transaction(AsyncTensorOp& op) {
                                                            {op.tma_desc.rows, op.tma_desc.cols},
                                                            infer_window_fmt(op.tma_desc),
                                                            0,
+                                                           op.transfer_region_col_span,
                                                            op.window_id,
                                                            &legacy_window,
                                                            nullptr);
@@ -1416,19 +1501,123 @@ void Core::try_resume_fence_waiters() {
 }
 
 bool Core::tmem_region_query(uint32_t col_base, uint32_t col_span, uint32_t* size_bytes) const {
+  if (nullptr != tmem_system_) {
+    return tmem_system_->region_query(col_base, col_span, size_bytes);
+  }
   return tmem_.region_query(col_base, col_span, size_bytes);
 }
 
 bool Core::tmem_query(uint32_t handle, uint32_t* col_span, uint32_t* size_bytes) const {
+  if (nullptr != tmem_system_) {
+    return tmem_system_->query(handle, col_span, size_bytes);
+  }
   return tmem_.query(handle, col_span, size_bytes);
 }
 
+bool Core::tmem_lookup_allocation(uint32_t handle, const TmemAllocation** allocation) const {
+  return lookup_tmem_allocation(handle, allocation);
+}
+
+bool Core::tmem_transfer_region(uint32_t handle, uint32_t* col_base, uint32_t* col_span) const {
+  const TmemAllocation* allocation = nullptr;
+  if (!lookup_tmem_allocation(handle, &allocation) || nullptr == allocation) {
+    return false;
+  }
+  if (col_base) {
+    *col_base = allocation->payload_col_base;
+  }
+  if (col_span) {
+    *col_span = allocation->col_span;
+  }
+  return true;
+}
+
+uint64_t Core::enqueue_tmem_request(const TmemRequestDesc& desc) {
+  if (nullptr != tmem_system_) {
+    return tmem_system_->enqueue_port_request(desc, desc.age);
+  }
+  return tmem_.enqueue_port_request(perf_stats_.cycles, desc);
+}
+
+bool Core::tmem_request_granted(uint64_t tag) const {
+  if (nullptr != tmem_system_) {
+    return tmem_system_->request_granted(tag);
+  }
+  return tmem_.request_granted(tag);
+}
+
+void Core::consume_tmem_request_grant(uint64_t tag) {
+  if (nullptr != tmem_system_) {
+    tmem_system_->consume_request_grant(tag);
+    return;
+  }
+  tmem_.consume_request_grant(tag);
+}
+
 bool Core::lookup_tmem_window(uint32_t handle, uint32_t window_id, const TmemWindowPlan** out) const {
+  if (nullptr != tmem_system_) {
+    return tmem_system_->lookup_window(handle, window_id, out);
+  }
   return tmem_.lookup_window(handle, window_id, out);
 }
 
+bool Core::tmem_window_packet_count(uint32_t handle, uint32_t window_id, uint32_t* count) const {
+  if (nullptr != tmem_system_) {
+    return tmem_system_->window_packet_count(handle, window_id, count);
+  }
+  return tmem_.window_packet_count(handle, window_id, count);
+}
+
 bool Core::tmem_window_epoch(uint32_t handle, uint32_t* epoch) const {
+  if (nullptr != tmem_system_) {
+    return tmem_system_->window_epoch(handle, epoch);
+  }
   return tmem_.window_epoch(handle, epoch);
+}
+
+bool Core::tmem_upsert_window(uint32_t handle, const TmemWindowPlan& window) {
+  if (nullptr != tmem_system_) {
+    return tmem_system_->upsert_window(handle, window);
+  }
+  return tmem_.upsert_window(handle, window);
+}
+
+void Core::tmem_set_payload_ready(uint32_t handle, bool ready) {
+  if (nullptr != tmem_system_) {
+    tmem_system_->set_payload_ready(handle, ready);
+    return;
+  }
+  tmem_.set_payload_ready(handle, ready);
+}
+
+void Core::tmem_set_meta_ready(uint32_t handle, bool ready) {
+  if (nullptr != tmem_system_) {
+    tmem_system_->set_meta_ready(handle, ready);
+    return;
+  }
+  tmem_.set_meta_ready(handle, ready);
+}
+
+void Core::tmem_set_meta_region(uint32_t handle, uint32_t meta_col_base, uint32_t meta_col_span) {
+  if (nullptr != tmem_system_) {
+    tmem_system_->set_meta_region(handle, meta_col_base, meta_col_span);
+    return;
+  }
+  tmem_.set_meta_region(handle, meta_col_base, meta_col_span);
+}
+
+bool Core::tmem_set_row_bytes(uint32_t handle, uint32_t row_bytes) {
+  if (nullptr != tmem_system_) {
+    return tmem_system_->set_row_bytes(handle, row_bytes);
+  }
+  return tmem_.set_row_bytes(handle, row_bytes);
+}
+
+bool Core::tmem_bump_window_epoch(uint32_t handle) {
+  if (nullptr != tmem_system_) {
+    return tmem_system_->bump_window_epoch(handle);
+  }
+  return tmem_.bump_window_epoch(handle);
 }
 
 bool Core::ensure_tmem_window_bound(uint32_t handle, uint32_t desc_id, TcuTarget target, uint32_t window_id, bool store_path) {
@@ -1437,8 +1626,29 @@ bool Core::ensure_tmem_window_bound(uint32_t handle, uint32_t desc_id, TcuTarget
     return false;
   }
 
-  MmaDescriptor desc{};
-  if (!read_mma_descriptor(desc_id, &desc)) {
+  auto lookup_bound_window = [&](uint32_t lookup_window_id, const TmemWindowPlan** out) -> bool {
+    if (nullptr != tmem_system_) {
+      return tmem_system_->lookup_window(handle, lookup_window_id, out);
+    }
+    return tmem_.lookup_window(handle, lookup_window_id, out);
+  };
+
+  auto read_window_epoch = [&](uint32_t* epoch) -> bool {
+    if (nullptr != tmem_system_) {
+      return tmem_system_->window_epoch(handle, epoch);
+    }
+    return tmem_.window_epoch(handle, epoch);
+  };
+
+  auto bind_layout_plan = [&](const TmemLayoutPlan& plan) -> bool {
+    if (nullptr != tmem_system_) {
+      return tmem_system_->bind_layout(handle, plan);
+    }
+    return tmem_.bind_layout(handle, plan);
+  };
+
+  IDescriptor desc{};
+  if (!read_idescriptor(desc_id, &desc)) {
     return false;
   }
 
@@ -1449,103 +1659,163 @@ bool Core::ensure_tmem_window_bound(uint32_t handle, uint32_t desc_id, TcuTarget
     return true;
   }
 
-  if (target == TcuTarget::None) {
-    TmemWindowPlannerInput input{};
-    input.a_shape = {desc.a_rows, desc.a_cols};
-    input.b_shape = {desc.b_rows, desc.b_cols};
-    input.c_shape = {desc.c_rows, desc.c_cols};
-    input.d_shape = {desc.c_rows, desc.c_cols};
-    input.fmt_a = desc.fmt_a;
-    input.fmt_b = desc.fmt_b;
-    input.fmt_c = desc.fmt_c;
-    input.fmt_d = effective_fmt_d(desc);
-    input.sparse_mode = desc.sparse_mode;
-    input.allocation_col_span = allocation->col_span;
-    TmemLayoutPlan plan{};
-    if (!TmemWindowPlanner::build_dense_plan(input, &plan, nullptr)) {
-      return false;
-    }
-    uint32_t epoch = 0;
-    if (tmem_.window_epoch(handle, &epoch)) {
-      plan.epoch = epoch;
-    }
-    return tmem_.bind_layout(handle, plan);
+  if (!allocation->prebuilt_layout.valid) {
+    return false;
   }
 
-  TmemWindowPlan window{};
-  if (!build_single_target_window_plan(*allocation, desc, target, window_id, store_path, &window)) {
+  auto planned_layout = allocation->prebuilt_layout;
+
+  auto lookup_planned_window = [&](uint32_t lookup_window_id, const TmemWindowPlan** out) -> bool {
+    auto it = std::find_if(planned_layout.windows.begin(),
+                           planned_layout.windows.end(),
+                           [lookup_window_id](const TmemWindowPlan& window) {
+                             return window.window_id == lookup_window_id;
+                           });
+    if (it == planned_layout.windows.end()) {
+      return false;
+    }
+    if (out) {
+      *out = &(*it);
+    }
     return true;
+  };
+
+  auto planned_window_matches_request =
+      [&](const TmemWindowPlan& window_plan) -> bool {
+        auto expected_target = planner_target(target, store_path);
+        auto expected_shape = shape_for_target(desc, target);
+        auto expected_fmt = fmt_for_target(desc, target, store_path);
+        return window_plan.target == expected_target
+            && window_plan.elem_shape.rows == expected_shape.rows
+            && window_plan.elem_shape.cols == expected_shape.cols
+            && window_plan.fmt == expected_fmt;
+      };
+
+  auto bound_window_matches_plan =
+      [&](const TmemWindowPlan& bound_window, const TmemWindowPlan& planned_window) -> bool {
+        return bound_window.target == planned_window.target
+            && bound_window.fmt == planned_window.fmt
+            && bound_window.elem_shape.rows == planned_window.elem_shape.rows
+            && bound_window.elem_shape.cols == planned_window.elem_shape.cols
+            && bound_window.packets_per_tile == planned_window.packets_per_tile
+            && bound_window.layout_kind == planned_window.layout_kind
+            && bound_window.logical_col_base == planned_window.logical_col_base
+            && bound_window.logical_line_base == planned_window.logical_line_base
+            && bound_window.logical_col_span == planned_window.logical_col_span
+            && bound_window.logical_line_span == planned_window.logical_line_span
+            && bound_window.logical_tile_col_span == planned_window.logical_tile_col_span
+            && bound_window.logical_tile_line_span == planned_window.logical_tile_line_span
+            && bound_window.logical_packet_col_span == planned_window.logical_packet_col_span
+            && bound_window.logical_packet_line_span == planned_window.logical_packet_line_span;
+      };
+
+  if (target == TcuTarget::None) {
+    uint32_t epoch = 0;
+    if (read_window_epoch(&epoch)) {
+      planned_layout.epoch = epoch;
+    }
+    return bind_layout_plan(planned_layout);
   }
+
+  const TmemWindowPlan* planned_window = nullptr;
+  if (!lookup_planned_window(window_id, &planned_window)) {
+    return false;
+  }
+  if (!planned_window_matches_request(*planned_window)) {
+    return false;
+  }
+
   const TmemWindowPlan* existing_window = nullptr;
-  if (tmem_.lookup_window(handle, window_id, &existing_window)) {
-    return true;
-  }
-  if (!place_window_after_existing(*allocation, &window)) {
-    return false;
-  }
-  if (!tmem_.upsert_window(handle, window)) {
-    return false;
-  }
-  if (target == TcuTarget::A) {
-    TmemWindowPlan meta_window{};
-    if (build_sparse_meta_window_plan(desc, window_id, &meta_window)) {
-      meta_window.logical_col_base = allocation->meta_col_base;
-      meta_window.logical_line_base = 0;
-      if (!tmem_.upsert_window(handle, meta_window)) {
-        return false;
-      }
+  if (lookup_bound_window(window_id, &existing_window)) {
+    if (bound_window_matches_plan(*existing_window, *planned_window)) {
+      return true;
     }
   }
-  return true;
+
+  uint32_t epoch = 0;
+  if (read_window_epoch(&epoch)) {
+    planned_layout.epoch = epoch;
+  }
+  if (!bind_layout_plan(planned_layout)) {
+    return false;
+  }
+  if (!lookup_bound_window(window_id, &existing_window)) {
+    return false;
+  }
+  return bound_window_matches_plan(*existing_window, *planned_window);
 }
 
 bool Core::tmem_region_copy_in(uint32_t col_base, uint32_t col_span, const uint8_t* data, uint32_t size_bytes) {
+  if (nullptr != tmem_system_) {
+    return false;
+  }
   return tmem_.region_copy_in(col_base, col_span, data, size_bytes);
 }
 
 bool Core::tmem_region_copy_out(uint32_t col_base, uint32_t col_span, uint8_t* data, uint32_t size_bytes) const {
+  if (nullptr != tmem_system_) {
+    return false;
+  }
   return tmem_.region_copy_out(col_base, col_span, data, size_bytes);
 }
 
 bool Core::tmem_copy_in(uint32_t handle, const uint8_t* data, uint32_t size_bytes) {
+  if (nullptr != tmem_system_) {
+    return false;
+  }
   return tmem_.copy_in(handle, data, size_bytes);
 }
 
 bool Core::tmem_copy_out(uint32_t handle, uint8_t* data, uint32_t size_bytes) const {
+  if (nullptr != tmem_system_) {
+    return false;
+  }
   return tmem_.copy_out(handle, data, size_bytes);
 }
 
 bool Core::tmem_region_shift_down(uint32_t col_base, uint32_t col_span, uint32_t row_bytes) {
+  if (nullptr != tmem_system_) {
+    return tmem_system_->region_shift_down(col_base, col_span, row_bytes);
+  }
   return tmem_.region_shift_down(col_base, col_span, row_bytes);
 }
 
 bool Core::tmem_handle_busy(uint32_t handle) const {
-  for (const auto& entry : async_tensor_ops_) {
-    const auto& op = entry.second;
-    if (op.completed || op.handle != handle) {
-      continue;
-    }
-    switch (op.type) {
-    case AsyncTensorOpType::TmaLoad:
-    case AsyncTensorOpType::TmaStore:
-    case AsyncTensorOpType::TmemShift:
-      return true;
-    default:
-      break;
-    }
+  if (nullptr != tma_frontend_ && nullptr != tmem_system_) {
+    return tma_frontend_->visible_load_busy(handle)
+        || tma_frontend_->visible_store_busy(handle)
+        || tmem_system_->visible_shift_busy(handle);
   }
-  return false;
+  return visible_tma_load_busy_handles_.count(handle) != 0
+      || visible_tma_store_or_shift_busy_handles_.count(handle) != 0;
 }
 
-bool Core::tmem_handle_ready_for_mma_load(uint32_t handle, TcuTarget target, uint32_t sparse_mode) const {
+bool Core::tmem_ready_for_mma_load(uint32_t handle, TcuTarget target, uint32_t sparse_mode) const {
   return TmemHandleBlockReason::None == tmem_handle_load_block_reason(handle, target, sparse_mode);
 }
 
-bool Core::tmem_handle_ready_for_mma_store(uint32_t handle) const {
+bool Core::tmem_ready_for_mma_store(uint32_t handle) const {
   return TmemHandleBlockReason::None == tmem_handle_store_block_reason(handle);
 }
 
 bool Core::has_inflight_tma_handle_activity() const {
+  if (nullptr != tma_frontend_ && nullptr != tmem_system_) {
+    for (const auto& entry : async_tensor_ops_) {
+      const auto& op = entry.second;
+      if (op.completed) {
+        continue;
+      }
+      switch (op.type) {
+      case AsyncTensorOpType::TmaLoad:
+      case AsyncTensorOpType::TmaStore:
+      case AsyncTensorOpType::TmemShift:
+        return true;
+      default:
+        break;
+      }
+    }
+    return false;
+  }
   for (const auto& entry : async_tensor_ops_) {
     const auto& op = entry.second;
     if (op.completed) {
@@ -1568,27 +1838,29 @@ Core::TmemHandleBlockReason Core::tmem_handle_load_block_reason(uint32_t handle,
   if (!lookup_tmem_allocation(handle, &allocation)) {
     return TmemHandleBlockReason::Invalid;
   }
-  for (const auto& entry : async_tensor_ops_) {
-    const auto& op = entry.second;
-    if (op.completed || op.handle != handle) {
-      continue;
-    }
-    switch (op.type) {
-    case AsyncTensorOpType::TmaLoad:
-      return TmemHandleBlockReason::BusyTmaLoad;
-    case AsyncTensorOpType::TmaStore:
-    case AsyncTensorOpType::TmemShift:
-      return TmemHandleBlockReason::BusyTmaStoreOrShift;
-    default:
-      break;
-    }
+  if (execute_cycle_tma_load_reserved_handles_.count(handle) != 0) {
+    return TmemHandleBlockReason::BusyTmaLoad;
   }
-  if (!allocation->payload_ready) {
+  if (execute_cycle_tma_store_or_shift_reserved_handles_.count(handle) != 0) {
+    return TmemHandleBlockReason::BusyTmaStoreOrShift;
+  }
+  if (nullptr != tma_frontend_ && tma_frontend_->visible_load_busy(handle)) {
+    return TmemHandleBlockReason::BusyTmaLoad;
+  }
+  if ((nullptr != tma_frontend_ && tma_frontend_->visible_store_busy(handle))
+   || (nullptr != tmem_system_ && tmem_system_->visible_shift_busy(handle))) {
+    return TmemHandleBlockReason::BusyTmaStoreOrShift;
+  }
+  bool payload_ready = (nullptr != tmem_system_) ? tmem_system_->visible_payload_ready(handle)
+                                                 : allocation->visible_payload_ready;
+  if (!payload_ready) {
     return TmemHandleBlockReason::PayloadNotReady;
   }
   bool needs_meta = (target == TcuTarget::A || target == TcuTarget::None)
                  && (sparse_mode != vortex::tensor::sparse_none);
-  if (needs_meta && !allocation->meta_ready) {
+  bool meta_ready = (nullptr != tmem_system_) ? tmem_system_->visible_meta_ready(handle)
+                                              : allocation->visible_meta_ready;
+  if (needs_meta && !meta_ready) {
     return TmemHandleBlockReason::MetaNotReady;
   }
   return TmemHandleBlockReason::None;
@@ -1599,48 +1871,77 @@ Core::TmemHandleBlockReason Core::tmem_handle_store_block_reason(uint32_t handle
   if (!lookup_tmem_allocation(handle, &allocation)) {
     return TmemHandleBlockReason::Invalid;
   }
-  for (const auto& entry : async_tensor_ops_) {
-    const auto& op = entry.second;
-    if (op.completed || op.handle != handle) {
-      continue;
-    }
-    switch (op.type) {
-    case AsyncTensorOpType::TmaLoad:
-      return TmemHandleBlockReason::BusyTmaLoad;
-    case AsyncTensorOpType::TmaStore:
-    case AsyncTensorOpType::TmemShift:
-      return TmemHandleBlockReason::BusyTmaStoreOrShift;
-    default:
-      break;
-    }
+  if (execute_cycle_tma_load_reserved_handles_.count(handle) != 0) {
+    return TmemHandleBlockReason::BusyTmaLoad;
+  }
+  if (execute_cycle_tma_store_or_shift_reserved_handles_.count(handle) != 0) {
+    return TmemHandleBlockReason::BusyTmaStoreOrShift;
+  }
+  if (nullptr != tma_frontend_ && tma_frontend_->visible_load_busy(handle)) {
+    return TmemHandleBlockReason::BusyTmaLoad;
+  }
+  if ((nullptr != tma_frontend_ && tma_frontend_->visible_store_busy(handle))
+   || (nullptr != tmem_system_ && tmem_system_->visible_shift_busy(handle))) {
+    return TmemHandleBlockReason::BusyTmaStoreOrShift;
+  }
+  bool payload_ready = (nullptr != tmem_system_) ? tmem_system_->visible_payload_ready(handle)
+                                                 : allocation->visible_payload_ready;
+  if (!payload_ready) {
+    return TmemHandleBlockReason::PayloadNotReady;
   }
   return TmemHandleBlockReason::None;
 }
 
-void Core::mark_mbarrier_phase_active(uint32_t barrier_id) {
-  if (barrier_id >= mbarriers_.size()) {
-    return;
-  }
-  auto& barrier = mbarriers_.at(barrier_id);
-  if (!barrier.valid) {
-    return;
-  }
-  barrier.phase_done = false;
+// ============================================================================
+// LMEM mirror helper: encode the in-Core MBarrierEntry into the 8 B
+// mbarrier_state_t bit layout and write it through to the kernel-visible
+// LMEM location at mbar_addr. Called after every state transition.
+// PTX §7.6.1 mbarrier object format: 64-bit packed value
+//   bits[63:62]   phase parity (2-bit)
+//   bits[61:32]   pending_arrival_count (30 bits)
+//   bits[31:20]   pending_tx_count      (12 bits, byte units per §7.6.4)
+//   bits[19:0]    expected_arrival_count (20 bits)
+// ============================================================================
+void Core::mirror_mbarrier_to_lmem(uint64_t mbar_addr, const MBarrierEntry& b) {
+  uint64_t encoded = 0;
+  encoded |= (uint64_t)(b.expected_arrival_count & 0xFFFFFu) << 0;
+  encoded |= (uint64_t)(b.pending_tx_count       & 0xFFFu)   << 20;
+  encoded |= (uint64_t)(b.pending_arrival_count  & 0x3FFFFFFFu) << 32;
+  encoded |= (uint64_t)(b.phase                  & 0x3u)     << 62;
+  this->lmem_write(&encoded, mbar_addr, sizeof(encoded));
 }
 
-void Core::try_complete_mbarrier(uint32_t barrier_id) {
-  if (barrier_id >= mbarriers_.size()) {
+void Core::mark_mbarrier_phase_active(uint64_t mbar_addr) {
+  // No-op under PTX semantics: phase activation is implicit via init/arrive/tx.
+  // Kept as a stub for backward compatibility with on_async_tensor_op_completed
+  // which still calls it; actual phase advancement happens in
+  // try_complete_mbarrier() based on expected/pending counts.
+  (void)mbar_addr;
+}
+
+// PTX §7.6.2 phase advance: when both arrival and tx targets are met, the
+// phase parity bit toggles, expected_arrival_count is reloaded into
+// pending_arrival_count, and the tx counters reset.
+void Core::try_complete_mbarrier(uint64_t mbar_addr) {
+  auto it = mbarriers_.find(mbar_addr);
+  if (it == mbarriers_.end()) {
     return;
   }
-  auto& barrier = mbarriers_.at(barrier_id);
-  if (!barrier.valid || barrier.pending_arrivals != 0 || barrier.pending_tx != 0) {
+  auto& barrier = it->second;
+  if (!barrier.valid
+   || barrier.pending_arrival_count != 0
+   || barrier.pending_tx_count < barrier.expected_tx_count) {
     return;
   }
 
-  ++barrier.phase;
-  barrier.phase_done = true;
-  barrier.pending_arrivals = barrier.expected_arrivals;
+  // Phase advance.
+  barrier.phase = (barrier.phase + 1) & 0x3u;
+  barrier.pending_arrival_count = barrier.expected_arrival_count;
+  barrier.pending_tx_count = 0;
+  barrier.expected_tx_count = 0;
+  mirror_mbarrier_to_lmem(mbar_addr, barrier);
 
+  // Wake up warps that were waiting on the prior phase.
   auto waiters = barrier.waiters_bitmap;
   barrier.waiters_bitmap.reset();
   for (uint32_t wid = 0; wid < arch_.num_warps(); ++wid) {
@@ -1650,23 +1951,40 @@ void Core::try_complete_mbarrier(uint32_t barrier_id) {
   }
 }
 
-void Core::finalize_async_tensor_op(AsyncTensorOp& op) {
+void Core::on_async_tensor_op_completed(AsyncTensorOp& op) {
   if (!op.completed) {
     return;
   }
+  // GAP-2: cp.async.bulk.tensor.mbarrier::complete_tx::bytes wiring.
+  // When the issue path (cpabulk_tensor_load) bound this op to a mbarrier
+  // with the complete_tx::bytes flag set, the byte count completed by the
+  // bulk transfer is added to that mbarrier's pending_tx_count. PTX §7.6.4.
+  if (op.tx_bound_mbar != 0 && op.tx_bytes != 0) {
+    mbarrier_complete_tx(op.tx_bound_mbar, op.tx_bytes);
+    // Reset so a single op completion only fires complete_tx once.
+    op.tx_bound_mbar = 0;
+    op.tx_bytes = 0;
+  }
   resume_async_waiters(op.async_id);
   try_resume_fence_waiters();
-  if (!op.committed || op.barrier_id >= mbarriers_.size()) {
+  if (!op.committed) {
     return;
   }
-  auto& barrier = mbarriers_.at(op.barrier_id);
-  if (!barrier.valid) {
+  // tcgen05.commit semantics (PTX §9.7.16.5.7): each prior tcgen05.async op
+  // bound by tcgen05.commit signals an arrival on the bound mbarrier on
+  // completion. NOT a tx_count update -- those go via mbarrier.complete_tx.
+  // op.barrier_id was reinterpreted in tc_commit() as the LMEM mbar address.
+  uint64_t mbar_addr = op.barrier_id;
+  auto it = mbarriers_.find(mbar_addr);
+  if (it == mbarriers_.end() || !it->second.valid) {
     return;
   }
-  if (barrier.pending_tx > 0) {
-    --barrier.pending_tx;
+  auto& barrier = it->second;
+  if (barrier.pending_arrival_count > 0) {
+    --barrier.pending_arrival_count;
   }
-  try_complete_mbarrier(op.barrier_id);
+  mirror_mbarrier_to_lmem(mbar_addr, barrier);
+  try_complete_mbarrier(mbar_addr);
 }
 
 // Advance one already-issued Core-side async tensor transaction by one cycle.
@@ -1676,20 +1994,23 @@ void Core::finalize_async_tensor_op(AsyncTensorOp& op) {
 // - then move at most one TMEM packet (or one refill line packet) per cycle
 //   subject to TMEM ingress/egress and bank availability
 // - mark TMEM-visible state ready only after the final required packet lands
-void Core::advance_one_async_tensor_transaction(AsyncTensorOp& op) {
+bool Core::advance_one_async_tensor_transaction(AsyncTensorOp& op) {
   initialize_async_tensor_transaction(op);
   if (op.completed) {
-    finalize_async_tensor_op(op);
-    return;
+    on_async_tensor_op_completed(op);
+    return true;
   }
   if (op.remaining_launch_cycles != 0) {
     --op.remaining_launch_cycles;
-    return;
+    return true;
   }
 
   switch (op.type) {
   case AsyncTensorOpType::TmaLoad:
   case AsyncTensorOpType::TmaStore: {
+    // TMA sees a math-matrix view of the payload/meta image. The helper below
+    // converts between that external row-major view and the TMEM packet view
+    // chosen by the current window layout template.
     auto make_packet = [](const std::vector<uint8_t>& buffer, uint32_t packet_idx) {
       TmemPacket packet;
       auto offset = packet_idx * Tmem::kPacketBytes;
@@ -1702,27 +2023,45 @@ void Core::advance_one_async_tensor_transaction(AsyncTensorOp& op) {
     const TmemWindowPlan* payload_window = nullptr;
     bool use_math_payload_window = tmem_.lookup_window(op.handle, op.window_id, &payload_window)
                                 && TmemWindowPlanner::uses_math_packet_adapter(*payload_window);
+    auto request_age = [&op](uint32_t ordinal) -> uint64_t {
+      return (static_cast<uint64_t>(op.async_id) << 32) | ordinal;
+    };
 
     if (op.type == AsyncTensorOpType::TmaLoad) {
       if (op.remaining_tmem_write_packets != 0) {
+        // Load direction: staged payload/meta bytes already exist in the
+        // external math view. This step emits at most one TMEM-visible packet
+        // per cycle, subject to ingress and bank availability.
         uint32_t payload_packets = 0;
         if (use_math_payload_window) {
           if (!tmem_.window_packet_count(op.handle, op.window_id, &payload_packets)) {
             op.completed = true;
-            finalize_async_tensor_op(op);
-            return;
+            on_async_tensor_op_completed(op);
+            return true;
           }
         } else {
           payload_packets = (op.payload_size_bytes + Tmem::kPacketBytes - 1) / Tmem::kPacketBytes;
         }
         if (op.next_payload_packet_idx < payload_packets) {
-          bool acquired = use_math_payload_window
-                        ? try_acquire_tmem_window_write_port(op.handle, op.window_id, op.next_payload_packet_idx)
-                        : try_acquire_tmem_window_linear_write_port(op.handle, op.window_id, op.next_payload_packet_idx);
-          if (!acquired) {
-            ++perf_stats_.stall_tmem_write_port_busy;
-            return;
+          if (op.pending_tmem_request_tag == 0) {
+            TmemRequestDesc request{};
+            request.kind = use_math_payload_window
+                         ? TmemRequestKind::WindowWrite
+                         : TmemRequestKind::WindowLinearWrite;
+            request.age = request_age(op.next_payload_packet_idx);
+            request.handle = op.handle;
+            request.window_id = op.window_id;
+            request.packet_idx = op.next_payload_packet_idx;
+            op.pending_tmem_request_tag = enqueue_tmem_request(request);
+            return true;
           }
+          if (!tmem_request_granted(op.pending_tmem_request_tag)) {
+            ++perf_stats_.stall_tmem_write_port_busy;
+            return true;
+          }
+          consume_tmem_request_grant(op.pending_tmem_request_tag);
+          op.pending_tmem_request_tag = 0;
+          ++perf_stats_.tmem_write_packets;
           TmemPacket packet;
           if (use_math_payload_window) {
             encode_math_window_packet(*payload_window, op.payload_staging_buffer, op.next_payload_packet_idx, &packet);
@@ -1734,8 +2073,8 @@ void Core::advance_one_async_tensor_transaction(AsyncTensorOp& op) {
                        : tmem_.write_window_linear_packet(op.handle, op.window_id, op.next_payload_packet_idx, packet);
           if (!written) {
             op.completed = true;
-            finalize_async_tensor_op(op);
-            return;
+            on_async_tensor_op_completed(op);
+            return true;
           }
           ++op.next_payload_packet_idx;
           if (op.next_payload_packet_idx == payload_packets) {
@@ -1752,18 +2091,34 @@ void Core::advance_one_async_tensor_transaction(AsyncTensorOp& op) {
             }
           }
         } else {
+          // Sparse meta follows the payload packets. It either lands in the
+          // meta shadow window or in the legacy linear meta region, depending
+          // on how the current handle/window was planned.
           const TmemWindowPlan* meta_window = nullptr;
           bool use_meta_window = tmem_.lookup_window(op.handle, meta_shadow_window_id(op.window_id), &meta_window);
           bool use_math_meta_window = use_meta_window && TmemWindowPlanner::uses_math_packet_adapter(*meta_window);
-          bool acquired = use_meta_window
-                        ? (use_math_meta_window
-                            ? try_acquire_tmem_window_write_port(op.handle, meta_shadow_window_id(op.window_id), op.next_meta_packet_idx)
-                            : try_acquire_tmem_window_linear_write_port(op.handle, meta_shadow_window_id(op.window_id), op.next_meta_packet_idx))
-                        : try_acquire_tmem_region_write_port(op.meta_region_col_base, op.meta_region_col_span, op.next_meta_packet_idx);
-          if (!acquired) {
-            ++perf_stats_.stall_tmem_write_port_busy;
-            return;
+          if (op.pending_tmem_request_tag == 0) {
+            TmemRequestDesc request{};
+            request.kind = use_meta_window
+                         ? (use_math_meta_window ? TmemRequestKind::WindowWrite
+                                                 : TmemRequestKind::WindowLinearWrite)
+                         : TmemRequestKind::RegionWrite;
+            request.age = request_age(payload_packets + op.next_meta_packet_idx);
+            request.handle = op.handle;
+            request.window_id = use_meta_window ? meta_shadow_window_id(op.window_id) : 0;
+            request.packet_idx = op.next_meta_packet_idx;
+            request.col_base = op.meta_region_col_base;
+            request.col_span = op.meta_region_col_span;
+            op.pending_tmem_request_tag = enqueue_tmem_request(request);
+            return true;
           }
+          if (!tmem_request_granted(op.pending_tmem_request_tag)) {
+            ++perf_stats_.stall_tmem_write_port_busy;
+            return true;
+          }
+          consume_tmem_request_grant(op.pending_tmem_request_tag);
+          op.pending_tmem_request_tag = 0;
+          ++perf_stats_.tmem_write_packets;
           TmemPacket packet;
           if (use_math_meta_window) {
             encode_math_window_packet(*meta_window, op.meta_staging_buffer, op.next_meta_packet_idx, &packet);
@@ -1777,8 +2132,8 @@ void Core::advance_one_async_tensor_transaction(AsyncTensorOp& op) {
                        : tmem_.region_write_packet(op.meta_region_col_base, op.meta_region_col_span, op.next_meta_packet_idx, packet);
           if (!written) {
             op.completed = true;
-            finalize_async_tensor_op(op);
-            return;
+            on_async_tensor_op_completed(op);
+            return true;
           }
           ++op.next_meta_packet_idx;
           if ((op.next_meta_packet_idx * Tmem::kPacketBytes) >= op.meta_size_bytes) {
@@ -1788,19 +2143,33 @@ void Core::advance_one_async_tensor_transaction(AsyncTensorOp& op) {
 
         --op.remaining_tmem_write_packets;
         if (op.remaining_tmem_write_packets != 0) {
-          return;
+          return true;
         }
         (void)tmem_.bump_window_epoch(op.handle);
       }
     } else {
       if (op.remaining_tmem_read_packets != 0) {
-        bool acquired = use_math_payload_window
-                      ? try_acquire_tmem_window_read_port(op.handle, op.window_id, op.next_payload_packet_idx)
-                      : try_acquire_tmem_window_linear_read_port(op.handle, op.window_id, op.next_payload_packet_idx);
-        if (!acquired) {
-          ++perf_stats_.stall_tmem_read_port_busy;
-          return;
+        // Store direction: read one TMEM packet per cycle, then immediately
+        // decode it back into the external math-matrix byte image.
+        if (op.pending_tmem_request_tag == 0) {
+          TmemRequestDesc request{};
+          request.kind = use_math_payload_window
+                       ? TmemRequestKind::WindowRead
+                       : TmemRequestKind::WindowLinearRead;
+          request.age = request_age(op.next_payload_packet_idx);
+          request.handle = op.handle;
+          request.window_id = op.window_id;
+          request.packet_idx = op.next_payload_packet_idx;
+          op.pending_tmem_request_tag = enqueue_tmem_request(request);
+          return true;
         }
+        if (!tmem_request_granted(op.pending_tmem_request_tag)) {
+          ++perf_stats_.stall_tmem_read_port_busy;
+          return true;
+        }
+        consume_tmem_request_grant(op.pending_tmem_request_tag);
+        op.pending_tmem_request_tag = 0;
+        ++perf_stats_.tmem_read_packets;
 
         TmemPacket packet;
         bool read_ok = use_math_payload_window
@@ -1808,8 +2177,8 @@ void Core::advance_one_async_tensor_transaction(AsyncTensorOp& op) {
                     : tmem_.read_window_linear_packet(op.handle, op.window_id, op.next_payload_packet_idx, &packet);
         if (!read_ok) {
           op.completed = true;
-          finalize_async_tensor_op(op);
-          return;
+          on_async_tensor_op_completed(op);
+          return true;
         }
         if (use_math_payload_window) {
           decode_math_window_packet(*payload_window, op.next_payload_packet_idx, packet, &op.payload_staging_buffer);
@@ -1840,7 +2209,7 @@ void Core::advance_one_async_tensor_transaction(AsyncTensorOp& op) {
             tmem_.set_payload_ready(op.handle, true);
           }
         } else {
-          return;
+          return true;
         }
       }
     }
@@ -1858,46 +2227,65 @@ void Core::advance_one_async_tensor_transaction(AsyncTensorOp& op) {
     TmemAllocation* allocation = nullptr;
     if (!lookup_tmem_allocation(op.handle, &allocation)) {
       op.completed = true;
-      finalize_async_tensor_op(op);
-      return;
+      on_async_tensor_op_completed(op);
+      return true;
     }
+    auto request_age = [&op](uint32_t ordinal) -> uint64_t {
+      return (static_cast<uint64_t>(op.async_id) << 32) | ordinal;
+    };
     bool use_window = (op.window_id != 0) || tmem_.lookup_window(op.handle, op.window_id, nullptr);
     if (!op.main_shift_body_complete) {
+      // Phase 1: account for the existing window body that must be shifted
+      // down by one math row. The Cmodel charges one TMEM read + one TMEM
+      // write packet for each packet-sized chunk that participates.
       auto packet_idx = op.next_payload_packet_idx;
-      if (op.remaining_tmem_read_packets != 0) {
-        bool acquired = use_window
-                      ? try_acquire_tmem_window_read_port(op.handle, op.window_id, packet_idx)
-                      : try_acquire_tmem_region_read_port(allocation->payload_col_base, allocation->col_span, packet_idx);
-        if (!acquired) {
-          ++perf_stats_.stall_tmem_read_port_busy;
-          return;
-        }
+      if (op.remaining_tmem_read_packets != 0 && op.pending_tmem_request_tag == 0) {
+        TmemRequestDesc request{};
+        request.kind = use_window ? TmemRequestKind::WindowRead
+                                  : TmemRequestKind::RegionRead;
+        request.age = request_age(packet_idx * 2);
+        request.handle = op.handle;
+        request.window_id = op.window_id;
+        request.packet_idx = packet_idx;
+        request.col_base = allocation->payload_col_base;
+        request.col_span = allocation->col_span;
+        op.pending_tmem_request_tag = enqueue_tmem_request(request);
       }
-      if (op.remaining_tmem_write_packets != 0) {
-        bool acquired = use_window
-                      ? try_acquire_tmem_window_write_port(op.handle, op.window_id, packet_idx)
-                      : try_acquire_tmem_region_write_port(allocation->payload_col_base, allocation->col_span, packet_idx);
-        if (!acquired) {
-          ++perf_stats_.stall_tmem_write_port_busy;
-          if (op.remaining_tmem_read_packets != 0) {
-            if (use_window) {
-              tmem_.refund_window_read_packet(perf_stats_.cycles, op.handle, op.window_id, packet_idx);
-            } else {
-              refund_tmem_region_read_port(allocation->payload_col_base, allocation->col_span, packet_idx);
-            }
-          }
-          return;
-        }
+      if (op.remaining_tmem_write_packets != 0 && op.pending_tmem_aux_request_tag == 0) {
+        TmemRequestDesc request{};
+        request.kind = use_window ? TmemRequestKind::WindowWrite
+                                  : TmemRequestKind::RegionWrite;
+        request.age = request_age(packet_idx * 2 + 1);
+        request.handle = op.handle;
+        request.window_id = op.window_id;
+        request.packet_idx = packet_idx;
+        request.col_base = allocation->payload_col_base;
+        request.col_span = allocation->col_span;
+        op.pending_tmem_aux_request_tag = enqueue_tmem_request(request);
       }
-      if (op.remaining_tmem_read_packets != 0) {
+      if (op.pending_tmem_request_tag != 0 && !tmem_request_granted(op.pending_tmem_request_tag)) {
+        ++perf_stats_.stall_tmem_read_port_busy;
+        return true;
+      }
+      if (op.pending_tmem_aux_request_tag != 0 && !tmem_request_granted(op.pending_tmem_aux_request_tag)) {
+        ++perf_stats_.stall_tmem_write_port_busy;
+        return true;
+      }
+      if (op.pending_tmem_request_tag != 0) {
+        consume_tmem_request_grant(op.pending_tmem_request_tag);
+        op.pending_tmem_request_tag = 0;
+        ++perf_stats_.tmem_read_packets;
         --op.remaining_tmem_read_packets;
       }
-      if (op.remaining_tmem_write_packets != 0) {
+      if (op.pending_tmem_aux_request_tag != 0) {
+        consume_tmem_request_grant(op.pending_tmem_aux_request_tag);
+        op.pending_tmem_aux_request_tag = 0;
+        ++perf_stats_.tmem_write_packets;
         --op.remaining_tmem_write_packets;
       }
       ++op.next_payload_packet_idx;
       if (op.remaining_tmem_read_packets != 0 || op.remaining_tmem_write_packets != 0) {
-        return;
+        return true;
       }
       op.main_shift_body_complete = true;
       if (op.remaining_refill_line_packets == 0) {
@@ -1906,29 +2294,46 @@ void Core::advance_one_async_tensor_transaction(AsyncTensorOp& op) {
                      : tmem_region_shift_down(allocation->payload_col_base, allocation->col_span, allocation->row_bytes);
         if (!shifted) {
           op.completed = true;
-          finalize_async_tensor_op(op);
-          return;
+          on_async_tensor_op_completed(op);
+          return true;
         }
         tmem_.set_payload_ready(op.handle, true);
         (void)tmem_.bump_window_epoch(op.handle);
       } else {
-        return;
+        return true;
       }
     }
 
     if (op.remaining_refill_line_packets != 0) {
+      // Phase 2: optional refill of the new top math row. One packet-sized row
+      // chunk is written per cycle through the normal TMEM ingress path.
       auto chunk_idx = op.next_refill_line_packet_idx;
-      bool acquired = use_window
-                    ? try_acquire_tmem_window_write_port(op.handle, op.window_id, chunk_idx)
-                    : try_acquire_tmem_region_write_port(allocation->payload_col_base, allocation->col_span, chunk_idx);
-      if (!acquired) {
-        ++perf_stats_.stall_tmem_write_port_busy;
-        return;
+      if (op.pending_tmem_request_tag == 0) {
+        TmemRequestDesc request{};
+        request.kind = use_window ? TmemRequestKind::WindowLineWrite
+                                  : TmemRequestKind::RegionWrite;
+        request.age = request_age(chunk_idx);
+        request.handle = op.handle;
+        request.window_id = op.window_id;
+        request.packet_idx = chunk_idx;
+        request.line_idx = 0;
+        request.chunk_idx = chunk_idx;
+        request.col_base = allocation->payload_col_base;
+        request.col_span = allocation->col_span;
+        op.pending_tmem_request_tag = enqueue_tmem_request(request);
+        return true;
       }
+      if (!tmem_request_granted(op.pending_tmem_request_tag)) {
+        ++perf_stats_.stall_tmem_write_port_busy;
+        return true;
+      }
+      consume_tmem_request_grant(op.pending_tmem_request_tag);
+      op.pending_tmem_request_tag = 0;
+      ++perf_stats_.tmem_write_packets;
       ++op.next_refill_line_packet_idx;
       --op.remaining_refill_line_packets;
       if (op.remaining_refill_line_packets != 0) {
-        return;
+        return true;
       }
       bool shifted = use_window
                    ? tmem_.shift_window_math_rows_down(op.handle, op.window_id,
@@ -1937,8 +2342,8 @@ void Core::advance_one_async_tensor_transaction(AsyncTensorOp& op) {
                    : tmem_region_shift_down(allocation->payload_col_base, allocation->col_span, allocation->row_bytes);
       if (!shifted) {
         op.completed = true;
-        finalize_async_tensor_op(op);
-        return;
+        on_async_tensor_op_completed(op);
+        return true;
       }
       tmem_.set_payload_ready(op.handle, true);
       (void)tmem_.bump_window_epoch(op.handle);
@@ -1953,100 +2358,213 @@ void Core::advance_one_async_tensor_transaction(AsyncTensorOp& op) {
   }
 
   op.completed = true;
-  finalize_async_tensor_op(op);
+  on_async_tensor_op_completed(op);
+  return true;
+}
+
+void Core::drain_tensor_execute_packet_requests() {
+  // TensorExecuteSystem and Core/TMEM communicate through SimPort, so only one
+  // request may be dequeued from this port per global cycle.
+  if (tensor_mem_req_in_.empty()) {
+    return;
+  }
+  auto request = tensor_mem_req_in_.front();
+  PendingTensorMemReq pending{};
+  pending.port_req = request;
+  pending.tmem_request_tag = enqueue_tmem_request(request.port_request);
+  pending_tensor_mem_reqs_[request.request_id] = pending;
+  tensor_mem_req_in_.pop();
+}
+
+void Core::complete_granted_tensor_execute_packet_requests() {
+  std::vector<uint64_t> completed_request_ids;
+  completed_request_ids.reserve(pending_tensor_mem_reqs_.size());
+
+  for (auto& entry : pending_tensor_mem_reqs_) {
+    auto request_id = entry.first;
+    auto& pending = entry.second;
+    if (!tmem_request_granted(pending.tmem_request_tag)) {
+      continue;
+    }
+
+    consume_tmem_request_grant(pending.tmem_request_tag);
+
+    TensorMemPortRsp response{};
+    response.request_id = request_id;
+    response.access_type = pending.port_req.access_type;
+
+    auto& request = pending.port_req.port_request;
+    bool success = false;
+    switch (request.kind) {
+    case TmemRequestKind::WindowRead:
+      success = tmem_read_window_packet(request.handle, request.window_id, request.packet_idx, &response.read_packet);
+      break;
+    case TmemRequestKind::WindowWrite:
+      success = tmem_write_window_packet(request.handle, request.window_id, request.packet_idx, pending.port_req.write_packet);
+      break;
+    default:
+      std::cerr << "Core error: tensor execute bridge received non-window TMEM request"
+                << " request_id=" << request_id
+                << " kind=" << static_cast<uint32_t>(request.kind)
+                << " handle=" << request.handle
+                << " window=" << request.window_id
+                << " packet=" << request.packet_idx
+                << std::endl;
+      std::abort();
+    }
+
+    if (!success) {
+      std::cerr << "Core error: TMEM port request completion failed"
+                << " request_id=" << request_id
+                << " kind=" << static_cast<uint32_t>(request.kind)
+                << " handle=" << request.handle
+                << " window=" << request.window_id
+                << " packet=" << request.packet_idx
+                << std::endl;
+      std::abort();
+    }
+
+    // Delay-0 is sufficient here because TensorUnit ticks earlier than Core in
+    // the platform object order, so the response becomes consumable next cycle.
+    tensor_mem_rsp_out_.push(response, 0);
+    completed_request_ids.push_back(request_id);
+  }
+
+  for (auto request_id : completed_request_ids) {
+    pending_tensor_mem_reqs_.erase(request_id);
+  }
+}
+
+void Core::drain_tensor_execute_completion_notices() {
+  if (!tensor_async_op_completion_in_.empty()) {
+    auto completion = tensor_async_op_completion_in_.front();
+    async_tensor_complete(completion.async_id);
+    tensor_async_op_completion_in_.pop();
+  }
 }
 
 // Advance all Core-side asynchronous tensor transactions by one cycle.
 // This models the TMA/TMEM background engine that updates TMEM-visible state
 // before the later in-core pipeline stages observe it in the same global cycle.
 void Core::advance_async_tensor_engine() {
-  ensure_tmem_port_budgets();
-  for (auto& entry : async_tensor_ops_) {
-    auto& op = entry.second;
-    if (!op.completed && perf_stats_.cycles >= op.first_service_cycle) {
-      advance_one_async_tensor_transaction(op);
-    }
+  if (nullptr != tma_frontend_ && nullptr != tmem_system_) {
+    return;
   }
+  // The legacy Core-local async tensor engine is intentionally disabled once
+  // the split TensorMemSystem/TensorExecuteSystem model is adopted. Keeping a
+  // second executable timing path would make the model non-signoffable.
+  std::abort();
 }
 
-uint32_t Core::tmem_alloc(uint32_t col_span) {
-  advance_async_tensor_engine();
-  return tmem_.alloc(col_span);
+void Core::compact_async_tmem_ops_fifo() {
+  std::deque<uint32_t> compacted_fifo;
+  for (auto async_id : async_tmem_ops_fifo_) {
+    auto it = async_tensor_ops_.find(async_id);
+    if (it == async_tensor_ops_.end() || it->second.completed) {
+      continue;
+    }
+    compacted_fifo.push_back(async_id);
+  }
+  async_tmem_ops_fifo_.swap(compacted_fifo);
 }
 
-bool Core::tmem_free(uint32_t handle) {
+uint32_t Core::tmem_alloc(uint32_t col_span, uint32_t mma_desc_id) {
   advance_async_tensor_engine();
+
+  // col_span 必须是 {16, 32, 64} 之一 (16 × 2^n)
+  if (col_span != 16 && col_span != 32 && col_span != 64) {
+    throw std::runtime_error(
+      "TMEM_ALLOC: col_span=" + std::to_string(col_span)
+      + " invalid, must be 16, 32, or 64");
+  }
+
+  // 如果绑定了 MMA descriptor，验证 col_span 并预构建 window layout plan
+  IDescriptor mma_desc{};
+  bool has_desc = (mma_desc_id != kInvalidTcuDescriptorId) && read_idescriptor(mma_desc_id, &mma_desc);
+
+  if (has_desc) {
+    // 构建 planner input — 每个 window 使用各自的精度
+    TmemWindowPlannerInput planner_input{};
+    planner_input.a_shape = {mma_desc.a_rows, mma_desc.a_cols};
+    planner_input.b_shape = {mma_desc.b_rows, mma_desc.b_cols};
+    planner_input.c_shape = {mma_desc.c_rows, mma_desc.c_cols};
+    planner_input.d_shape = {mma_desc.c_rows, mma_desc.c_cols};
+    planner_input.fmt_a = mma_desc.fmt_a;
+    planner_input.fmt_b = mma_desc.fmt_b;
+    planner_input.fmt_c = mma_desc.fmt_c;
+    planner_input.fmt_d = mma_desc.fmt_d;
+    planner_input.sparse_mode = mma_desc.sparse_mode;
+    planner_input.allocation_col_span = col_span;
+
+    auto min_col = TmemWindowPlanner::compute_min_col_span(planner_input);
+    if (min_col == 0) {
+      throw std::runtime_error(
+        "TMEM_ALLOC: window shape + precision combination cannot fit in TMEM "
+        "(exceeds 128 lines even at col_span=64)");
+    }
+    if (col_span < min_col) {
+      throw std::runtime_error(
+        "TMEM_ALLOC: col_span=" + std::to_string(col_span)
+        + " too small, minimum " + std::to_string(min_col)
+        + " required for this shape+precision");
+    }
+    planner_input.allocation_col_span = col_span;
+
+    // 预构建 layout plan (A/B/C/D windows) 并持久化到 allocation 元数据
+    TmemLayoutPlan layout{};
+    std::string plan_reason;
+    if (!TmemWindowPlanner::build_dense_plan(planner_input, &layout, &plan_reason)) {
+      throw std::runtime_error(
+        "TMEM_ALLOC: window plan failed — " + plan_reason);
+    }
+
+    // Phase-3.4 Stage 0: alloc returns a PTX TADDR; the value IS the col_base.
+    // Layout plan and mma_desc_id are persisted into the allocation keyed by
+    // taddr.
+    uint32_t taddr = Tmem::kInvalidTaddr;
+    if (nullptr != tmem_system_) {
+      taddr = tmem_system_->alloc(col_span);
+    } else {
+      taddr = tmem_.alloc(col_span);
+    }
+    if (taddr != Tmem::kInvalidTaddr) {
+      TmemAllocation* alloc = nullptr;
+      if (lookup_tmem_allocation(taddr, &alloc) && alloc != nullptr) {
+        alloc->mma_desc_id = mma_desc_id;
+        alloc->prebuilt_layout = layout;
+      }
+    }
+    return taddr;
+  }
+
+  // No MMA descriptor — fallback alloc still returns a PTX TADDR.
+  uint32_t fallback_taddr = Tmem::kInvalidTaddr;
+  if (nullptr != tmem_system_) {
+    fallback_taddr = tmem_system_->alloc(col_span);
+  } else {
+    fallback_taddr = tmem_.alloc(col_span);
+  }
+  return fallback_taddr;
+}
+
+bool Core::tmem_dealloc(uint32_t handle) {
+  advance_async_tensor_engine();
+  if (nullptr != tmem_system_) {
+    return tmem_system_->free(handle);
+  }
   return tmem_.free(handle);
 }
 
 void Core::tmem_rel_permit() {
+  if (nullptr != tmem_system_) {
+    tmem_system_->seal_allocator();
+    return;
+  }
   tmem_.seal_allocator();
 }
 
-uint32_t Core::tma_load(uint32_t wid, uint32_t handle, uint32_t desc_id, uint32_t window_id) {
-  advance_async_tensor_engine();
-  auto wgid = arch_.warpgroup_id(wid);
-  TmaDescriptor desc;
-  if (!read_tma_descriptor(desc_id, &desc)) {
-    return 0;
-  }
-  auto kind = static_cast<TcuPayloadKind>(desc.payload_kind);
-  TmemAllocation* allocation = nullptr;
-  if (lookup_tmem_allocation(handle, &allocation)) {
-    tmem_.set_meta_region(handle, desc.meta_tmem_base, desc.meta_col_span);
-    if (kind == TcuPayloadKind::SparseMeta) {
-      tmem_.set_meta_ready(handle, false);
-    } else {
-      tmem_.set_payload_ready(handle, false);
-    }
-    if (kind != TcuPayloadKind::SparseMeta
-     && desc.meta_addr != 0 && desc.meta_size_bytes != 0 && desc.meta_col_span != 0) {
-      tmem_.set_meta_ready(handle, false);
-    }
-  }
-  ++perf_stats_.tma_load_count;
-  auto async_id = next_async_id_++;
-  AsyncTensorOp op{};
-  op.async_id = async_id;
-  op.type = AsyncTensorOpType::TmaLoad;
-  op.wid = wid;
-  op.wgid = wgid;
-  op.handle = handle;
-  op.descriptor_id = desc_id;
-  op.window_id = window_id;
-  op.issue_cycle = perf_stats_.cycles;
-  op.first_service_cycle = perf_stats_.cycles + 1;
-  async_tensor_ops_[async_id] = std::move(op);
-  return async_id;
-}
-
-uint32_t Core::tma_store(uint32_t wid, uint32_t handle, uint32_t desc_id, uint32_t window_id) {
-  advance_async_tensor_engine();
-  auto wgid = arch_.warpgroup_id(wid);
-  TmaDescriptor desc;
-  if (!read_tma_descriptor(desc_id, &desc)) {
-    return 0;
-  }
-  if (static_cast<TcuPayloadKind>(desc.payload_kind) == TcuPayloadKind::SparseMeta) {
-    tmem_.set_meta_ready(handle, false);
-  } else {
-    tmem_.set_payload_ready(handle, false);
-  }
-  ++perf_stats_.tma_store_count;
-  auto async_id = next_async_id_++;
-  AsyncTensorOp op{};
-  op.async_id = async_id;
-  op.type = AsyncTensorOpType::TmaStore;
-  op.wid = wid;
-  op.wgid = wgid;
-  op.handle = handle;
-  op.descriptor_id = desc_id;
-  op.window_id = window_id;
-  op.issue_cycle = perf_stats_.cycles;
-  op.first_service_cycle = perf_stats_.cycles + 1;
-  async_tensor_ops_[async_id] = std::move(op);
-  return async_id;
-}
+// Phase-2: legacy Core::tma_load and Core::tma_store have been inlined into
+// cpabulk_tensor_load / cpabulk_tensor_store below. No standalone definitions.
 
 uint32_t Core::tmem_shift(uint32_t wid, uint32_t handle, uint32_t window_id, uint32_t refill_descriptor_id) {
   advance_async_tensor_engine();
@@ -2055,7 +2573,11 @@ uint32_t Core::tmem_shift(uint32_t wid, uint32_t handle, uint32_t window_id, uin
   if (!lookup_tmem_allocation(handle, &allocation)) {
     return 0;
   }
-  tmem_.set_payload_ready(handle, false);
+  if (nullptr != tmem_system_) {
+    tmem_system_->set_payload_ready(handle, false);
+  } else {
+    tmem_.set_payload_ready(handle, false);
+  }
   auto async_id = next_async_id_++;
   AsyncTensorOp op{};
   op.async_id = async_id;
@@ -2068,10 +2590,13 @@ uint32_t Core::tmem_shift(uint32_t wid, uint32_t handle, uint32_t window_id, uin
   op.issue_cycle = perf_stats_.cycles;
   op.first_service_cycle = perf_stats_.cycles + 1;
   async_tensor_ops_[async_id] = std::move(op);
+  assert(nullptr != tmem_system_);
+  execute_cycle_tma_store_or_shift_reserved_handles_.insert(handle);
+  (void)tmem_system_->issue_shift(async_id, wid, wgid, handle, window_id, refill_descriptor_id, perf_stats_.cycles);
   return async_id;
 }
 
-uint32_t Core::mma_load_async_issue(uint32_t wid, uint32_t handle, uint32_t desc_id) {
+uint32_t Core::mma_load_async_issue(uint32_t wid, uint32_t handle, uint32_t idesc) {
   advance_async_tensor_engine();
   auto wgid = arch_.warpgroup_id(wid);
   auto async_id = next_async_id_++;
@@ -2126,68 +2651,20 @@ void Core::async_tensor_complete(uint32_t async_id) {
     return;
   }
   it->second.completed = true;
-  finalize_async_tensor_op(it->second);
+  on_async_tensor_op_completed(it->second);
   if (it->second.type == AsyncTensorOpType::Wmma) {
     async_tensor_ops_.erase(it);
   }
 }
 
-uint32_t Core::tc_commit(uint32_t wid, uint32_t barrier_id) {
-  advance_async_tensor_engine();
-  auto wgid = arch_.warpgroup_id(wid);
-  if (barrier_id >= mbarriers_.size()) {
-    return 0;
-  }
-  auto& barrier = mbarriers_.at(barrier_id);
-  if (!barrier.valid) {
-    return 0;
-  }
+// Phase-2: legacy Core::tc_commit / Core::tc_fence inlined into
+// Core::mbar_commit / Core::mbar_fence. Core::tc_wait inlined into
+// the wait_for_all_inflight_tcgen05_async() private helper below.
 
-  uint32_t committed = 0;
-  for (auto& entry : async_tensor_ops_) {
-    auto& op = entry.second;
-    if (op.wgid != wgid || op.completed || op.committed) {
-      continue;
-    }
-    op.committed = true;
-    op.barrier_id = barrier_id;
-    ++committed;
-  }
-
-  if (committed != 0) {
-    mark_mbarrier_phase_active(barrier_id);
-    barrier.pending_tx += committed;
-    try_complete_mbarrier(barrier_id);
-  }
-  try_resume_fence_waiters();
-  return committed;
-}
-
-bool Core::tc_fence(uint32_t wid, TcuFenceMode mode) {
-  advance_async_tensor_engine();
-  auto wgid = arch_.warpgroup_id(wid);
-  if (mode == TcuFenceMode::Before) {
-    // In-order warp issue already preserves relative ordering before a following thread sync.
-    return true;
-  }
-  // AFTER acts as a completion fence for committed async tensor operations.
-  if (!has_pending_async_ops(wid, true)) {
-    return true;
-  }
-  auto mask = warpgroup_mask(wgid);
-  for (uint32_t gwid = 0; gwid < arch_.num_warps(); ++gwid) {
-    if (!mask.test(gwid)) {
-      continue;
-    }
-    auto& wait_state = fence_wait_states_.at(gwid);
-    wait_state.active = true;
-    wait_state.mode = mode;
-  }
-  ++perf_stats_.stall_wait_barrier;
-  return false;
-}
-
-bool Core::tc_wait(uint32_t wid) {
+// Wait for all inflight tcgen05.async ops issued by this wid's warpgroup
+// (MmaLoad / MmaStore / Wmma). Used by both tcgen05.wait::ld and
+// tcgen05.wait::st (per-kind tracking is not yet split).
+bool Core::wait_for_all_inflight_tcgen05_async(uint32_t wid) {
   advance_async_tensor_engine();
   auto wgid = arch_.warpgroup_id(wid);
   auto group_mask = warpgroup_mask(wgid);
@@ -2214,72 +2691,126 @@ bool Core::tc_wait(uint32_t wid) {
   return !pending;
 }
 
-bool Core::mbarrier_init(uint32_t barrier_id, uint32_t count) {
-  if (barrier_id >= mbarriers_.size()) {
-    return false;
-  }
-  auto& barrier = mbarriers_.at(barrier_id);
+// PTX §7.6.3 mbarrier.init: initialize the 8 B mbarrier object in shared mem
+// with `count` expected arrivals; phase parity starts at 0; tx counters at 0.
+bool Core::mbarrier_init(uint64_t mbar_addr, uint32_t count) {
+  auto& barrier = mbarriers_[mbar_addr];
   barrier = {};
   barrier.valid = true;
-  barrier.expected_arrivals = count;
-  barrier.pending_arrivals = count;
-  barrier.phase_done = (count == 0);
+  barrier.expected_arrival_count = count;
+  barrier.pending_arrival_count = count;
+  barrier.phase = 0;
+  // Drop any stale waiter targets for this address from prior generations.
   for (auto& wait_targets : mbarrier_wait_targets_) {
-    wait_targets.erase(barrier_id);
+    wait_targets.erase(mbar_addr);
   }
+  mirror_mbarrier_to_lmem(mbar_addr, barrier);
   return true;
 }
 
-void Core::mbarrier_arrive(uint32_t barrier_id) {
-  if (barrier_id >= mbarriers_.size()) {
+// PTX §7.6.3 mbarrier.invalidate: tear down the object.
+void Core::mbarrier_invalidate(uint64_t mbar_addr) {
+  auto it = mbarriers_.find(mbar_addr);
+  if (it == mbarriers_.end()) {
     return;
   }
-  auto& barrier = mbarriers_.at(barrier_id);
-  if (!barrier.valid) {
-    return;
+  // Wake any blocked waiters first (they will see the object invalid and exit).
+  for (uint32_t wid = 0; wid < arch_.num_warps(); ++wid) {
+    if (it->second.waiters_bitmap.test(wid)) {
+      emulator_.resume(wid);
+    }
+    mbarrier_wait_targets_.at(wid).erase(mbar_addr);
   }
-  mark_mbarrier_phase_active(barrier_id);
-  if (barrier.pending_arrivals > 0) {
-    --barrier.pending_arrivals;
-  }
-  try_complete_mbarrier(barrier_id);
+  mbarriers_.erase(it);
+  // Clear the LMEM mirror so kernel observes invalidation.
+  uint64_t zero = 0;
+  this->lmem_write(&zero, mbar_addr, sizeof(zero));
 }
 
-bool Core::mbarrier_wait(uint32_t wid, uint32_t barrier_id) {
+// PTX §7.6.3 mbarrier.arrive: decrement pending_arrival_count by `decrement`.
+// Returns the *current* phase token so caller can wait on this phase.
+uint32_t Core::mbarrier_arrive(uint64_t mbar_addr, uint32_t decrement_count) {
+  auto it = mbarriers_.find(mbar_addr);
+  if (it == mbarriers_.end() || !it->second.valid) {
+    return 0;
+  }
+  auto& barrier = it->second;
+  uint32_t observed_phase = barrier.phase;
+  if (barrier.pending_arrival_count >= decrement_count) {
+    barrier.pending_arrival_count -= decrement_count;
+  } else {
+    barrier.pending_arrival_count = 0;
+  }
+  mirror_mbarrier_to_lmem(mbar_addr, barrier);
+  try_complete_mbarrier(mbar_addr);
+  return observed_phase;
+}
+
+// PTX §7.6.3 mbarrier.arrive_drop: arrive AND decrement expected_arrival_count
+// permanently (participant leaves the barrier).
+void Core::mbarrier_arrive_drop(uint64_t mbar_addr) {
+  auto it = mbarriers_.find(mbar_addr);
+  if (it == mbarriers_.end() || !it->second.valid) {
+    return;
+  }
+  auto& barrier = it->second;
+  if (barrier.expected_arrival_count > 0) {
+    --barrier.expected_arrival_count;
+  }
+  if (barrier.pending_arrival_count > 0) {
+    --barrier.pending_arrival_count;
+  }
+  mirror_mbarrier_to_lmem(mbar_addr, barrier);
+  try_complete_mbarrier(mbar_addr);
+}
+
+// PTX §7.6.4 mbarrier.expect_tx: increase expected tx-byte target.
+void Core::mbarrier_expect_tx(uint64_t mbar_addr, uint32_t tx_bytes) {
+  auto it = mbarriers_.find(mbar_addr);
+  if (it == mbarriers_.end() || !it->second.valid) {
+    return;
+  }
+  it->second.expected_tx_count += tx_bytes;
+  mirror_mbarrier_to_lmem(mbar_addr, it->second);
+}
+
+// PTX §7.6.4 mbarrier.complete_tx: contribute completed tx bytes; if combined
+// with arrival it can advance phase.
+void Core::mbarrier_complete_tx(uint64_t mbar_addr, uint32_t tx_bytes) {
+  auto it = mbarriers_.find(mbar_addr);
+  if (it == mbarriers_.end() || !it->second.valid) {
+    return;
+  }
+  it->second.pending_tx_count += tx_bytes;
+  mirror_mbarrier_to_lmem(mbar_addr, it->second);
+  try_complete_mbarrier(mbar_addr);
+}
+
+// PTX §7.6.3 mbarrier.wait.parity: blocking wait until current phase parity
+// differs from `phase_token`. Returns false to indicate stall (caller suspends
+// the warp); returns true once the phase has advanced.
+bool Core::mbarrier_wait(uint32_t wid, uint64_t mbar_addr, uint32_t phase_token) {
   advance_async_tensor_engine();
   auto wgid = arch_.warpgroup_id(wid);
   auto group_mask = warpgroup_mask(wgid);
-  if (barrier_id >= mbarriers_.size()) {
+  auto it = mbarriers_.find(mbar_addr);
+  if (it == mbarriers_.end() || !it->second.valid) {
     return true;
   }
-  auto& barrier = mbarriers_.at(barrier_id);
-  if (!barrier.valid) {
-    return true;
-  }
-
-  auto& wait_targets = mbarrier_wait_targets_.at(wid);
-  auto it = wait_targets.find(barrier_id);
-  if (it != wait_targets.end()) {
-    if (barrier.phase >= it->second) {
-      for (uint32_t gwid = 0; gwid < arch_.num_warps(); ++gwid) {
-        if (group_mask.test(gwid)) {
-          mbarrier_wait_targets_.at(gwid).erase(barrier_id);
-        }
+  auto& barrier = it->second;
+  // Phase parity comparison (PTX semantics): if current parity bit differs
+  // from input token, the wait is satisfied.
+  if ((barrier.phase & 0x1u) != (phase_token & 0x1u)) {
+    for (uint32_t gwid = 0; gwid < arch_.num_warps(); ++gwid) {
+      if (group_mask.test(gwid)) {
+        mbarrier_wait_targets_.at(gwid).erase(mbar_addr);
       }
-      return true;
     }
-    barrier.waiters_bitmap |= group_mask;
-    ++perf_stats_.stall_wait_barrier;
-    return false;
-  }
-
-  if (barrier.phase_done) {
     return true;
   }
-
   for (uint32_t gwid = 0; gwid < arch_.num_warps(); ++gwid) {
     if (group_mask.test(gwid)) {
-      mbarrier_wait_targets_.at(gwid)[barrier_id] = barrier.phase + 1;
+      mbarrier_wait_targets_.at(gwid)[mbar_addr] = phase_token;
     }
   }
   barrier.waiters_bitmap |= group_mask;
@@ -2287,45 +2818,542 @@ bool Core::mbarrier_wait(uint32_t wid, uint32_t barrier_id) {
   return false;
 }
 
-bool Core::tma_wait(uint32_t wid, uint32_t async_id) {
-  advance_async_tensor_engine();
-  auto group_mask = warpgroup_mask(arch_.warpgroup_id(wid));
-  auto it = async_tensor_ops_.find(async_id);
-  if (it == async_tensor_ops_.end()) {
+// PTX §7.6.3 mbarrier.test_wait: non-blocking poll. Returns ready bit
+// without suspending the warp.
+bool Core::mbarrier_test_wait(uint64_t mbar_addr, uint32_t phase_token) {
+  auto it = mbarriers_.find(mbar_addr);
+  if (it == mbarriers_.end() || !it->second.valid) {
     return true;
   }
-  if (!it->second.completed) {
-    async_tensor_waiters_[async_id] |= group_mask;
-    ++perf_stats_.stall_wait_barrier;
+  return (it->second.phase & 0x1u) != (phase_token & 0x1u);
+}
+
+// PTX §7.6.3 mbarrier.try_wait: bounded blocking wait. Behaves like wait()
+// but returns false (timeout) after `1 << timeout_bucket` cycles. CModel
+// approximation: behaves like wait() (no real timeout tracker), reports
+// timeout=false on first poll if not ready, lets caller re-issue.
+bool Core::mbarrier_try_wait(uint32_t wid, uint64_t mbar_addr,
+                             uint32_t phase_token, uint32_t timeout_bucket) {
+  (void)timeout_bucket;
+  // For Phase-2 simx: equivalent to test_wait (non-blocking) -- the kernel
+  // is responsible for re-issuing if the prior call returned not-ready.
+  // Future work: schedule a wakeup at +(1 << timeout_bucket) cycles.
+  (void)wid;
+  return mbarrier_test_wait(mbar_addr, phase_token);
+}
+
+// ============================================================================
+// Phase-2/3 Core API: cp.async.bulk.tensor / tcgen05.cp / tcgen05.{fence,commit,
+// wait::ld, wait::st} thin wrappers.
+//
+// Phase-3.2 cpabulk_tensor_load supports two data-plane modes selected by the
+// args_lmem_ptr value range:
+//   (a) args_lmem_ptr in [LMEM_BASE_ADDR, LMEM_BASE_ADDR + LMEM_SIZE) ->
+//       direct DRAM -> LMEM mode. tensor_map_addr is a real DRAM pointer to a
+//       128 B tensor_map_t; cpabulk_transfer_args_t (32 B) at args_lmem_ptr
+//       holds {smem_addr, mbar_addr, coords[5]}. We dcache_read N bytes from
+//       (tensor_map.global_address + flat coord offset) into LMEM at
+//       args.smem_addr. If complete_tx, on completion we call
+//       mbarrier_complete_tx(args.mbar_addr, bytes_transferred).
+//   (b) otherwise -> legacy descriptor-table mode. tensor_map_addr is
+//       reinterpreted as a desc_id and routed through TmaFrontend with the
+//       destination still being TMEM. This preserves the legacy 9-test data
+//       path until host runtime migrates to populating tensor_map_t.
+// ============================================================================
+
+namespace {
+inline bool is_lmem_addr(uint64_t addr) {
+  if (addr < LMEM_BASE_ADDR) {
     return false;
   }
-  async_tensor_waiters_.erase(async_id);
-  async_tensor_ops_.erase(it);
+  return (addr - LMEM_BASE_ADDR) < (uint64_t{1} << LMEM_LOG_SIZE);
+}
+
+// Given a tensor_map_t and the integer coords[N], compute (byte offset into
+// the global tensor, total bytes for the N-D bounding tile). The "tile" size
+// is given by box_size[]. CUtensorMap rank is 1..5; we honour box_size and
+// global_stride per dim.
+inline uint32_t element_type_bytes(uint8_t element_type) {
+  // CUtensorMapDataType encoding (PTX §6.4.10.4):
+  //   0: U8   1: U16  2: U32  3: I32   4: U64
+  //   5: I64  6: F16  7: F32  8: F64
+  //   9: BF16 10: FP8 11: FP4 ...
+  switch (element_type) {
+    case 0:  return 1;
+    case 1:  return 2;
+    case 2:  return 4;
+    case 3:  return 4;
+    case 4:  return 8;
+    case 5:  return 8;
+    case 6:  return 2;
+    case 7:  return 4;
+    case 8:  return 8;
+    case 9:  return 2;
+    case 10: return 1;
+    case 11: return 1;  // 4-bit packed; 1 byte per 2 elements but we treat as 1
+    default: return 4;  // safe fallback
+  }
+}
+} // namespace
+
+// cp.async.bulk.tensor (DRAM -> shared) Phase-3.2 implementation.
+uint32_t Core::cpabulk_tensor_load(uint32_t wid,
+                                   uint64_t tensor_map_addr,
+                                   uint64_t args_lmem_ptr,
+                                   bool complete_tx) {
+  // ---- Mode (a): direct DRAM -> LMEM with args_lmem_ptr in LMEM range ----
+  if (is_lmem_addr(args_lmem_ptr)) {
+    advance_async_tensor_engine();
+    auto wgid = arch_.warpgroup_id(wid);
+
+    // Read the cpabulk_transfer_args_t from LMEM.
+    struct {
+      uint32_t smem_addr;
+      uint32_t mbar_addr;
+      int32_t  coords[5];
+      uint32_t reserved;
+    } __attribute__((packed)) args = {};
+    static_assert(sizeof(args) == 32, "cpabulk_transfer_args_t must be 32 B");
+    this->lmem_read(&args, args_lmem_ptr, sizeof(args));
+
+    // Read the 128 B tensor_map_t from DRAM at tensor_map_addr.
+    struct {
+      uint64_t global_address;
+      uint64_t box_size[5];
+      uint64_t global_stride[5];
+      uint32_t element_strides[5];
+      uint8_t  element_type;
+      uint8_t  interleave;
+      uint8_t  swizzle;
+      uint8_t  l2_promotion;
+      uint8_t  oob_fill;
+      uint8_t  rank;
+      uint8_t  reserved0[2];
+      uint32_t reserved1[3];
+    } __attribute__((packed)) tmap = {};
+    static_assert(sizeof(tmap) == 128, "tensor_map_t must be 128 B");
+    this->dcache_read(&tmap, tensor_map_addr, sizeof(tmap));
+
+    uint32_t rank = tmap.rank == 0 ? 1u : (tmap.rank > 5 ? 5u : tmap.rank);
+    uint32_t elem_bytes = element_type_bytes(tmap.element_type);
+    if (elem_bytes == 0) {
+      elem_bytes = 1;
+    }
+
+    // Total bytes = element_bytes * product(box_size[0..rank-1])
+    uint64_t total_elems = 1;
+    for (uint32_t d = 0; d < rank; ++d) {
+      uint64_t b = tmap.box_size[d];
+      if (b == 0) b = 1;
+      total_elems *= b;
+    }
+    uint32_t total_bytes = static_cast<uint32_t>(total_elems * elem_bytes);
+
+    // Source DRAM address: global_address + sum(coords[d] * global_stride[d]).
+    uint64_t src_addr = tmap.global_address;
+    for (uint32_t d = 0; d < rank; ++d) {
+      uint64_t stride = tmap.global_stride[d];
+      if (stride == 0) {
+        stride = (d == 0) ? elem_bytes : tmap.box_size[d - 1] * elem_bytes;
+      }
+      src_addr += static_cast<uint64_t>(args.coords[d]) * stride;
+    }
+
+    // Streaming DRAM -> LMEM copy in 64 B chunks.
+    constexpr uint32_t kChunk = 64;
+    uint8_t buf[kChunk];
+    uint64_t lmem_dst = static_cast<uint64_t>(args.smem_addr);
+    uint32_t copied = 0;
+    while (copied < total_bytes) {
+      uint32_t take = std::min(kChunk, total_bytes - copied);
+      this->dcache_read(buf, src_addr + copied, take);
+      this->lmem_write(buf, lmem_dst + copied, take);
+      copied += take;
+    }
+
+    auto async_id = next_async_id_++;
+    AsyncTensorOp op{};
+    op.async_id = async_id;
+    op.type = AsyncTensorOpType::TmaLoad;
+    op.wid = wid;
+    op.wgid = wgid;
+    op.handle = 0;
+    op.descriptor_id = 0;
+    op.window_id = 0;
+    op.issue_cycle = perf_stats_.cycles;
+    op.first_service_cycle = perf_stats_.cycles + 1;
+    op.completed = true;        // direct copy completes synchronously for now
+    op.payload_size_bytes = total_bytes;
+    if (complete_tx && args.mbar_addr != 0) {
+      op.tx_bound_mbar = static_cast<uint64_t>(args.mbar_addr);
+      op.tx_bytes      = total_bytes;
+    }
+    async_tensor_ops_[async_id] = std::move(op);
+    ++perf_stats_.tma_load_count;
+    // Fire the completion hook now so mbarrier_complete_tx + waiter resume
+    // both run (functional model; timing of the actual copy is approximated).
+    auto& stored = async_tensor_ops_[async_id];
+    on_async_tensor_op_completed(stored);
+    return async_id;
+  }
+
+  // ---- Mode (b): legacy descriptor-table fallback ----
+  (void)complete_tx;
+  uint32_t desc_id = static_cast<uint32_t>(tensor_map_addr);
+  uint32_t handle = 0;
+  uint32_t window_id = 0;
+  advance_async_tensor_engine();
+  auto wgid = arch_.warpgroup_id(wid);
+  TmaDescriptor desc;
+  if (!read_tma_descriptor(desc_id, &desc)) {
+    return 0;
+  }
+  auto kind = static_cast<TcuPayloadKind>(desc.payload_kind);
+  TmemAllocation* allocation = nullptr;
+  if (lookup_tmem_allocation(handle, &allocation)) {
+    if (nullptr != tmem_system_) {
+      tmem_system_->set_meta_region(handle, desc.meta_tmem_base, desc.meta_col_span);
+    } else {
+      tmem_.set_meta_region(handle, desc.meta_tmem_base, desc.meta_col_span);
+    }
+    if (kind == TcuPayloadKind::SparseMeta) {
+      if (nullptr != tmem_system_) {
+        tmem_system_->set_meta_ready(handle, false);
+      } else {
+        tmem_.set_meta_ready(handle, false);
+      }
+    } else {
+      if (nullptr != tmem_system_) {
+        tmem_system_->set_payload_ready(handle, false);
+      } else {
+        tmem_.set_payload_ready(handle, false);
+      }
+    }
+    if (kind != TcuPayloadKind::SparseMeta
+     && desc.meta_addr != 0 && desc.meta_size_bytes != 0 && desc.meta_col_span != 0) {
+      if (nullptr != tmem_system_) {
+        tmem_system_->set_meta_ready(handle, false);
+      } else {
+        tmem_.set_meta_ready(handle, false);
+      }
+    }
+  }
+  ++perf_stats_.tma_load_count;
+  auto async_id = next_async_id_++;
+  AsyncTensorOp op{};
+  op.async_id = async_id;
+  op.type = AsyncTensorOpType::TmaLoad;
+  op.wid = wid;
+  op.wgid = wgid;
+  op.handle = handle;
+  op.descriptor_id = desc_id;
+  op.window_id = window_id;
+  op.issue_cycle = perf_stats_.cycles;
+  op.first_service_cycle = perf_stats_.cycles + 1;
+  async_tensor_ops_[async_id] = std::move(op);
+  assert(nullptr != tma_frontend_);
+  execute_cycle_tma_load_reserved_handles_.insert(handle);
+  (void)tma_frontend_->issue_load(async_id, wid, wgid, handle, desc_id, window_id, perf_stats_.cycles);
+  return async_id;
+}
+
+// cp.async.bulk.tensor (shared -> DRAM) Phase-3.2 implementation.
+uint32_t Core::cpabulk_tensor_store(uint32_t wid,
+                                    uint64_t tensor_map_addr,
+                                    uint64_t args_lmem_ptr) {
+  // ---- Mode (a): direct LMEM -> DRAM with args_lmem_ptr in LMEM range ----
+  if (is_lmem_addr(args_lmem_ptr)) {
+    advance_async_tensor_engine();
+    auto wgid = arch_.warpgroup_id(wid);
+
+    struct {
+      uint32_t smem_addr;
+      uint32_t mbar_addr;
+      int32_t  coords[5];
+      uint32_t reserved;
+    } __attribute__((packed)) args = {};
+    this->lmem_read(&args, args_lmem_ptr, sizeof(args));
+
+    struct {
+      uint64_t global_address;
+      uint64_t box_size[5];
+      uint64_t global_stride[5];
+      uint32_t element_strides[5];
+      uint8_t  element_type;
+      uint8_t  interleave;
+      uint8_t  swizzle;
+      uint8_t  l2_promotion;
+      uint8_t  oob_fill;
+      uint8_t  rank;
+      uint8_t  reserved0[2];
+      uint32_t reserved1[3];
+    } __attribute__((packed)) tmap = {};
+    this->dcache_read(&tmap, tensor_map_addr, sizeof(tmap));
+
+    uint32_t rank = tmap.rank == 0 ? 1u : (tmap.rank > 5 ? 5u : tmap.rank);
+    uint32_t elem_bytes = element_type_bytes(tmap.element_type);
+    if (elem_bytes == 0) {
+      elem_bytes = 1;
+    }
+
+    uint64_t total_elems = 1;
+    for (uint32_t d = 0; d < rank; ++d) {
+      uint64_t b = tmap.box_size[d];
+      if (b == 0) b = 1;
+      total_elems *= b;
+    }
+    uint32_t total_bytes = static_cast<uint32_t>(total_elems * elem_bytes);
+
+    uint64_t dst_addr = tmap.global_address;
+    for (uint32_t d = 0; d < rank; ++d) {
+      uint64_t stride = tmap.global_stride[d];
+      if (stride == 0) {
+        stride = (d == 0) ? elem_bytes : tmap.box_size[d - 1] * elem_bytes;
+      }
+      dst_addr += static_cast<uint64_t>(args.coords[d]) * stride;
+    }
+
+    constexpr uint32_t kChunk = 64;
+    uint8_t buf[kChunk];
+    uint64_t lmem_src = static_cast<uint64_t>(args.smem_addr);
+    uint32_t copied = 0;
+    while (copied < total_bytes) {
+      uint32_t take = std::min(kChunk, total_bytes - copied);
+      this->lmem_read(buf, lmem_src + copied, take);
+      this->dcache_write(buf, dst_addr + copied, take);
+      copied += take;
+    }
+
+    auto async_id = next_async_id_++;
+    AsyncTensorOp op{};
+    op.async_id = async_id;
+    op.type = AsyncTensorOpType::TmaStore;
+    op.wid = wid;
+    op.wgid = wgid;
+    op.issue_cycle = perf_stats_.cycles;
+    op.first_service_cycle = perf_stats_.cycles + 1;
+    op.completed = true;
+    op.payload_size_bytes = total_bytes;
+    async_tensor_ops_[async_id] = std::move(op);
+    ++perf_stats_.tma_store_count;
+    auto& stored = async_tensor_ops_[async_id];
+    on_async_tensor_op_completed(stored);
+    return async_id;
+  }
+
+  // ---- Mode (b): legacy descriptor-table fallback ----
+  uint32_t desc_id = static_cast<uint32_t>(tensor_map_addr);
+  uint32_t handle = 0;
+  uint32_t window_id = 0;
+  advance_async_tensor_engine();
+  auto wgid = arch_.warpgroup_id(wid);
+  TmaDescriptor desc;
+  if (!read_tma_descriptor(desc_id, &desc)) {
+    return 0;
+  }
+  if (static_cast<TcuPayloadKind>(desc.payload_kind) == TcuPayloadKind::SparseMeta) {
+    if (nullptr != tmem_system_) {
+      tmem_system_->set_meta_ready(handle, false);
+    } else {
+      tmem_.set_meta_ready(handle, false);
+    }
+  } else {
+    if (nullptr != tmem_system_) {
+      tmem_system_->set_payload_ready(handle, false);
+    } else {
+      tmem_.set_payload_ready(handle, false);
+    }
+  }
+  ++perf_stats_.tma_store_count;
+  auto async_id = next_async_id_++;
+  AsyncTensorOp op{};
+  op.async_id = async_id;
+  op.type = AsyncTensorOpType::TmaStore;
+  op.wid = wid;
+  op.wgid = wgid;
+  op.handle = handle;
+  op.descriptor_id = desc_id;
+  op.window_id = window_id;
+  op.issue_cycle = perf_stats_.cycles;
+  op.first_service_cycle = perf_stats_.cycles + 1;
+  async_tensor_ops_[async_id] = std::move(op);
+  assert(nullptr != tma_frontend_);
+  execute_cycle_tma_store_or_shift_reserved_handles_.insert(handle);
+  (void)tma_frontend_->issue_store(async_id, wid, wgid, handle, desc_id, window_id, perf_stats_.cycles);
+  return async_id;
+}
+
+// Phase-3.3.1 GAP-4: TMEM byte-range R/W backing tcgen05.ld / tcgen05.st.
+// Routes to TmemSystem when active (which is the canonical allocator path),
+// else to the local Tmem instance. Both expose the same byte-range API.
+bool Core::tmem_region_read_bytes(uint32_t handle, uint32_t byte_offset, uint8_t* dst, uint32_t bytes) {
+  if (nullptr != tmem_system_) {
+    return tmem_system_->handle_region_read_bytes(handle, byte_offset, dst, bytes);
+  }
+  return tmem_.handle_region_read_bytes(handle, byte_offset, dst, bytes);
+}
+
+bool Core::tmem_region_write_bytes(uint32_t handle, uint32_t byte_offset, const uint8_t* src, uint32_t bytes) {
+  if (nullptr != tmem_system_) {
+    return tmem_system_->handle_region_write_bytes(handle, byte_offset, src, bytes);
+  }
+  return tmem_.handle_region_write_bytes(handle, byte_offset, src, bytes);
+}
+
+bool Core::tmem_find_allocation_by_lane(uint32_t lane, uint32_t* col_base) const {
+  if (nullptr != tmem_system_) {
+    return tmem_system_->find_allocation_by_lane(lane, col_base);
+  }
+  return tmem_.find_allocation_by_lane(lane, col_base);
+}
+
+bool Core::tmem_cp(uint32_t wid,
+                   uint32_t taddr,
+                   uint64_t s_desc_lmem_ptr,
+                   uint32_t shape,
+                   uint32_t decompress) {
+  (void)wid;
+  // Read 64-bit s_desc from LMEM. PTX §9.7.16.2 shared-memory descriptor:
+  //   bits[13:0]   start_address (in 16 B units, relative to shared-memory base)
+  //   bits[16:14]  reserved
+  //   bits[31:17]  leading dim stride, etc. (not used for the simple shape path)
+  //   bits[53:32]  more layout fields
+  //   bits[63:62]  swizzle mode
+  uint64_t s_desc = 0;
+  this->lmem_read(&s_desc, s_desc_lmem_ptr, sizeof(s_desc));
+  uint32_t smem_offset = static_cast<uint32_t>(s_desc & 0x3FFFu) * 16u;
+  uint64_t lmem_src = static_cast<uint64_t>(LMEM_BASE_ADDR) + smem_offset;
+
+  // Per-shape byte count (PTX §9.7.16.5.3). All sizes follow rows × bits / 8.
+  // Encoded values from TcuCpShape:
+  //   0: 128x256b -> 128 * 32 = 4096 B
+  //   1: 4x256b   ->   4 * 32 =  128 B
+  //   2: 128x128b -> 128 * 16 = 2048 B
+  //   3: 64x128b.warpx2  -> 64  * 16 = 1024 B
+  //   4: 32x128b.warpx4  -> 32  * 16 =  512 B
+  uint32_t bytes = 0;
+  switch (shape) {
+    case 0: bytes = 4096; break;
+    case 1: bytes =  128; break;
+    case 2: bytes = 2048; break;
+    case 3: bytes = 1024; break;
+    case 4: bytes =  512; break;
+    default: bytes = 4096; break;
+  }
+  if (decompress != 0) {
+    // GAP: decompression matrix (b6x16_p32 / b4x16_p64) not implemented yet;
+    // the byte count would shrink for compressed sources. Continue with the
+    // uncompressed footprint as a safe upper bound.
+  }
+
+  // Read the source bytes from LMEM into a contiguous buffer.
+  std::vector<uint8_t> buf(bytes, 0);
+  this->lmem_read(buf.data(), lmem_src, bytes);
+
+  // Resolve the TMEM allocation that owns `taddr`. taddr's low byte holds the
+  // handle base column (matches kernel/include/vx_tensor.h::tmem_handle_base);
+  // the offset within the allocation is the high bytes (treated as logical
+  // line offset for shape S128x256b which fills the full payload region).
+  uint32_t handle = taddr;
+  if (nullptr != tmem_system_) {
+    // Fallback: use Tmem instance through the shared system if it routes there.
+    // Not all configurations expose copy_in via TmemSystem; route to tmem_
+    // directly when accessible.
+  }
+  bool ok = tmem_.copy_in(handle, buf.data(), bytes);
+  if (!ok) {
+    // Allocation lookup failed; could be a stub handle or the legacy
+    // single-handle (handle=0) path. Skip silently — Phase-3.2 only
+    // implements the strict-handle path.
+  }
   return true;
 }
 
-bool Core::tmem_read_packet(uint32_t handle, uint32_t packet_idx, TmemPacket* out) {
+// tcgen05.fence::{before,after}_thread_sync (PTX §9.7.16.5.1).
+// Body inlined from former Core::tc_fence (now deleted).
+bool Core::mbar_fence(uint32_t wid, TcuFenceMode mode) {
   advance_async_tensor_engine();
-  return tmem_.read_packet(handle, packet_idx, out);
+  auto wgid = arch_.warpgroup_id(wid);
+  if (mode == TcuFenceMode::Before) {
+    // In-order warp issue already preserves relative ordering before a
+    // following thread sync.
+    return true;
+  }
+  // AFTER acts as a completion fence for committed async tensor operations.
+  if (!has_pending_async_ops(wid, true)) {
+    return true;
+  }
+  auto mask = warpgroup_mask(wgid);
+  for (uint32_t gwid = 0; gwid < arch_.num_warps(); ++gwid) {
+    if (!mask.test(gwid)) {
+      continue;
+    }
+    auto& wait_state = fence_wait_states_.at(gwid);
+    wait_state.active = true;
+    wait_state.mode = mode;
+  }
+  ++perf_stats_.stall_wait_barrier;
+  return false;
+}
+
+// tcgen05.commit (PTX §9.7.16.5.7): registers all currently inflight
+// tcgen05.async ops in this warpgroup to the mbarrier at `mbar_addr`. Each
+// registered op will trigger ONE mbarrier_arrive on completion (NOT a
+// tx_count update). Body inlined from former Core::tc_commit (now deleted).
+uint32_t Core::mbar_commit(uint32_t wid, uint64_t mbar_addr, uint32_t cta_mask) {
+  (void)cta_mask; // Vortex single-cluster: cta_mask broadcast is no-op.
+  advance_async_tensor_engine();
+  auto wgid = arch_.warpgroup_id(wid);
+  auto it = mbarriers_.find(mbar_addr);
+  if (it == mbarriers_.end() || !it->second.valid) {
+    return 0;
+  }
+  auto& barrier = it->second;
+
+  uint32_t committed = 0;
+  for (auto& entry : async_tensor_ops_) {
+    auto& op = entry.second;
+    if (op.wgid != wgid || op.completed || op.committed) {
+      continue;
+    }
+    op.committed = true;
+    // Reuse barrier_id slot in AsyncTensorOp to carry the LMEM mbar address
+    // (the field is uint32; we cap to RV32 pointer width). On op completion,
+    // on_async_tensor_op_completed() will call mbarrier_arrive on this address.
+    op.barrier_id = static_cast<uint32_t>(mbar_addr);
+    ++committed;
+  }
+
+  if (committed != 0) {
+    barrier.expected_arrival_count += committed;
+    barrier.pending_arrival_count  += committed;
+    mirror_mbarrier_to_lmem(mbar_addr, barrier);
+  }
+  try_resume_fence_waiters();
+  return committed;
+}
+
+bool Core::tcgen05_wait_ld(uint32_t wid) {
+  return wait_for_all_inflight_tcgen05_async(wid);
+}
+
+bool Core::tcgen05_wait_st(uint32_t wid) {
+  return wait_for_all_inflight_tcgen05_async(wid);
 }
 
 bool Core::tmem_read_window_packet(uint32_t handle, uint32_t window_id, uint32_t packet_idx, TmemPacket* out) {
   advance_async_tensor_engine();
+  if (nullptr != tmem_system_) {
+    return tmem_system_->read_window_packet(handle, window_id, packet_idx, out);
+  }
   return tmem_.read_window_packet(handle, window_id, packet_idx, out);
-}
-
-bool Core::tmem_read_meta_packet(uint32_t handle, uint32_t packet_idx, TmemPacket* out) {
-  advance_async_tensor_engine();
-  return tmem_.read_meta_packet(handle, packet_idx, out);
-}
-
-bool Core::tmem_write_packet(uint32_t handle, uint32_t packet_idx, const TmemPacket& in) {
-  advance_async_tensor_engine();
-  return tmem_.write_packet(handle, packet_idx, in);
 }
 
 bool Core::tmem_write_window_packet(uint32_t handle, uint32_t window_id, uint32_t packet_idx, const TmemPacket& in) {
   advance_async_tensor_engine();
+  if (nullptr != tmem_system_) {
+    return tmem_system_->write_window_packet(handle, window_id, packet_idx, in);
+  }
   return tmem_.write_window_packet(handle, window_id, packet_idx, in);
 }
 

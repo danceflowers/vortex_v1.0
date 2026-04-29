@@ -675,9 +675,13 @@ inline std::ostream &operator<<(std::ostream &os, const TcuPayloadKind& kind) {
   return os;
 }
 
+// ---------------------------------------------------------------------------
+// tcgen05 PTX-aligned modifier enums (carried via funct7 qualifier bits)
+// ---------------------------------------------------------------------------
+
 enum class TcuFenceMode : uint8_t {
-  Before = 0,
-  After,
+  Before = 0,  // tcgen05.fence::before_thread_sync
+  After,       // tcgen05.fence::after_thread_sync
 };
 
 inline std::ostream &operator<<(std::ostream &os, const TcuFenceMode& mode) {
@@ -690,23 +694,72 @@ inline std::ostream &operator<<(std::ostream &os, const TcuFenceMode& mode) {
   return os;
 }
 
+// tcgen05.cp shape modifier (qualifier[3:1] in TMEM_CP)
+enum class TcuCpShape : uint8_t {
+  S128x256b = 0,
+  S4x256b,
+  S128x128b,
+  S64x128b_w2,   // 64x128b.warpx2
+  S32x128b_w4,   // 32x128b.warpx4
+};
+
+// tcgen05.cp decompress modifier (qualifier[5:4] in TMEM_CP)
+enum class TcuCpDecompress : uint8_t {
+  None = 0,
+  B6x16_P32,
+  B4x16_P64,
+};
+
+// MBAR_TEST_TRY_WAIT variant selector (qualifier[0])
+enum class TcuTestTryWait : uint8_t {
+  Test = 0,  // mbarrier.test_wait (non-blocking, returns ready bit)
+  Try  = 1,  // mbarrier.try_wait  (blocking with timeout)
+};
+
+// tcgen05.ld / tcgen05.st shape (qualifier[2:0])
+// Vortex maps these onto the existing AMem/BMem/CMem/DMem subtile shapes.
+enum class TcuLdStShape : uint8_t {
+  Shape32x32b = 0,
+  Shape16x32b,
+  Shape16x64b,
+  Shape16x128b,
+  Shape16x256b,
+};
+
+// ---------------------------------------------------------------------------
+// TcuType enum: one value per tcgen05 PTX instruction (or close analogue)
+// ---------------------------------------------------------------------------
+
 enum class TcuType {
-  TMEM_ALLOC,
-  TMEM_FREE,
-  TMEM_REL_PERMIT,
-  TMA_LOAD,
-  TMA_STORE,
-  TC_COMMIT,
-  TC_FENCE,
-  TC_WAIT,
-  TMEM_SHIFT,
-  MMA_LOAD,
-  MMA_STORE,
-  MBAR_INIT,
-  MBAR_ARRIVE,
-  MBAR_WAIT,
-  TMA_WAIT,
-  WMMA,
+  // ---- custom-1 (EXT2, 0x2B): TMEM management + cp.async.bulk.tensor ----
+  TMEM_REL_PERMIT,    // tcgen05.relinquish_alloc_permit
+  TMEM_ALLOC,         // tcgen05.alloc
+  TMEM_DEALLOC,       // tcgen05.dealloc
+  TMEM_CP,            // tcgen05.cp (shared-mem -> TMEM)
+  TMEM_SHIFT,         // tcgen05.shift.down
+  CPABULK_TENSOR_LD,  // cp.async.bulk.tensor.<N>d (DRAM -> shared)
+  CPABULK_TENSOR_ST,  // cp.async.bulk.tensor.<N>d (shared -> DRAM)
+
+  // ---- custom-2 (EXT3, 0x5B): tcgen05 sync + full mbarrier ----
+  MBAR_FENCE,         // tcgen05.fence::{before,after}_thread_sync
+  MBAR_COMMIT,        // tcgen05.commit
+  MBAR_INIT,          // mbarrier.init / mbarrier.invalidate
+  MBAR_ARRIVE,        // mbarrier.arrive{.expect_tx,.arrive_drop}
+  MBAR_EXPECT_TX,     // mbarrier.expect_tx (standalone)
+  MBAR_COMPLETE_TX,   // mbarrier.complete_tx
+  MBAR_WAIT,          // mbarrier.wait (blocking, no timeout)
+  MBAR_TEST_TRY_WAIT, // mbarrier.test_wait / mbarrier.try_wait
+
+  // ---- custom-3 (EXT4, 0x7B): tcgen05 compute ----
+  TCU_MMA,            // tcgen05.mma{.ws,.sp}
+  TCU_LD,             // tcgen05.ld (TMEM -> RF)
+  TCU_ST,             // tcgen05.st (RF -> TMEM)
+  TCU_WAIT_LD,        // tcgen05.wait::ld
+  TCU_WAIT_ST,        // tcgen05.wait::st
+
+  // Phase-2: legacy MMA_LOAD / MMA_STORE / WMMA internal routing tags removed;
+  // TCU_MMA is now the single ISA-visible compute entry. Internal fan-out is
+  // managed by TensorAsyncFrontend without per-stage TcuType discrimination.
 };
 
 static constexpr uint32_t kInvalidTcuDescriptorId = 0xffffffffu;
@@ -724,16 +777,10 @@ static constexpr uint32_t kTcuTmemOpCtlDescShift =
 static constexpr uint32_t kTcuTmemOpCtlFlagsShift =
     kTcuTmemOpCtlDescShift + kTcuTmemOpCtlDescBits;
 static constexpr uint32_t kTcuTmemOpFlagRefill = 0x1u;
-static constexpr uint32_t kTcuMmaMemCtlTargetBits = 2;
-static constexpr uint32_t kTcuMmaMemCtlTileBits = 16;
-static constexpr uint32_t kTcuMmaMemCtlSlotBits = 2;
-static constexpr uint32_t kTcuWmmaSlotCtlSlotBits = 2;
-static constexpr uint32_t kTcuWmmaSlotCtlAShift = 0;
-static constexpr uint32_t kTcuWmmaSlotCtlBShift = kTcuWmmaSlotCtlAShift + kTcuWmmaSlotCtlSlotBits;
-// auto-routing: window_id 已移除, target(2) + tile_id(16) + slot_id(2) = 20 bits
-static constexpr uint32_t kTcuMmaMemCtlTargetShift = 0;
-static constexpr uint32_t kTcuMmaMemCtlTileShift = kTcuMmaMemCtlTargetShift + kTcuMmaMemCtlTargetBits;
-static constexpr uint32_t kTcuMmaMemCtlSlotShift = kTcuMmaMemCtlTileShift + kTcuMmaMemCtlTileBits;
+// Phase-3.3.8: kTcuMmaMemCtl* / tcu_mma_mem_* helpers excised — MMA_LOAD /
+// MMA_STORE were deleted in Phase-2 (TCU_MMA fans out internally with
+// idesc.M/N driving 16x16 sub-tiles per Phase-3.3.7). Window/tile encoding
+// in the MMA path is no longer part of the ABI surface.
 
 inline uint32_t tcu_control_field_mask(uint32_t bits) {
   return (bits >= 32) ? 0xffffffffu : ((1u << bits) - 1);
@@ -759,115 +806,116 @@ inline uint32_t tcu_tmem_op_ctl_flags(uint32_t control) {
   return (control >> kTcuTmemOpCtlFlagsShift) & tcu_control_field_mask(kTcuTmemOpCtlFlagsBits);
 }
 
-// auto-routing: window_id 已移除, 硬件从 target 推导 window
-inline uint32_t tcu_mma_mem_make_control(TcuTarget target,
-                                         uint32_t slot_id,
-                                         uint32_t tile_id) {
-  return ((static_cast<uint32_t>(target) & tcu_control_field_mask(kTcuMmaMemCtlTargetBits)) << kTcuMmaMemCtlTargetShift)
-       | ((tile_id & tcu_control_field_mask(kTcuMmaMemCtlTileBits)) << kTcuMmaMemCtlTileShift)
-       | ((slot_id & tcu_control_field_mask(kTcuMmaMemCtlSlotBits)) << kTcuMmaMemCtlSlotShift);
-}
-
-inline TcuTarget tcu_mma_mem_ctl_target(uint32_t control) {
-  auto raw = (control >> kTcuMmaMemCtlTargetShift) & tcu_control_field_mask(kTcuMmaMemCtlTargetBits);
-  switch (raw) {
-  case 0: return TcuTarget::None;
-  case 1: return TcuTarget::A;
-  case 2: return TcuTarget::B;
-  case 3: return TcuTarget::C;
-  default:
-    std::abort();
-  }
-}
-
-// auto-routing: 从 target 推导 window_id (A→0, B→1, C→2, D→3)
-inline uint32_t tcu_mma_mem_ctl_window_id_from_target(TcuTarget target) {
-  switch (target) {
-  case TcuTarget::A: return 0;
-  case TcuTarget::B: return 1;
-  case TcuTarget::C: return 2;
-  default: return 0;
-  }
-}
-
-inline uint32_t tcu_mma_mem_ctl_tile_id(uint32_t control) {
-  return (control >> kTcuMmaMemCtlTileShift) & tcu_control_field_mask(kTcuMmaMemCtlTileBits);
-}
-
-inline uint32_t tcu_mma_mem_ctl_slot_id(uint32_t control) {
-  return (control >> kTcuMmaMemCtlSlotShift) & tcu_control_field_mask(kTcuMmaMemCtlSlotBits);
-}
-
-inline uint32_t tcu_wmma_make_slot_control(uint32_t a_slot_id, uint32_t b_slot_id) {
-  return ((a_slot_id & tcu_control_field_mask(kTcuWmmaSlotCtlSlotBits)) << kTcuWmmaSlotCtlAShift)
-       | ((b_slot_id & tcu_control_field_mask(kTcuWmmaSlotCtlSlotBits)) << kTcuWmmaSlotCtlBShift);
-}
-
-inline uint32_t tcu_wmma_ctl_a_slot_id(uint32_t control) {
-  return (control >> kTcuWmmaSlotCtlAShift) & tcu_control_field_mask(kTcuWmmaSlotCtlSlotBits);
-}
-
-inline uint32_t tcu_wmma_ctl_b_slot_id(uint32_t control) {
-  return (control >> kTcuWmmaSlotCtlBShift) & tcu_control_field_mask(kTcuWmmaSlotCtlSlotBits);
-}
-
-// Canonical decoded/executed tensor instruction arguments.
+// Canonical decoded tensor instruction arguments.
 //
-// Decode fills the architectural intent (descriptor id, fence mode, macro-op
-// selection). Execute later resolves runtime control words into window/tile/
-// slot selection and fills in the effective operand formats from descriptors.
+// Decode extracts the funct3 + qualifier bits from the 32-bit instruction word
+// and fills these fields verbatim. Execute then dispatches by TcuType and reads
+// the relevant subset:
+//   - TMEM_*           : cta_group, shared_addr_space, cp_shape, cp_decompress
+//   - CPABULK_TENSOR_* : dim_count, im2col_tile, multicast, mbar_complete_tx
+//   - MBAR_*           : cluster_scope, arrive_drop, relaxed, expect_tx_combo,
+//                        test_or_try, timeout_bucket, fence_mode
+//   - TCU_MMA          : enable_input_d, ws, sp, cta_group, collector_a_fill, multicast
+//   - TCU_LD/ST        : ld_shape, ld_num, ld_pack
 struct IntrTcuArgs {
+  // Operand-side state resolved at execute time from idesc memory descriptor
+  // (lazy-loaded for TCU_MMA; not used by other instructions).
   uint32_t fmt_a = 0;
   uint32_t fmt_b = 0;
   uint32_t fmt_c = 0;
   uint32_t fmt_d = 0;
-  uint32_t step_m = 0;
-  uint32_t step_n = 0;
-  uint32_t step_k = 0;
-  // Legacy field name kept while old call sites are retired. In the current
-  // TMEM model this denotes logical column span rather than physical banks.
-  uint32_t bank_span = 0;
-  uint32_t meta_col_span = 0;
-  uint32_t packet_count = 0;
+  uint32_t a_sparse_mode = 0;
+
+  // Async tracking / handle indirection.
   uint32_t async_id = 0;
-  uint32_t descriptor = kInvalidTcuDescriptorId;
   uint32_t runtime_handle = 0;
+
+  // ---- New tcgen05 ISA qualifier-decoded flags (modifier bits from funct7) ----
+  uint8_t cta_group = 0;          // qualifier[0] for most TMEM ops; qualifier[3] for TCU_MMA
+  uint8_t shared_addr_space = 0;  // TMEM_ALLOC qualifier[1]
+  uint8_t multicast = 0;          // TMEM_CP qualifier[6]; CPABULK qualifier[4]; MBAR_COMMIT qualifier[2]; TCU_MMA qualifier[6]
+  uint8_t cluster_scope = 0;      // MBAR_* shared::cluster bit
+  uint8_t invalidate = 0;         // MBAR_INIT qualifier[0] (0=init, 1=invalidate)
+
+  // TMEM_CP modifiers.
+  TcuCpShape cp_shape = TcuCpShape::S128x256b;
+  TcuCpDecompress cp_decompress = TcuCpDecompress::None;
+
+  // CPABULK_TENSOR_LD/ST modifiers.
+  uint8_t dim_count = 1;            // qualifier[2:0] + 1
+  uint8_t im2col_tile = 0;          // qualifier[3] (0=im2col, 1=tile)
+  uint8_t mbar_complete_tx = 0;     // CPABULK_TENSOR_LD qualifier[5]
+
+  // MBAR_FENCE modifier.
+  TcuFenceMode fence_mode = TcuFenceMode::Before;
+
+  // MBAR_ARRIVE modifiers.
+  uint8_t arrive_drop = 0;          // qualifier[1]
+  uint8_t relaxed = 0;              // qualifier[2]
+  uint8_t expect_tx_combo = 0;      // qualifier[3] (1=arrive.expect_tx)
+
+  // MBAR_TEST_TRY_WAIT modifiers.
+  TcuTestTryWait test_or_try = TcuTestTryWait::Test;
+  uint8_t timeout_bucket = 0;       // qualifier[6:2] (5 bits, only valid when test_or_try=Try)
+
+  // TCU_MMA modifiers.
+  uint8_t enable_input_d = 0;       // qualifier[0] (=output_resident OR)
+  uint8_t ws = 0;                   // qualifier[1]
+  uint8_t sp = 0;                   // qualifier[2]
+  uint8_t collector_a_fill = 0;     // qualifier[5:4] (fill/use/lastuse/discard)
+
+  // TCU_LD / TCU_ST modifiers.
+  TcuLdStShape ld_shape = TcuLdStShape::Shape32x32b;
+  uint8_t ld_num = 0;               // qualifier[5:3]
+  uint8_t ld_pack = 0;              // qualifier[6]
+
+  // ---- Internal microarchitecture routing fields ----
+  // Used by tensor_async_frontend.cpp / tensor_issue_policy.cpp /
+  // tensor_mem_manager.cpp to match operand state caches against the
+  // currently-active idesc/operand_block. Not part of the ISA encoding;
+  // populated by execute.cpp's TCU_MMA fan-out path.
+  uint32_t descriptor = 0xffffffffu;
+  // Phase-3.3.8: window_id is internal-only (always 0 in the new TCU_MMA
+  // path; only TMEM_SHIFT still encodes it from rs2 for legacy refill).
+  // tile_id is now derived inside dispatch_tcu_mma() from idesc.M/N — kernel
+  // does not encode it. Kept for the legacy fill/store helpers in
+  // tensor_async_frontend.cpp; will be removed when those helpers
+  // de-window.
   uint32_t window_id = 0;
   uint32_t tile_id = 0;
-  uint32_t a_sparse_mode = 0;
-  uint32_t barrier_id = 0;
-  uint32_t slot_id = 0;
-  uint32_t a_slot_id = 0;
-  uint32_t b_slot_id = 0;
-  uint32_t c_slot_id = 0;
-  uint8_t ws = 0;
-  uint8_t sp = 0;
+  uint8_t output_resident = 0;
   uint8_t macro_op = 0;
   uint8_t transpose_a = 0;
   uint8_t transpose_b = 0;
   TcuTarget target = TcuTarget::None;
   TcuPayloadKind payload_kind = TcuPayloadKind::Dense;
-  TcuFenceMode fence_mode = TcuFenceMode::Before;
 };
 
 inline std::ostream &operator<<(std::ostream &os, const TcuType& type) {
   switch (type) {
-  case TcuType::TMEM_ALLOC: os << "TMEM_ALLOC"; break;
-  case TcuType::TMEM_FREE:  os << "TMEM_FREE"; break;
-  case TcuType::TMEM_REL_PERMIT: os << "TMEM_REL_PERMIT"; break;
-  case TcuType::TMA_LOAD:   os << "TMA_LOAD"; break;
-  case TcuType::TMA_STORE:  os << "TMA_STORE"; break;
-  case TcuType::TC_COMMIT:  os << "TC_COMMIT"; break;
-  case TcuType::TC_FENCE:   os << "TC_FENCE"; break;
-  case TcuType::TC_WAIT:    os << "TC_WAIT"; break;
-  case TcuType::TMEM_SHIFT: os << "TMEM_SHIFT"; break;
-  case TcuType::MMA_LOAD:   os << "MMA_LOAD"; break;
-  case TcuType::MMA_STORE:  os << "MMA_STORE"; break;
-  case TcuType::MBAR_INIT:   os << "MBAR_INIT"; break;
-  case TcuType::MBAR_ARRIVE: os << "MBAR_ARRIVE"; break;
-  case TcuType::MBAR_WAIT:   os << "MBAR_WAIT"; break;
-  case TcuType::TMA_WAIT:   os << "TMA_WAIT"; break;
-  case TcuType::WMMA:       os << "WMMA"; break;
+  // custom-1
+  case TcuType::TMEM_REL_PERMIT:    os << "TMEM_REL_PERMIT"; break;
+  case TcuType::TMEM_ALLOC:         os << "TMEM_ALLOC"; break;
+  case TcuType::TMEM_DEALLOC:       os << "TMEM_DEALLOC"; break;
+  case TcuType::TMEM_CP:            os << "TMEM_CP"; break;
+  case TcuType::TMEM_SHIFT:         os << "TMEM_SHIFT"; break;
+  case TcuType::CPABULK_TENSOR_LD:  os << "CPABULK_TENSOR_LD"; break;
+  case TcuType::CPABULK_TENSOR_ST:  os << "CPABULK_TENSOR_ST"; break;
+  // custom-2
+  case TcuType::MBAR_FENCE:         os << "MBAR_FENCE"; break;
+  case TcuType::MBAR_COMMIT:        os << "MBAR_COMMIT"; break;
+  case TcuType::MBAR_INIT:          os << "MBAR_INIT"; break;
+  case TcuType::MBAR_ARRIVE:        os << "MBAR_ARRIVE"; break;
+  case TcuType::MBAR_EXPECT_TX:     os << "MBAR_EXPECT_TX"; break;
+  case TcuType::MBAR_COMPLETE_TX:   os << "MBAR_COMPLETE_TX"; break;
+  case TcuType::MBAR_WAIT:          os << "MBAR_WAIT"; break;
+  case TcuType::MBAR_TEST_TRY_WAIT: os << "MBAR_TEST_TRY_WAIT"; break;
+  // custom-3
+  case TcuType::TCU_MMA:            os << "TCU_MMA"; break;
+  case TcuType::TCU_LD:             os << "TCU_LD"; break;
+  case TcuType::TCU_ST:             os << "TCU_ST"; break;
+  case TcuType::TCU_WAIT_LD:        os << "TCU_WAIT_LD"; break;
+  case TcuType::TCU_WAIT_ST:        os << "TCU_WAIT_ST"; break;
   default:
     assert(false);
   }

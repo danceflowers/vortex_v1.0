@@ -18,6 +18,7 @@
 #include <vector>
 #include "tmem.h"
 #include "types.h"
+#include "i_descriptor.h"
 
 namespace vortex {
 
@@ -47,27 +48,9 @@ struct TmaDescriptor {
   uint8_t reserved = 0;
 } __attribute__((packed));
 
-// Software-visible MMA descriptor.
-//
-// Shapes are expressed in mathematical matrix elements (window shape).
-// The window planner translates these into TMEM windows, tiles and packets.
-// transpose 已移至 TmaDescriptor (数据搬运侧关注)。
-struct MmaDescriptor {
-  uint32_t fmt_a = 0;
-  uint32_t fmt_b = 0;
-  uint32_t fmt_c = 0;
-  uint32_t fmt_d = 0;
-  uint8_t ws = 0;
-  uint8_t sp = 0;
-  uint8_t sparse_mode = 0;
-  uint8_t reserved[5] = {};
-  uint16_t a_rows = 0;
-  uint16_t a_cols = 0;
-  uint16_t b_rows = 0;
-  uint16_t b_cols = 0;
-  uint16_t c_rows = 0;
-  uint16_t c_cols = 0;
-} __attribute__((packed));
+// IDescriptor is the legacy software descriptor-table entry used by TMA/TMEM
+// setup paths. Do not confuse it with idescriptor_t, the 32-bit tcgen05.mma
+// instruction descriptor carried directly by each TCU_MMA instruction.
 
 // Front-end TMA timing/descriptor helper.
 //
@@ -99,9 +82,9 @@ public:
                            TmaDescriptor* out,
                            const ReadCallback& dcache_read);
 
-  bool read_mma_descriptor(uint64_t startup_arg,
+  bool read_idescriptor(uint64_t startup_arg,
                            uint32_t desc_id,
-                           MmaDescriptor* out,
+                           IDescriptor* out,
                            const ReadCallback& dcache_read);
 
   uint32_t estimate_load_latency(const TmaDescriptor& desc) const;
@@ -192,7 +175,7 @@ private:
   bool descriptor_tables_loaded_;
   bool realistic_load_;
   std::vector<TmaDescriptor> tma_desc_table_;
-  std::vector<MmaDescriptor> mma_desc_table_;
+  std::vector<IDescriptor> mma_desc_table_;
 };
 
 } // namespace vortex

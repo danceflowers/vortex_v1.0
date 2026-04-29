@@ -8,7 +8,11 @@ SRC_DIR = $(VORTEX_HOME)/sim/simx
 
 CXXFLAGS += -std=c++17 -Wall -Wextra -Wfatal-errors
 CXXFLAGS += -fPIC -Wno-maybe-uninitialized
-CXXFLAGS += -I$(SRC_DIR) -I$(SW_COMMON_DIR) -I$(ROOT_DIR)/hw
+CXXFLAGS += -I$(SRC_DIR) -I$(SRC_DIR)/common -I$(SRC_DIR)/tensor
+CXXFLAGS += -I$(SRC_DIR)/tensor/open_tensorcore -I$(SRC_DIR)/tensor/open_tensorcore/tensor_compute
+CXXFLAGS += -I$(SRC_DIR)/tensor/open_tensorcore/local_memory -I$(SRC_DIR)/tensor/open_tensorcore/tensor_control
+CXXFLAGS += -I$(SRC_DIR)/tensor/open_tensorcore/tensor_helper -I$(SRC_DIR)/tensor/open_tensorcore/tensor_top
+CXXFLAGS += -I$(SW_COMMON_DIR) -I$(ROOT_DIR)/hw
 CXXFLAGS += -I$(THIRD_PARTY_DIR)/softfloat/source/include
 CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/spdlog/include
 CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/yaml-cpp/include
@@ -25,7 +29,7 @@ SRCS += $(SRC_DIR)/processor.cpp $(SRC_DIR)/cluster.cpp $(SRC_DIR)/socket.cpp $(
 SRCS += $(SRC_DIR)/decode.cpp $(SRC_DIR)/opc_unit.cpp $(SRC_DIR)/dispatcher.cpp
 SRCS += $(SRC_DIR)/execute.cpp $(SRC_DIR)/func_unit.cpp
 SRCS += $(SRC_DIR)/cache_sim.cpp $(SRC_DIR)/mem_sim.cpp $(SRC_DIR)/local_mem.cpp $(SRC_DIR)/mem_coalescer.cpp
-SRCS += $(SRC_DIR)/dcrs.cpp $(SRC_DIR)/types.cpp
+SRCS += $(SRC_DIR)/dcrs.cpp $(SRC_DIR)/common/types.cpp
 
 # Add V extension sources
 ifneq ($(findstring -DEXT_V_ENABLE, $(CONFIGS)),)
@@ -37,7 +41,22 @@ else
 endif
 # Add TCU extension sources
 ifneq ($(findstring -DEXT_TCU_ENABLE, $(CONFIGS)),)
-	SRCS += $(SRC_DIR)/tensor_unit.cpp $(SRC_DIR)/tmem.cpp $(SRC_DIR)/tma.cpp $(SRC_DIR)/tmem_window_planner.cpp
+	SRCS += $(SRC_DIR)/tensor/tma.cpp $(SRC_DIR)/tensor/tma_frontend.cpp
+	SRCS += $(SRC_DIR)/tensor/tmem.cpp $(SRC_DIR)/tensor/tmem_system.cpp $(SRC_DIR)/tensor/tmem_window_planner.cpp
+	SRCS += $(SRC_DIR)/tensor/tensor_mem_layout_utils.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/local_memory/tensor_local_mem_arbiter.cpp
+	# tensor_local_mem_pipeline.cpp references a header that doesn't exist; skip
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/local_memory/tensor_mem_pipeline.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_control/tc_decode.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_control/tensor_async_frontend.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_control/tensor_issue_policy.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_control/tensor_mem_manager.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_control/tensor_wmma_issue_engine.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_control/tensor_wmma_retire_unit.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_helper/tensor_debug_utils.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_top/tensor_runtime_utils.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_top/tensor_tick_utils.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_top/tensor_unit.cpp
 endif
 
 # Debugging

@@ -1104,138 +1104,205 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
       }
       ibuffer.push_back(instr);
     } break;
-  #ifdef EXT_TCU_ENABLE
-    case 2: { // TMEM allocation / TMA launch / TMA wait control group
-      switch (funct3) {
-      case 0: { // Legacy synchronous WMMA path removed.
-        std::abort();
-      } break;
-      case 1: { // TMEM_ALLOC
-        auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TMEM_ALLOC);
-        instr->setDestReg(rd, RegType::Integer);
-        instr->setSrcReg(0, rs1, RegType::Integer);
-        ibuffer.push_back(instr);
-      } break;
-      case 2: { // TMEM_FREE
-        auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TMEM_FREE);
-        instr->setSrcReg(0, rs1, RegType::Integer);
-        ibuffer.push_back(instr);
-      } break;
-      case 3: { // TMA_LOAD
-        auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TMA_LOAD);
-        instr->setDestReg(rd, RegType::Integer);
-        instr->setSrcReg(0, rs1, RegType::Integer);
-        instr->setSrcReg(1, rs2, RegType::Integer);
-        ibuffer.push_back(instr);
-      } break;
-      case 4: { // TMA_STORE
-        auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TMA_STORE);
-        instr->setDestReg(rd, RegType::Integer);
-        instr->setSrcReg(0, rs1, RegType::Integer);
-        instr->setSrcReg(1, rs2, RegType::Integer);
-        ibuffer.push_back(instr);
-      } break;
-      case 7: { // TMA_WAIT
-        auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TMA_WAIT);
-        instr->setSrcReg(0, rs1, RegType::Integer);
-        ibuffer.push_back(instr);
-      } break;
-      default:
-        std::abort();
-      }
-    } break;
-    case 4: { // Tensor memory / tensor compute macro-op group
-      switch (funct3) {
-      case 0: { // WMMA using preloaded desc_id
-        IntrTcuArgs args{};
-        args.descriptor = rd;
-        args.macro_op = 1;
-        if (rs1 >= 16 || rs2 >= 4) {
-          std::abort();
-        }
-        args.a_slot_id = tcu_wmma_ctl_a_slot_id(rs1);
-        args.b_slot_id = tcu_wmma_ctl_b_slot_id(rs1);
-        args.c_slot_id = rs2;
-        auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::WMMA, args);
-        ibuffer.push_back(instr);
-      } break;
-      case 5: { // MMA_LOAD using preloaded desc_id
-        IntrTcuArgs args{};
-        args.descriptor = rd;
-        args.macro_op = 1;
-        auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::MMA_LOAD, args);
-        instr->setSrcReg(0, rs1, RegType::Integer);
-        instr->setSrcReg(1, rs2, RegType::Integer);
-        ibuffer.push_back(instr);
-      } break;
-      case 6: { // MMA_STORE using preloaded desc_id
-        IntrTcuArgs args{};
-        args.descriptor = rd;
-        args.macro_op = 1;
-        auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::MMA_STORE, args);
-        instr->setSrcReg(0, rs1, RegType::Integer);
-        instr->setSrcReg(1, rs2, RegType::Integer);
-        ibuffer.push_back(instr);
-      } break;
-      default:
-        std::abort();
-      }
-    } break;
-    case 3: { // Tensor synchronization / shift / barrier control group
-      switch (funct3) {
-      case 0: { // TMEM_REL_PERMIT
-        auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TMEM_REL_PERMIT);
-        ibuffer.push_back(instr);
-      } break;
-      case 1: { // TC_COMMIT
-        auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TC_COMMIT);
-        set_optional_int_dest(instr, rd);
-        instr->setSrcReg(0, rs1, RegType::Integer);
-        ibuffer.push_back(instr);
-      } break;
-      case 2: { // TC_FENCE
-        IntrTcuArgs args{};
-        // Encode fence mode in rd because funct7=3 reserves the funct2 bits.
-        args.fence_mode = (rd != 0) ? TcuFenceMode::After : TcuFenceMode::Before;
-        auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TC_FENCE, args);
-        ibuffer.push_back(instr);
-      } break;
-      case 3: { // TMEM_SHIFT
-        auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TMEM_SHIFT);
-        set_optional_int_dest(instr, rd);
-        instr->setSrcReg(0, rs1, RegType::Integer);
-        instr->setSrcReg(1, rs2, RegType::Integer);
-        ibuffer.push_back(instr);
-      } break;
-      case 4: { // MBAR_INIT
-        auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::MBAR_INIT);
-        instr->setSrcReg(0, rs1, RegType::Integer);
-        instr->setSrcReg(1, rs2, RegType::Integer);
-        ibuffer.push_back(instr);
-      } break;
-      case 5: { // MBAR_ARRIVE
-        auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::MBAR_ARRIVE);
-        instr->setSrcReg(0, rs1, RegType::Integer);
-        ibuffer.push_back(instr);
-      } break;
-      case 6: { // MBAR_WAIT
-        auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::MBAR_WAIT);
-        instr->setSrcReg(0, rs1, RegType::Integer);
-        ibuffer.push_back(instr);
-      } break;
-      case 7: { // TC_WAIT
-        auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TC_WAIT);
-        ibuffer.push_back(instr);
-      } break;
-      default:
-        std::abort();
-      }
-    } break;
-  #endif
     default:
       std::abort();
     }
   } break;
+#ifdef EXT_TCU_ENABLE
+  case Opcode::EXT2: { // custom-1 (0x2B): tcgen05 TMEM management + cp.async.bulk.tensor
+    auto qualifier = funct7;
+    IntrTcuArgs args{};
+    args.cta_group = (qualifier >> 0) & 1;
+    switch (funct3) {
+    case 0b001: { // TMEM_REL_PERMIT
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TMEM_REL_PERMIT, args);
+      ibuffer.push_back(instr);
+    } break;
+    case 0b010: { // TMEM_ALLOC: rs1=dst_addr ptr, rs2=nCols, rd=handle
+      args.shared_addr_space = (qualifier >> 1) & 1;
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TMEM_ALLOC, args);
+      instr->setDestReg(rd, RegType::Integer);  // returned handle
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      instr->setSrcReg(1, rs2, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    case 0b011: { // TMEM_DEALLOC: rs1=taddr, rs2=nCols
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TMEM_DEALLOC, args);
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      instr->setSrcReg(1, rs2, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    case 0b100: { // TMEM_CP: rs1=taddr, rs2=s_desc
+      args.cp_shape = static_cast<TcuCpShape>((qualifier >> 1) & 0x7);
+      args.cp_decompress = static_cast<TcuCpDecompress>((qualifier >> 4) & 0x3);
+      args.multicast = (qualifier >> 6) & 1;
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TMEM_CP, args);
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      instr->setSrcReg(1, rs2, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    case 0b101: { // TMEM_SHIFT: rs1=taddr, rs2=control
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TMEM_SHIFT, args);
+      set_optional_int_dest(instr, rd);
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      instr->setSrcReg(1, rs2, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    case 0b110: { // CPABULK_TENSOR_LD: rs1=tensor_map_handle, rs2=coords/ctl
+      args.dim_count = ((qualifier >> 0) & 0x7) + 1;
+      args.im2col_tile = (qualifier >> 3) & 1;
+      args.multicast = (qualifier >> 4) & 1;
+      args.mbar_complete_tx = (qualifier >> 5) & 1;
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::CPABULK_TENSOR_LD, args);
+      instr->setDestReg(rd, RegType::Integer);
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      instr->setSrcReg(1, rs2, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    case 0b111: { // CPABULK_TENSOR_ST: rs1=tensor_map_handle, rs2=coords/ctl
+      args.dim_count = ((qualifier >> 0) & 0x7) + 1;
+      args.im2col_tile = (qualifier >> 3) & 1;
+      args.multicast = (qualifier >> 4) & 1;
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::CPABULK_TENSOR_ST, args);
+      instr->setDestReg(rd, RegType::Integer);
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      instr->setSrcReg(1, rs2, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    default:
+      std::abort();
+    }
+  } break;
+  case Opcode::EXT3: { // custom-2 (0x5B): tcgen05 sync + full mbarrier
+    auto qualifier = funct7;
+    IntrTcuArgs args{};
+    switch (funct3) {
+    case 0b000: { // MBAR_FENCE
+      args.fence_mode = ((qualifier & 1) != 0) ? TcuFenceMode::After : TcuFenceMode::Before;
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::MBAR_FENCE, args);
+      ibuffer.push_back(instr);
+    } break;
+    case 0b001: { // MBAR_COMMIT: rs1=mbar_addr, rs2=ctaMask
+      args.cta_group = (qualifier >> 0) & 1;
+      args.cluster_scope = (qualifier >> 1) & 1;
+      args.multicast = (qualifier >> 2) & 1;
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::MBAR_COMMIT, args);
+      set_optional_int_dest(instr, rd);
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      instr->setSrcReg(1, rs2, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    case 0b010: { // MBAR_INIT / MBAR_INVALIDATE: rs1=mbar_addr, rs2=count
+      args.invalidate = (qualifier >> 0) & 1;
+      args.cluster_scope = (qualifier >> 1) & 1;
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::MBAR_INIT, args);
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      instr->setSrcReg(1, rs2, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    case 0b011: { // MBAR_ARRIVE: rs1=mbar_addr, rs2=count_or_tx
+      args.cluster_scope = (qualifier >> 0) & 1;
+      args.arrive_drop   = (qualifier >> 1) & 1;
+      args.relaxed       = (qualifier >> 2) & 1;
+      args.expect_tx_combo = (qualifier >> 3) & 1;
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::MBAR_ARRIVE, args);
+      set_optional_int_dest(instr, rd);
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      instr->setSrcReg(1, rs2, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    case 0b100: { // MBAR_EXPECT_TX: rs1=mbar_addr, rs2=txCount
+      args.cluster_scope = (qualifier >> 0) & 1;
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::MBAR_EXPECT_TX, args);
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      instr->setSrcReg(1, rs2, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    case 0b101: { // MBAR_COMPLETE_TX: rs1=mbar_addr, rs2=txCount
+      args.cluster_scope = (qualifier >> 0) & 1;
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::MBAR_COMPLETE_TX, args);
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      instr->setSrcReg(1, rs2, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    case 0b110: { // MBAR_WAIT: rs1=mbar_addr, rs2=phase_token (blocking, no timeout)
+      args.cluster_scope = (qualifier >> 0) & 1;
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::MBAR_WAIT, args);
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      instr->setSrcReg(1, rs2, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    case 0b111: { // MBAR_TEST_TRY_WAIT: rs1=mbar_addr, rs2=phase_token, rd=status
+      args.test_or_try   = ((qualifier >> 0) & 1) ? TcuTestTryWait::Try : TcuTestTryWait::Test;
+      args.cluster_scope = (qualifier >> 1) & 1;
+      args.timeout_bucket = (qualifier >> 2) & 0x1F; // 5 bits
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::MBAR_TEST_TRY_WAIT, args);
+      instr->setDestReg(rd, RegType::Integer);
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      instr->setSrcReg(1, rs2, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    default:
+      std::abort();
+    }
+  } break;
+  case Opcode::EXT4: { // custom-3 (0x7B): tcgen05 compute family
+    auto qualifier = funct7;
+    IntrTcuArgs args{};
+    switch (funct3) {
+    case 0b000: { // TCU_MMA: rd=x0, rs1=idesc, rs2=operand_block LMEM ptr
+      // PTX-aligned compact qualifier (7-bit funct7):
+      //   [0]   enable_input_d
+      //   [1]   ws
+      //   [2]   sp
+      //   [3]   cta_group
+      //   [5:4] collector_a_state (fill/use/lastuse/discard)
+      //   [6]   multicast::cluster
+      args.enable_input_d   = (qualifier >> 0) & 1;
+      args.ws               = (qualifier >> 1) & 1;
+      args.sp               = (qualifier >> 2) & 1;
+      args.cta_group        = (qualifier >> 3) & 1;
+      args.collector_a_fill = (qualifier >> 4) & 0x3;
+      args.multicast        = (qualifier >> 6) & 1;
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TCU_MMA, args);
+      if (rd != 0) {
+        std::abort();
+      }
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      instr->setSrcReg(1, rs2, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    case 0b001: { // TCU_LD: rd=data, rs1=taddr
+      args.ld_shape = static_cast<TcuLdStShape>((qualifier >> 0) & 0x7);
+      args.ld_num   = (qualifier >> 3) & 0x7;
+      args.ld_pack  = (qualifier >> 6) & 1;
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TCU_LD, args);
+      instr->setDestReg(rd, RegType::Integer);
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    case 0b010: { // TCU_ST: rs1=taddr, rs2=data
+      args.ld_shape = static_cast<TcuLdStShape>((qualifier >> 0) & 0x7);
+      args.ld_num   = (qualifier >> 3) & 0x7;
+      args.ld_pack  = (qualifier >> 6) & 1;
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TCU_ST, args);
+      instr->setSrcReg(0, rs1, RegType::Integer);
+      instr->setSrcReg(1, rs2, RegType::Integer);
+      ibuffer.push_back(instr);
+    } break;
+    case 0b011: { // TCU_WAIT_LD
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TCU_WAIT_LD, args);
+      ibuffer.push_back(instr);
+    } break;
+    case 0b100: { // TCU_WAIT_ST
+      auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TCU_WAIT_ST, args);
+      ibuffer.push_back(instr);
+    } break;
+    default:
+      std::abort();
+    }
+  } break;
+#endif
   default:
     std::abort();
   }

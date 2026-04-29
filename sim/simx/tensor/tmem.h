@@ -103,11 +103,20 @@ public:
     uint32_t chunk_idx = 0;
   };
 
+  // Phase-3.4 Stage 0: PTX-strict TADDR sentinel. tcgen05.alloc returns a
+  // TADDR `[15:0]=lane`,`[31:16]=col_byte`. col_byte 0..511 is valid, so the
+  // theoretical max valid TADDR is 0x01FF_007F (col_byte=511, lane=127). Any
+  // TADDR >= 0x80000000 is treated as invalid; we use 0xFFFFFFFFu as the
+  // canonical failure value (cannot collide with a successful alloc).
+  static constexpr uint32_t kInvalidTaddr = 0xFFFFFFFFu;
+
   static constexpr uint32_t kPacketBytes = 64;
   static constexpr uint32_t kPhysicalBankBytes = 8;
   static constexpr uint32_t kPacketLanes = kPacketBytes / kPhysicalBankBytes;
-  static constexpr uint32_t kLogicalLines = 128;
-  static constexpr uint32_t kPayloadCols = 64;
+  // Phase-3.3.3: expand logical view to 128 lanes × 512 cols (1-byte cell).
+  // Total = 128 × 512 = 64 KB. Banks / ports / swizzle unchanged.
+  static constexpr uint32_t kLogicalLines = 512;   // was 128 (cols per lane)
+  static constexpr uint32_t kPayloadCols = 128;    // was 64  (lanes)
   static constexpr uint32_t kMetaCols = 0;
   static constexpr uint32_t kMetaColBase = kPayloadCols;
   static constexpr uint32_t kNumCols = kPayloadCols + kMetaCols;
@@ -145,11 +154,22 @@ public:
   bool lookup_allocation(uint32_t handle, TmemAllocation** allocation);
   bool lookup_allocation(uint32_t handle, const TmemAllocation** allocation) const;
 
+  // Phase-3.4 Stage 0: PTX TADDR lookup helper. Per-thread TCU_LD/TCU_ST
+  // computes actual_lane = taddr.lane + thread_id; this scans allocations_
+  // for one whose [col_base, col_base + col_span) covers actual_lane.
+  // Returns the containing allocation's col_base on success.
+  bool find_allocation_by_lane(uint32_t lane, uint32_t* col_base) const;
+
   bool region_query(uint32_t col_base, uint32_t col_span, uint32_t* size_bytes) const;
   bool query(uint32_t handle, uint32_t* col_span, uint32_t* size_bytes) const;
 
   bool region_copy_in(uint32_t col_base, uint32_t col_span, const uint8_t* data, uint32_t size_bytes);
   bool region_copy_out(uint32_t col_base, uint32_t col_span, uint8_t* data, uint32_t size_bytes) const;
+
+  // Byte-range R/W via handle (Phase-3.3.1 GAP-4 path for tcu_ld/tcu_st).
+  // byte_offset is relative to the allocation's payload region (0..col_span*kColBytes-1).
+  bool handle_region_read_bytes(uint32_t handle, uint32_t byte_offset, uint8_t* dst, uint32_t bytes) const;
+  bool handle_region_write_bytes(uint32_t handle, uint32_t byte_offset, const uint8_t* src, uint32_t bytes);
   bool region_read_packet(uint32_t col_base, uint32_t col_span, uint32_t packet_idx, TmemPacket* out) const;
   bool region_write_packet(uint32_t col_base, uint32_t col_span, uint32_t packet_idx, const TmemPacket& in);
   bool copy_in(uint32_t handle, const uint8_t* data, uint32_t size_bytes);
@@ -288,7 +308,9 @@ private:
   void insert_pending_request(uint64_t tag, bool write);
 
   using PhysicalRow = std::vector<uint8_t>;
-  static constexpr uint32_t kPhysicalRows = 64;
+  // Phase-3.3.3: kPhysicalRows tracks kLogicalLines (2 logical lines pack into
+  // one physical row). With kLogicalLines=512, kPhysicalRows=256.
+  static constexpr uint32_t kPhysicalRows = kLogicalLines / 2;
 
   uint32_t num_physical_banks_;
   uint32_t bank_slice_bytes_;

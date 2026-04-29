@@ -45,7 +45,7 @@ bool warpgroup_debug_enabled(Word pc) {
 bool is_warpgroup_collective_tcu(TcuType type) {
   switch (type) {
   case TcuType::TMEM_ALLOC:
-  case TcuType::TMEM_FREE:
+  case TcuType::TMEM_DEALLOC:
   case TcuType::TMEM_REL_PERMIT:
     return false;
   default:
@@ -55,15 +55,9 @@ bool is_warpgroup_collective_tcu(TcuType type) {
 
 bool collective_args_match(TcuType type, const IntrTcuArgs& lhs, const IntrTcuArgs& rhs) {
   switch (type) {
-  case TcuType::WMMA:
-    return lhs.descriptor == rhs.descriptor
-        && lhs.a_slot_id == rhs.a_slot_id
-        && lhs.b_slot_id == rhs.b_slot_id
-        && lhs.c_slot_id == rhs.c_slot_id;
-  case TcuType::MMA_LOAD:
-  case TcuType::MMA_STORE:
+  case TcuType::TCU_MMA:
     return lhs.descriptor == rhs.descriptor;
-  case TcuType::TC_FENCE:
+  case TcuType::MBAR_FENCE:
     return lhs.fence_mode == rhs.fence_mode;
   default:
     return true;
@@ -348,47 +342,10 @@ instr_trace_t* Emulator::step() {
         if (collective_follower_consume) {
           score = std::numeric_limits<uint32_t>::max();
         } else {
-          if (tcu_type == TcuType::WMMA
-           || tcu_type == TcuType::MMA_LOAD
-           || tcu_type == TcuType::MMA_STORE) {
-            MmaDescriptor desc{};
-            if (core_->read_mma_descriptor(tcu_args.descriptor, &desc)) {
-              tcu_args.fmt_a = desc.fmt_a;
-              tcu_args.fmt_b = desc.fmt_b;
-              tcu_args.fmt_ab = (desc.fmt_a == desc.fmt_b) ? desc.fmt_a : 0;
-              tcu_args.fmt_c = desc.fmt_c;
-              tcu_args.fmt_d = desc.fmt_d;
-              tcu_args.ws = desc.ws;
-              tcu_args.sp = desc.sp;
-              tcu_args.a_sparse_mode = desc.sparse_mode;
-              tcu_args.transpose_a = desc.transpose_a;
-              tcu_args.transpose_b = desc.transpose_b;
-            }
-          }
-          if (tcu_type == TcuType::MMA_LOAD || tcu_type == TcuType::MMA_STORE) {
-            auto src0 = instr.getSrcReg(0);
-            auto src1 = instr.getSrcReg(1);
-            if (src0.type == RegType::Integer) {
-              for (uint32_t t = 0; t < warp.tmask.size(); ++t) {
-                if (!warp.tmask.test(t)) {
-                  continue;
-                }
-                tcu_args.runtime_handle = warp.ireg_file.at(src0.idx).at(t);
-                if (src1.type == RegType::Integer) {
-                  auto control = warp.ireg_file.at(src1.idx).at(t);
-                  tcu_args.target = tcu_mma_mem_ctl_target(control);
-                  tcu_args.slot_id = tcu_mma_mem_ctl_slot_id(control);
-                  tcu_args.window_id = tcu_mma_mem_ctl_window_id(control);
-                  tcu_args.tile_id = tcu_mma_mem_ctl_tile_id(control);
-                }
-                break;
-              }
-            }
-          }
-          score = tensor_unit_->scheduler_score(wid, tcu_type, tcu_args);
+          score = tensor_unit_->scheduler_score(wid, tcu_type);
         }
         if (score == 0 && best_tcu_block == TensorUnit::IssueBlockReason::None) {
-          best_tcu_block = tensor_unit_->classify_issue_block(wid, tcu_type, tcu_args);
+          best_tcu_block = tensor_unit_->classify_issue_block(wid, tcu_type);
         }
       }
     }
@@ -685,6 +642,48 @@ void Emulator::set_stall_reason(uint32_t wid, WarpStallReason reason) {
 
 WarpStallReason Emulator::stall_reason(uint32_t wid) const {
   return stall_reasons_.at(wid);
+}
+
+bool Emulator::stalled(uint32_t wid) const {
+  return stalled_warps_.test(wid);
+}
+
+bool Emulator::active(uint32_t wid) const {
+  return active_warps_.test(wid);
+}
+
+Word Emulator::warp_pc(uint32_t wid) const {
+  return warps_.at(wid).PC;
+}
+
+uint32_t Emulator::warp_tmask_count(uint32_t wid) const {
+  return warps_.at(wid).tmask.count();
+}
+
+void Emulator::dump_warp_front_state(std::ostream& os, uint32_t wid) const {
+  const auto& warp = warps_.at(wid);
+  os << "    emu_ibuffer_empty=" << warp.ibuffer.empty();
+  if (warp.ibuffer.empty()) {
+    os << "\n";
+    return;
+  }
+
+  const auto& instr = *warp.ibuffer.front();
+  os << " front_fu=" << instr.getFUType();
+  if (!std::holds_alternative<TcuType>(instr.getOpType())
+   || !std::holds_alternative<IntrTcuArgs>(instr.getArgs())) {
+    os << " front_op_non_tcu\n";
+    return;
+  }
+
+  auto tcu_type = std::get<TcuType>(instr.getOpType());
+  os << " front_tcu=" << tcu_type;
+
+  auto score = tensor_unit_->scheduler_score(wid, tcu_type);
+  auto block = tensor_unit_->classify_issue_block(wid, tcu_type);
+  os << " score=" << score
+     << " block=" << static_cast<uint32_t>(block)
+     << "\n";
 }
 
 bool Emulator::wspawn(uint32_t num_warps, Word nextPC) {

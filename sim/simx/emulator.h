@@ -17,11 +17,12 @@
 #include <vector>
 #include <sstream>
 #include <stack>
+#include <iosfwd>
 #include <mem.h>
 #include "types.h"
 #include "instr.h"
 #ifdef EXT_TCU_ENABLE
-#include "tensor_unit.h"
+#include "open_tensorcore/tensor_top/tensor_unit.h"
 #endif
 #ifdef EXT_V_ENABLE
 #include "vec_unit.h"
@@ -111,6 +112,16 @@ public:
   void set_stall_reason(uint32_t wid, WarpStallReason reason);
 
   WarpStallReason stall_reason(uint32_t wid) const;
+
+  bool stalled(uint32_t wid) const;
+
+  bool active(uint32_t wid) const;
+
+  Word warp_pc(uint32_t wid) const;
+
+  uint32_t warp_tmask_count(uint32_t wid) const;
+
+  void dump_warp_front_state(std::ostream& os, uint32_t wid) const;
 
   bool barrier(uint32_t bar_id, uint32_t count, uint32_t wid);
 

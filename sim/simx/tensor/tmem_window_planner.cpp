@@ -68,16 +68,16 @@ uint32_t cmem_packets_per_subtile(uint32_t fmt) {
   }
 }
 
-// m16n16k8: A tile = 16x8, B tile = 8x16
-// fp8: 128 bytes / 64 = 2 packets;  fp16: 256 bytes / 64 = 4 packets
+// m16n16k16: A tile = 16x16, B tile = 16x16
+// fp8: 256 bytes / 64 = 4 packets;  fp16: 512 bytes / 64 = 8 packets
 uint32_t ab_packet_count(TmemWindowTarget target, uint32_t fmt, uint32_t sparse_mode) {
   (void)target;
   (void)sparse_mode;
   switch (fmt) {
   case vortex::tensor::fp8::id:
-    return 2;
-  case vortex::tensor::fp16::id:
     return 4;
+  case vortex::tensor::fp16::id:
+    return 8;
   default:
     return 0;
   }
@@ -107,14 +107,14 @@ bool packet_math_region_impl(const TmemWindowPlan& window,
 
   switch (window.layout_kind) {
   case TmemWindowLayoutKind::ALineNative: {
-    // m16n16k8: A tile = 16x8, 2 lines per tile (step_m=0,1; step_k=0)
+    // m16n16k16: A tile = 16x16, 2 lines per tile (step_m=0,1; step_k=0)
     auto packets_per_line = ab_packet_count(TmemWindowTarget::A, window.fmt, window.sparse_mode) / 2;
     if (0 == packets_per_line) {
       return false;
     }
     auto line_id = local_packet_idx / packets_per_line;
     auto packet_in_line = local_packet_idx % packets_per_line;
-    // k8: line_id 直接对应 step_m (0 或 1), 无 step_k 分解
+    // k16: line_id 直接对应 step_m (0 或 1), 无 step_k 分解
     auto line_row = line_id;  // M-block 索引
     if (math_row_base) {
       *math_row_base = tile_row * TmemWindowPlanner::kATileRows
@@ -127,14 +127,14 @@ bool packet_math_region_impl(const TmemWindowPlan& window,
     break;
   }
   case TmemWindowLayoutKind::BLineNative: {
-    // m16n16k8: B tile = 8x16, 2 lines per tile (step_n=0,1; step_k=0)
+    // m16n16k16: B tile = 16x16, 2 lines per tile (step_n=0,1; step_k=0)
     auto packets_per_line = ab_packet_count(TmemWindowTarget::B, window.fmt, window.sparse_mode) / 2;
     if (0 == packets_per_line) {
       return false;
     }
     auto line_id = local_packet_idx / packets_per_line;
     auto packet_in_line = local_packet_idx % packets_per_line;
-    // k8: line_id 直接对应 step_n (0 或 1), 无 step_k 分解
+    // k16: line_id 直接对应 step_n (0 或 1), 无 step_k 分解
     auto line_col = line_id;  // N-block 索引
     if (math_row_base) {
       *math_row_base = tile_row * TmemWindowPlanner::kBTileRows

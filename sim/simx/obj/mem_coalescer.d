@@ -1,7 +1,7 @@
 /mnt/d/wode_code_trunk/vortex/sim/simx/obj/mem_coalescer.o: \
  /mnt/d/wode_code_trunk/vortex/sim/simx/mem_coalescer.cpp \
  /mnt/d/wode_code_trunk/vortex/sim/simx/mem_coalescer.h \
- /mnt/d/wode_code_trunk/vortex/sim/simx/types.h \
+ /mnt/d/wode_code_trunk/vortex/sim/simx/common/types.h \
  /mnt/d/wode_code_trunk/vortex/sim/common/util.h \
  /mnt/d/wode_code_trunk/vortex/sim/common/bitmanip.h \
  /mnt/d/wode_code_trunk/vortex/sim/common/stringutil.h \
@@ -11,10 +11,10 @@
  /mnt/d/wode_code_trunk/vortex/sim/common/mempool.h \
  /mnt/d/wode_code_trunk/vortex/sim/common/linked_list.h \
  /mnt/d/wode_code_trunk/vortex/sim/common/bitvector.h \
- /mnt/d/wode_code_trunk/vortex/sim/simx/debug.h \
- /mnt/d/wode_code_trunk/vortex/sim/simx/constants.h
+ /mnt/d/wode_code_trunk/vortex/sim/simx/common/debug.h \
+ /mnt/d/wode_code_trunk/vortex/sim/simx/common/constants.h
 /mnt/d/wode_code_trunk/vortex/sim/simx/mem_coalescer.h:
-/mnt/d/wode_code_trunk/vortex/sim/simx/types.h:
+/mnt/d/wode_code_trunk/vortex/sim/simx/common/types.h:
 /mnt/d/wode_code_trunk/vortex/sim/common/util.h:
 /mnt/d/wode_code_trunk/vortex/sim/common/bitmanip.h:
 /mnt/d/wode_code_trunk/vortex/sim/common/stringutil.h:
@@ -24,5 +24,5 @@
 /mnt/d/wode_code_trunk/vortex/sim/common/mempool.h:
 /mnt/d/wode_code_trunk/vortex/sim/common/linked_list.h:
 /mnt/d/wode_code_trunk/vortex/sim/common/bitvector.h:
-/mnt/d/wode_code_trunk/vortex/sim/simx/debug.h:
-/mnt/d/wode_code_trunk/vortex/sim/simx/constants.h:
+/mnt/d/wode_code_trunk/vortex/sim/simx/common/debug.h:
+/mnt/d/wode_code_trunk/vortex/sim/simx/common/constants.h:

@@ -50,33 +50,9 @@ inline int64_t check_boxing(int64_t a) {
   return nan_box(0x7fc00000); // NaN
 }
 
-#ifdef EXT_TCU_ENABLE
-static inline bool has_mma_descriptor(const IntrTcuArgs& args) {
-  return args.descriptor != kInvalidTcuDescriptorId;
-}
-
-// Resolve the preloaded MMA descriptor into effective operand formats and
-// matrix-shape metadata used by the TensorUnit macro-op path.
-static inline void resolve_mma_descriptor(Core* core, IntrTcuArgs* args) {
-  if (!has_mma_descriptor(*args)) {
-    return;
-  }
-  Core::MmaDescriptor desc;
-  if (!core->read_mma_descriptor(args->descriptor, &desc)) {
-    std::abort();
-  }
-  args->fmt_a = desc.fmt_a;
-  args->fmt_b = desc.fmt_b;
-  args->fmt_ab = (desc.fmt_a == desc.fmt_b) ? desc.fmt_a : 0;
-  args->fmt_c = desc.fmt_c;
-  args->fmt_d = desc.fmt_d;
-  args->ws = desc.ws;
-  args->sp = desc.sp;
-  args->a_sparse_mode = desc.sparse_mode;
-  args->transpose_a = desc.transpose_a;
-  args->transpose_b = desc.transpose_b;
-}
-#endif
+// Phase-2: legacy MMA descriptor table reads (resolve_mma_descriptor /
+// decode_tc_commit_scope) deleted. TCU_MMA now passes idesc as a 32-bit
+// register value through the dispatch path; tcgen05.commit has no scope.
 
 void Emulator::fetch_registers(std::vector<reg_data_t>& out, uint32_t wid, uint32_t src_index, const RegOpd& reg) {
   __unused(src_index);
@@ -1489,9 +1465,12 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       trace->data = trace_data;
       switch (tcu_type) {
       case TcuType::TMEM_ALLOC: {
+        // Phase-3.4 Stage 0: returns a PTX TADDR (col_base in low 16, col_byte=0
+        // in high 16). 0xFFFFFFFF is the invalid sentinel.
         auto col_span = std::max<uint32_t>(1, rs1_data.at(thread_start).u32);
-        auto handle = core_->tmem_alloc(col_span); // rs1_data stores the requested logical TMEM column span
-        if (handle == 0) {
+        auto mma_desc_id = rs2_data.at(thread_start).u32; // rs2: 0-based MMA descriptor ID, invalid = no prebuilt layout
+        auto taddr = core_->tmem_alloc(col_span, mma_desc_id);
+        if (taddr == Tmem::kInvalidTaddr) {
           throw std::runtime_error(
             "TMEM allocation failed: requested " + std::to_string(col_span)
           + " logical columns, but simx provides only "
@@ -1500,71 +1479,13 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t))
             continue;
-          rd_data[t].u = handle;
+          rd_data[t].u = taddr;
         }
         trace_data->rd_write = true;
         rd_write = true;
-      } break;
-      case TcuType::TMEM_FREE: {
-        auto handle = rs1_data.at(thread_start).u32;
-        core_->tmem_free(handle);
       } break;
       case TcuType::TMEM_REL_PERMIT: {
         core_->tmem_rel_permit();
-      } break;
-      case TcuType::TMA_LOAD: {
-        auto handle = rs1_data.at(thread_start).u32;
-        auto tmem_control_word = rs2_data.at(thread_start).u32;
-        tpuArgs.window_id = tcu_tmem_op_ctl_window_id(tmem_control_word);
-        auto descriptor_id = tcu_tmem_op_ctl_desc_id(tmem_control_word);
-        // TMA launch enters the Core-side async tensor engine and returns an
-        // async id that later feeds TMA_WAIT / TC_COMMIT synchronization.
-        auto async_id = core_->tma_load(wid, handle, descriptor_id, tpuArgs.window_id);
-        for (uint32_t t = thread_start; t < num_threads; ++t) {
-          if (!warp.tmask.test(t))
-            continue;
-          rd_data[t].u = async_id;
-        }
-        trace_data->rd_write = true;
-        rd_write = true;
-      } break;
-      case TcuType::TMA_STORE: {
-        auto handle = rs1_data.at(thread_start).u32;
-        auto tmem_control_word = rs2_data.at(thread_start).u32;
-        tpuArgs.window_id = tcu_tmem_op_ctl_window_id(tmem_control_word);
-        auto descriptor_id = tcu_tmem_op_ctl_desc_id(tmem_control_word);
-        auto async_id = core_->tma_store(wid, handle, descriptor_id, tpuArgs.window_id);
-        for (uint32_t t = thread_start; t < num_threads; ++t) {
-          if (!warp.tmask.test(t))
-            continue;
-          rd_data[t].u = async_id;
-        }
-        trace_data->rd_write = true;
-        rd_write = true;
-      } break;
-      case TcuType::TC_COMMIT: {
-        auto barrier_id = rs1_data.at(thread_start).u32;
-        auto committed = core_->tc_commit(wid, barrier_id);
-        tpuArgs.barrier_id = barrier_id;
-        for (uint32_t t = thread_start; t < num_threads; ++t) {
-          if (!warp.tmask.test(t))
-            continue;
-          rd_data[t].u = committed;
-        }
-        trace_data->rd_write = (rdest.type != RegType::None) && (rdest.idx != 0);
-        rd_write = trace_data->rd_write;
-      } break;
-      case TcuType::TC_FENCE: {
-        if (!core_->tc_fence(wid, tpuArgs.fence_mode)) {
-          core_->suspend(wid, WarpStallReason::AsyncTensor);
-          last_instr_retired_ = false;
-        }
-      } break;
-      case TcuType::TC_WAIT: {
-        if (!core_->tc_wait(wid)) {
-          core_->suspend(wid, WarpStallReason::AsyncTensor);
-          last_instr_retired_ = false;
-        }
       } break;
       case TcuType::TMEM_SHIFT: {
         auto handle = rs1_data.at(thread_start).u32;
@@ -1583,71 +1504,219 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         trace_data->rd_write = (rdest.type != RegType::None) && (rdest.idx != 0);
         rd_write = trace_data->rd_write;
       } break;
-      case TcuType::MMA_LOAD: {
-        resolve_mma_descriptor(core_, &tpuArgs);
-        auto handle = rs1_data.at(thread_start).u32;
-        auto mma_memory_control_word = rs2_data.at(thread_start).u32;
-        tpuArgs.target = tcu_mma_mem_ctl_target(mma_memory_control_word);
-        tpuArgs.slot_id = tcu_mma_mem_ctl_slot_id(mma_memory_control_word);
-        tpuArgs.window_id = tcu_mma_mem_ctl_window_id(mma_memory_control_word);
-        tpuArgs.tile_id = tcu_mma_mem_ctl_tile_id(mma_memory_control_word);
-        // MMA_LOAD resolves one logical tensor-memory tile into local operand
-        // slot state. Actual TMEM packet progression and local line writes are
-        // handled by TensorUnit after this macro-op is admitted.
-        tensor_unit_->mma_load(wid, handle, tpuArgs, trace_data.get());
-        if (trace_data->retry) {
-          core_->set_stall_reason(wid, WarpStallReason::AsyncTensor);
-          last_instr_retired_ = false;
-        }
-        rd_write = trace_data->rd_write;
-      } break;
-      case TcuType::MMA_STORE: {
-        resolve_mma_descriptor(core_, &tpuArgs);
-        auto handle = rs1_data.at(thread_start).u32;
-        auto mma_memory_control_word = rs2_data.at(thread_start).u32;
-        tpuArgs.target = tcu_mma_mem_ctl_target(mma_memory_control_word);
-        tpuArgs.slot_id = tcu_mma_mem_ctl_slot_id(mma_memory_control_word);
-        tpuArgs.window_id = tcu_mma_mem_ctl_window_id(mma_memory_control_word);
-        tpuArgs.tile_id = tcu_mma_mem_ctl_tile_id(mma_memory_control_word);
-        tensor_unit_->mma_store(wid, handle, tpuArgs, trace_data.get());
-        if (trace_data->retry) {
-          core_->set_stall_reason(wid, WarpStallReason::AsyncTensor);
-          last_instr_retired_ = false;
-        }
-        rd_write = trace_data->rd_write;
-      } break;
       case TcuType::MBAR_INIT: {
-        auto barrier_id = rs1_data.at(thread_start).u32;
+        // rs1 carries the LMEM address of the mbarrier object (PTX semantics).
+        auto mbar_addr = static_cast<uint64_t>(rs1_data.at(thread_start).u32);
         auto count = rs2_data.at(thread_start).u32;
-        core_->mbarrier_init(barrier_id, count);
+        core_->mbarrier_init(mbar_addr, count);
       } break;
       case TcuType::MBAR_ARRIVE: {
-        auto barrier_id = rs1_data.at(thread_start).u32;
-        core_->mbarrier_arrive(barrier_id);
+        auto mbar_addr = static_cast<uint64_t>(rs1_data.at(thread_start).u32);
+        auto observed_phase = core_->mbarrier_arrive(mbar_addr);
+        // PTX returns the phase token observed at arrival in rd, so the
+        // caller can later wait on this phase. Write it back if rd != x0.
+        for (uint32_t t = thread_start; t < num_threads; ++t) {
+          if (!warp.tmask.test(t)) continue;
+          rd_data[t].u = observed_phase;
+        }
+        trace_data->rd_write = (rdest.type != RegType::None) && (rdest.idx != 0);
+        rd_write = trace_data->rd_write;
       } break;
       case TcuType::MBAR_WAIT: {
-        auto barrier_id = rs1_data.at(thread_start).u32;
-        if (!core_->mbarrier_wait(wid, barrier_id)) {
+        auto mbar_addr = static_cast<uint64_t>(rs1_data.at(thread_start).u32);
+        auto phase_token = rs2_data.at(thread_start).u32;
+        if (!core_->mbarrier_wait(wid, mbar_addr, phase_token)) {
           core_->suspend(wid, WarpStallReason::MBarrier);
           last_instr_retired_ = false;
         }
       } break;
-      case TcuType::TMA_WAIT: {
-        auto async_id = rs1_data.at(thread_start).u32;
-        if (!core_->tma_wait(wid, async_id)) {
+      // ============================================================
+      // New tcgen05-aligned ISA cases (custom-1 / custom-2 / custom-3)
+      // ============================================================
+      case TcuType::TMEM_DEALLOC: {
+        // tcgen05.dealloc — alias of legacy TMEM_FREE on the Core API side.
+        auto handle = rs1_data.at(thread_start).u32;
+        core_->tmem_dealloc(handle);
+      } break;
+      case TcuType::TMEM_CP: {
+        // tcgen05.cp (PTX §9.7.16.5.3): shared->TMEM copy.
+        // rs1 = TMEM target address; rs2 = LMEM ptr to 64 b s_desc.
+        auto taddr = rs1_data.at(thread_start).u32;
+        auto s_desc_lmem_ptr = static_cast<uint64_t>(rs2_data.at(thread_start).u32);
+        auto shape = static_cast<uint32_t>(tpuArgs.cp_shape);
+        auto decompress = static_cast<uint32_t>(tpuArgs.cp_decompress);
+        core_->tmem_cp(wid, taddr, s_desc_lmem_ptr, shape, decompress);
+      } break;
+      case TcuType::CPABULK_TENSOR_LD: {
+        // cp.async.bulk.tensor.<N>d.shared::cluster.global (PTX §6.4.10):
+        // rs1 = DRAM addr of tensor_map_t (128 B);
+        // rs2 = LMEM ptr to cpabulk_transfer_args_t (32 B).
+        auto tensor_map_addr = static_cast<uint64_t>(rs1_data.at(thread_start).u32);
+        auto args_lmem_ptr   = static_cast<uint64_t>(rs2_data.at(thread_start).u32);
+        bool complete_tx = (tpuArgs.mbar_complete_tx != 0);
+        auto async_id = core_->cpabulk_tensor_load(wid, tensor_map_addr,
+                                                   args_lmem_ptr, complete_tx);
+        for (uint32_t t = thread_start; t < num_threads; ++t) {
+          if (!warp.tmask.test(t)) continue;
+          rd_data[t].u = async_id;
+        }
+        trace_data->rd_write = true;
+        rd_write = true;
+      } break;
+      case TcuType::CPABULK_TENSOR_ST: {
+        // cp.async.bulk.tensor.<N>d.global.shared::cta (PTX §6.4.10).
+        auto tensor_map_addr = static_cast<uint64_t>(rs1_data.at(thread_start).u32);
+        auto args_lmem_ptr   = static_cast<uint64_t>(rs2_data.at(thread_start).u32);
+        auto async_id = core_->cpabulk_tensor_store(wid, tensor_map_addr,
+                                                    args_lmem_ptr);
+        for (uint32_t t = thread_start; t < num_threads; ++t) {
+          if (!warp.tmask.test(t)) continue;
+          rd_data[t].u = async_id;
+        }
+        trace_data->rd_write = true;
+        rd_write = true;
+      } break;
+      case TcuType::MBAR_FENCE: {
+        // tcgen05.fence::{before,after}_thread_sync (PTX §9.7.16.5.1).
+        if (!core_->mbar_fence(wid, tpuArgs.fence_mode)) {
           core_->suspend(wid, WarpStallReason::AsyncTensor);
           last_instr_retired_ = false;
         }
       } break;
-      case TcuType::WMMA: {
+      case TcuType::MBAR_COMMIT: {
+        // tcgen05.commit (PTX §9.7.16.5.7): register inflight tcgen05.async ops
+        // for arrival on this mbarrier. Each registered op will trigger ONE
+        // mbarrier_arrive on completion (NOT complete_tx).
+        auto mbar_addr = static_cast<uint64_t>(rs1_data.at(thread_start).u32);
+        auto cta_mask  = rs2_data.at(thread_start).u32;
+        auto committed = core_->mbar_commit(wid, mbar_addr, cta_mask);
+        for (uint32_t t = thread_start; t < num_threads; ++t) {
+          if (!warp.tmask.test(t)) continue;
+          rd_data[t].u = committed;
+        }
+        trace_data->rd_write = (rdest.type != RegType::None) && (rdest.idx != 0);
+        rd_write = trace_data->rd_write;
+      } break;
+      case TcuType::MBAR_EXPECT_TX: {
+        // mbarrier.expect_tx (PTX §7.6.4): rs2 = txCount in bytes.
+        auto mbar_addr = static_cast<uint64_t>(rs1_data.at(thread_start).u32);
+        auto tx_bytes = rs2_data.at(thread_start).u32;
+        core_->mbarrier_expect_tx(mbar_addr, tx_bytes);
+      } break;
+      case TcuType::MBAR_COMPLETE_TX: {
+        // mbarrier.complete_tx (PTX §7.6.4): rs2 = txCount in bytes.
+        auto mbar_addr = static_cast<uint64_t>(rs1_data.at(thread_start).u32);
+        auto tx_bytes = rs2_data.at(thread_start).u32;
+        core_->mbarrier_complete_tx(mbar_addr, tx_bytes);
+      } break;
+      case TcuType::MBAR_TEST_TRY_WAIT: {
+        // mbarrier.test_wait / mbarrier.try_wait — non-blocking variants.
+        auto mbar_addr = static_cast<uint64_t>(rs1_data.at(thread_start).u32);
+        auto phase_token = rs2_data.at(thread_start).u32;
+        bool ready;
+        if (tpuArgs.test_or_try == TcuTestTryWait::Try) {
+          ready = core_->mbarrier_try_wait(wid, mbar_addr, phase_token,
+                                           tpuArgs.timeout_bucket);
+        } else {
+          ready = core_->mbarrier_test_wait(mbar_addr, phase_token);
+        }
+        for (uint32_t t = thread_start; t < num_threads; ++t) {
+          if (!warp.tmask.test(t)) continue;
+          rd_data[t].u = ready ? 1u : 0u;
+        }
+        trace_data->rd_write = (rdest.type != RegType::None) && (rdest.idx != 0);
+        rd_write = trace_data->rd_write;
+      } break;
+      case TcuType::TCU_MMA: {
+        // tcgen05.mma{.ws,.sp}: single-instruction fan-out.
+        // Forward raw register values + qualifier to TensorUnit which runs
+        // tc_decode -> idesc + operand_block_t lazy-load -> 5-stage frontend.
         assert(warp.tmask.count() == num_threads);
-        resolve_mma_descriptor(core_, &tpuArgs);
-        tensor_unit_->wmma(wid, tpuArgs, rs1_data, rs2_data, rs3_data, rd_data, trace_data.get());
+        // Reconstruct qualifier from the modifier flags decode.cpp set.
+        uint32_t qualifier =
+            (uint32_t(tpuArgs.enable_input_d) << 0)
+          | (uint32_t(tpuArgs.ws)             << 1)
+          | (uint32_t(tpuArgs.sp)             << 2)
+          | (uint32_t(tpuArgs.cta_group)      << 3)
+          | (uint32_t(tpuArgs.collector_a_fill & 0x3) << 4)
+          | (uint32_t(tpuArgs.multicast)      << 6);
+        uint32_t rs1_value = rs1_data.at(thread_start).u32; // idesc (32-bit)
+        uint32_t rs2_value = rs2_data.at(thread_start).u32; // operand_block_t LMEM ptr
+        tensor_unit_->dispatch_tcu_mma(wid, rs1_value, rs2_value,
+                                        qualifier, trace_data.get());
         if (trace_data->retry) {
           core_->set_stall_reason(wid, WarpStallReason::AsyncTensor);
           last_instr_retired_ = false;
         }
         rd_write = trace_data->rd_write;
+      } break;
+      case TcuType::TCU_LD: {
+        // Phase-3.4 Stage 0: tcgen05.ld per PTX §9.7.16.5.5 with PTX TADDR
+        // encoding (§9.7.16.1):
+        //   taddr[15:0]  = lane base
+        //   taddr[31:16] = col_byte offset (1-byte cell — Vortex deviation)
+        // The warp issues a uniform taddr; thread t accesses
+        //   actual_lane = taddr.lane + t (warp-collective)
+        // and reads 4 consecutive 1-byte cells at (actual_lane, col_byte..+3).
+        // Allocation is found by lane→col_base reverse lookup.
+        for (uint32_t t = thread_start; t < num_threads; ++t) {
+          if (!warp.tmask.test(t)) continue;
+          uint32_t taddr = rs1_data.at(t).u32;
+          uint32_t lane_base = taddr & 0xFFFFu;
+          uint32_t col_byte  = (taddr >> 16) & 0xFFFFu;
+          uint32_t actual_lane = lane_base + t;
+          uint32_t col_base = 0;
+          uint8_t buf[4] = {0, 0, 0, 0};
+          if (core_->tmem_find_allocation_by_lane(actual_lane, &col_base)) {
+            uint32_t byte_off = (actual_lane - col_base) * Tmem::kColBytes + col_byte;
+            (void)core_->tmem_region_read_bytes(col_base, byte_off, buf, sizeof(buf));
+          }
+          uint32_t word = static_cast<uint32_t>(buf[0])
+                       | (static_cast<uint32_t>(buf[1]) << 8)
+                       | (static_cast<uint32_t>(buf[2]) << 16)
+                       | (static_cast<uint32_t>(buf[3]) << 24);
+          rd_data[t].u = word;
+        }
+        trace_data->rd_write = (rdest.type != RegType::None) && (rdest.idx != 0);
+        rd_write = trace_data->rd_write;
+      } break;
+      case TcuType::TCU_ST: {
+        // Phase-3.4 Stage 0: tcgen05.st per PTX §9.7.16.5.6 — same TADDR
+        // decoding as tcgen05.ld; thread t writes 4 cells at
+        // (taddr.lane + t, taddr.col_byte..+3).
+        for (uint32_t t = thread_start; t < num_threads; ++t) {
+          if (!warp.tmask.test(t)) continue;
+          uint32_t taddr = rs1_data.at(t).u32;
+          uint32_t value = rs2_data.at(t).u32;
+          uint32_t lane_base = taddr & 0xFFFFu;
+          uint32_t col_byte  = (taddr >> 16) & 0xFFFFu;
+          uint32_t actual_lane = lane_base + t;
+          uint32_t col_base = 0;
+          uint8_t buf[4] = {
+            static_cast<uint8_t>(value & 0xff),
+            static_cast<uint8_t>((value >> 8) & 0xff),
+            static_cast<uint8_t>((value >> 16) & 0xff),
+            static_cast<uint8_t>((value >> 24) & 0xff),
+          };
+          if (core_->tmem_find_allocation_by_lane(actual_lane, &col_base)) {
+            uint32_t byte_off = (actual_lane - col_base) * Tmem::kColBytes + col_byte;
+            (void)core_->tmem_region_write_bytes(col_base, byte_off, buf, sizeof(buf));
+          }
+        }
+      } break;
+      case TcuType::TCU_WAIT_LD: {
+        // tcgen05.wait::ld (PTX §9.7.16.5.8): wait for prior tcgen05.ld ops.
+        if (!core_->tcgen05_wait_ld(wid)) {
+          core_->suspend(wid, WarpStallReason::AsyncTensor);
+          last_instr_retired_ = false;
+        }
+      } break;
+      case TcuType::TCU_WAIT_ST: {
+        // tcgen05.wait::st (PTX §9.7.16.5.8): wait for prior tcgen05.st ops.
+        if (!core_->tcgen05_wait_st(wid)) {
+          core_->suspend(wid, WarpStallReason::AsyncTensor);
+          last_instr_retired_ = false;
+        }
       } break;
       default:
         std::abort();

@@ -111,10 +111,10 @@ public:
   static constexpr uint32_t kLogicalLines = 128;
   static constexpr uint32_t kPacketBytes = 64;
 
-  // m16n16k8 计算原语决定的固定 tile 大小
+  // m16n16k16 计算原语决定的固定 tile 大小
   static constexpr uint32_t kATileRows = 16;  // M 维
-  static constexpr uint32_t kATileCols = 8;   // K 维
-  static constexpr uint32_t kBTileRows = 8;   // K 维
+  static constexpr uint32_t kATileCols = 16;  // K 维
+  static constexpr uint32_t kBTileRows = 16;  // K 维
   static constexpr uint32_t kBTileCols = 16;  // N 维
   static constexpr uint32_t kCDTileRows = 16; // M 维
   static constexpr uint32_t kCDTileCols = 16; // N 维
@@ -141,27 +141,26 @@ public:
     }
   }
 
-  // ---- Window shape 与输出驻留 (ws) 是正交概念 ----
+  // ---- Window shape 与输出驻留 (output_resident) 是正交概念 ----
   //
   // Window shape 决定 TMA 搬运粒度 (MMA descriptor 的 a_rows/a_cols 等字段):
   //   A = M × K,  B = K × N,  C = D = M × N
   //
-  // 输出驻留 (ws!=0) 决定 WMMA 结果写 CMem(FIFO)累加还是写 DMem 独立输出。
-  // 任何 window shape 都可以搭配 ws=0 或 ws=1, 由 MMA_LOAD 的 tile_id
+  // 输出驻留 (output_resident!=0) 决定 WMMA 结果写 CMem(FIFO)累加还是写 DMem 独立输出。
+  // 任何 window shape 都可以搭配 output_resident=0 或 output_resident=1, 由 MMA_LOAD 的 tile_id
   // 显式控制计算哪个 tile, 软件决定迭代顺序。
   //
   // 支持的 window shapes (col_span=64, fp8 A/B + fp16 C/D):
   //
   //   M×N×K        A window   B window   C/D window   lines   tiles(A/B/C)
   //   ─────────────────────────────────────────────────────────────────────
-  //   16×16×16     16×16      16×16      16×16        24/128  2/2/1
-  //   32×32×8      32×8       8×32       32×32        72/128  2/2/4
-  //   32×32×16     32×16      16×32      32×32        80/128  4/4/4
-  //   32×32×32     32×32      32×32      32×32        96/128  8/8/4
+  //   16×16×16     16×16      16×16      16×16        24/128  1/1/1
+  //   32×32×16     32×16      16×32      32×32        80/128  2/2/4
+  //   32×32×32     32×32      32×32      32×32        96/128  4/4/4
 
   // 验证 MMA descriptor 的 shapes 数学一致性
   // A(M×K) × B(K×N) = C(M×N), D shape = C shape
-  // M 须是 16 的倍数, N 须是 16 的倍数, K 须是 8 的倍数
+  // M 须是 16 的倍数, N 须是 16 的倍数, K 须是 16 的倍数
   static bool validate_mma_shapes(const TmemWindowPlannerInput& input,
                                   std::string* reason = nullptr);
 

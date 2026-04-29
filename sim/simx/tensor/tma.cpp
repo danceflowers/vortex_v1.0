@@ -83,7 +83,7 @@ bool TmaModel::ensure_descriptor_tables_loaded(uint64_t startup_arg, const ReadC
     mma_desc_table_.resize(header.mma_desc_count);
     dcache_read(mma_desc_table_.data(),
                 header.mma_desc_addr,
-                header.mma_desc_count * sizeof(MmaDescriptor));
+                header.mma_desc_count * sizeof(IDescriptor));
   }
   descriptor_tables_loaded_ = true;
   return true;
@@ -100,9 +100,9 @@ bool TmaModel::read_tma_descriptor(uint64_t startup_arg,
   return true;
 }
 
-bool TmaModel::read_mma_descriptor(uint64_t startup_arg,
+bool TmaModel::read_idescriptor(uint64_t startup_arg,
                                    uint32_t desc_id,
-                                   MmaDescriptor* out,
+                                   IDescriptor* out,
                                    const ReadCallback& dcache_read) {
   if (nullptr == out || !ensure_descriptor_tables_loaded(startup_arg, dcache_read) || desc_id >= mma_desc_table_.size()) {
     return false;
