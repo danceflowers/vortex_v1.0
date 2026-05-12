@@ -324,7 +324,9 @@ public:
     this->dcr_write(VX_DCR_BASE_STARTUP_ARG1, args_addr >> 32);
 
     // start new run
-    future_ = std::async(std::launch::async, [&] { processor_.run(); });
+    future_ = std::async(std::launch::async, [&] {
+      return processor_.run_checked();
+    });
 
     // clear mpm cache
     mpm_cache_.clear();
@@ -345,7 +347,7 @@ public:
       if (0 == timeout_sec--)
         return -1;
     }
-    return 0;
+    return future_.get();
   }
 
   int dcr_write(uint32_t addr, uint32_t value) {
@@ -362,12 +364,19 @@ public:
   }
 
   int mpm_query(uint32_t addr, uint32_t core_id, uint64_t *value) {
-    uint32_t offset = addr - VX_CSR_MPM_BASE;
-    if (offset > 31)
+    uint32_t offset = 0;
+    if (addr >= VX_CSR_MPM_BASE && addr < (VX_CSR_MPM_BASE + 64)) {
+      offset = addr - VX_CSR_MPM_BASE;
+    } else if (addr >= VX_CSR_MPM_BASE_H && addr < (VX_CSR_MPM_BASE_H + 64)) {
+      offset = addr - VX_CSR_MPM_BASE_H;
+    } else {
+      return -1;
+    }
+    if (offset > 63)
       return -1;
     if (mpm_cache_.count(core_id) == 0) {
-      uint64_t mpm_mem_addr = IO_MPM_ADDR + core_id * 32 * sizeof(uint64_t);
-      CHECK_ERR(this->download(mpm_cache_[core_id].data(), mpm_mem_addr, 32 * sizeof(uint64_t)), {
+      uint64_t mpm_mem_addr = IO_MPM_ADDR + core_id * 64 * sizeof(uint64_t);
+      CHECK_ERR(this->download(mpm_cache_[core_id].data(), mpm_mem_addr, 64 * sizeof(uint64_t)), {
         return err;
       });
     }
@@ -611,8 +620,8 @@ private:
   Processor processor_;
   MemoryAllocator global_mem_;
   DeviceConfig dcrs_;
-  std::future<void> future_;
-  std::unordered_map<uint32_t, std::array<uint64_t, 32>> mpm_cache_;
+  std::future<int> future_;
+  std::unordered_map<uint32_t, std::array<uint64_t, 64>> mpm_cache_;
 #ifdef VM_ENABLE
   std::unordered_map<uint64_t, uint64_t> addr_mapping; // HW: key: ppn; value: vpn
   MemoryAllocator *page_table_mem_;

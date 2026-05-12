@@ -5,40 +5,28 @@
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
 
-// ============================================================================
-// tensor_unit.cpp —— TensorUnit 实现（单实例简化版）
-// ============================================================================
-
 #include "tensor_unit.h"
-#include "open_tensorcore/tensor_control/tc_decode.h"
-#include "open_tensorcore/tensor_control/tensor_async_frontend.h"
-#include "open_tensorcore/tensor_control/tensor_issue_policy.h"
-#include "open_tensorcore/tensor_control/tensor_mem_manager.h"
-#include "open_tensorcore/tensor_control/tensor_wmma_issue_engine.h"
-#include "open_tensorcore/tensor_control/tensor_unit_types.h"
-#include "open_tensorcore/tensor_control/tensor_wmma_retire_unit.h"
-#include "open_tensorcore/local_memory/tensor_local_mem_arbiter.h"
-#include "open_tensorcore/local_memory/tensor_mem_pipeline.h"
-#include "open_tensorcore/tensor_top/tensor_runtime_utils.h"
-#include "open_tensorcore/tensor_top/tensor_tick_utils.h"
 
 #include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstring>
 #include <deque>
+#include <iostream>
 #include <unordered_map>
 #include <vector>
 
 #include "core.h"
 #include "tensor_cfg.h"
-#include "tmem_window_planner.h"
-#include "open_tensorcore/local_memory/amem.h"
-#include "open_tensorcore/local_memory/bmem.h"
-#include "open_tensorcore/local_memory/cmem.h"
-#include "open_tensorcore/local_memory/dmem.h"
-#include "open_tensorcore/local_memory/meta_mem.h"
+#include "open_tensorcore/tensor_compute/amem.h"
+#include "open_tensorcore/tensor_compute/bmem.h"
+#include "open_tensorcore/tensor_compute/cmem.h"
+#include "open_tensorcore/tensor_compute/dmem.h"
+#include "open_tensorcore/tensor_compute/sparse_select.h"
 #include "open_tensorcore/tensor_compute/tensor_core_top.h"
+#include "open_tensorcore/tensor_control/tc_decode.h"
 
 using namespace vortex;
-using namespace vortex::tensor_unit_detail;
 
 namespace {
 
@@ -49,220 +37,820 @@ void reset_trace_for_async_dispatch(TensorUnit::ExeTraceData* trace_data) {
   }
 }
 
+PrecisionType fmt_to_precision(uint32_t fmt) {
+  namespace vt = vortex::tensor;
+  switch (fmt) {
+  case vt::fp8::id:  return PREC_FP8_E4M3;
+  case vt::fp16::id: return PREC_FP16;
+  case vt::fp32::id: return PREC_FP32;
+  default:           return PREC_FP9;
+  }
+}
+
+uint64_t shared_desc_to_lmem_addr(uint64_t sdesc) {
+  uint32_t smem_offset = static_cast<uint32_t>(sdesc & 0x3fffu) * 16u;
+  return static_cast<uint64_t>(LMEM_BASE_ADDR) + smem_offset;
+}
+
+uint32_t fmt_element_bytes(uint32_t fmt) {
+  namespace vt = vortex::tensor;
+  switch (fmt) {
+  case vt::fp8::id:  return 1;
+  case vt::fp16::id: return 2;
+  case vt::fp32::id: return 4;
+  default:           return 0;
+  }
+}
+
+uint32_t dmem_rows_per_packet(uint32_t fmt) {
+  constexpr uint32_t kDmemPrimitiveDim = 8;
+  auto elem_bytes = fmt_element_bytes(fmt);
+  return elem_bytes == 0 ? 0 : Tmem::kPacketBytes / (kDmemPrimitiveDim * elem_bytes);
+}
+
 } // namespace
 
 class TensorUnit::Impl {
 public:
-  friend class TensorUnit;
-  static constexpr uint32_t kWmmaPrimitiveCount = tensor_unit_detail::kWmmaPrimitiveCount;
-  static constexpr uint32_t kSubtilesPerTile = tensor_unit_detail::kSubtilesPerTile;
-  static constexpr uint32_t kPrimitiveDim = tensor_unit_detail::kPrimitiveDim;
-  static constexpr uint32_t kMaxConversionInputPackets = tensor_unit_detail::kMaxConversionInputPackets;
-  static constexpr uint32_t kOutputPacketBufferDepth = tensor_unit_detail::kOutputPacketBufferDepth;
-  static constexpr uint32_t kAmemWriteLinesPerCycle = 1;
-  static constexpr uint32_t kBmemWriteLinesPerCycle = 1;
-  static constexpr uint32_t kCmemWriteSubtilesPerCycle = 1;
-  static constexpr uint32_t kCmemReadSubtilesPerCycle = 1;
-  static constexpr uint32_t kMetaWritePacketsPerCycle = 1;
+  static constexpr uint32_t kMaxQueuedMma = 4;
+  static constexpr uint32_t kTileM = 16;
+  static constexpr uint32_t kTileN = 16;
+  static constexpr uint32_t kTileK = 16;
+  static constexpr uint32_t kPrimitiveDim = 8;
+  static constexpr uint32_t kSubtiles = 4;
+  static constexpr uint32_t kKPhases = 2;
+  static constexpr uint32_t kSparseMetaPacketBytes = Tmem::kPacketBytes;
+  static constexpr uint32_t kSparseMetaPacketBaseByteOffset = 512;
+
+  enum class MmaStage : uint8_t {
+    FillA,
+    FillMeta,
+    FillB,
+    FillC,
+    Compute,
+    StoreD,
+    Complete,
+  };
+
+  struct TaddrRegion {
+    uint32_t col_base = 0;
+    uint32_t col_span = 0;
+    uint32_t byte_offset = 0;
+    uint32_t size_bytes = 0;
+  };
+
+  struct MmaOp {
+    TcDecodedMmaCmd cmd = {};
+    uint32_t wid = 0;
+    uint32_t wgid = 0;
+    uint32_t async_id = 0;
+    bool initialized = false;
+    MmaStage stage = MmaStage::FillA;
+
+    TaddrRegion a_region = {};
+    TaddrRegion d_region = {};
+    uint32_t a_packet_base = 0;
+    uint32_t d_packet_base = 0;
+
+    std::vector<TmemPacket> a_packets;
+    std::vector<TmemPacket> meta_packets;
+    std::vector<BMem::packet_t> b_packets;
+    std::vector<TmemPacket> c_packets;
+    std::vector<TmemPacket> d_store_packets;
+
+    uint32_t next_a_packet = 0;
+    uint32_t meta_packet_base = 0;
+    uint32_t next_b_packet = 0;
+    uint32_t next_c_packet = 0;
+    uint32_t next_d_packet = 0;
+    uint64_t pending_request_id = 0;
+    uint32_t pending_packet_index = 0;
+
+    uint32_t issue_subtile = 0;
+    uint32_t issue_k_phase = 0;
+    uint32_t final_retired_subtiles = 0;
+  };
 
   Impl(TensorUnit* simobject, const Arch& arch, Core* core)
     : simobject_(simobject)
     , core_(core)
-    , arch_(arch)
-    , perf_stats_() {
+    , arch_(arch) {
     reset();
   }
 
   void reset() {
-    vortex::reset_all_tensor_unit_state(&perf_stats_,
-                                        &amem_, &bmem_, &cmem_, &dmem_, &metamem_,
-                                        &amem_state_, &bmem_state_, &cmem_state_, &dmem_state_,
-                                        &pub_amem_state_, &pub_bmem_state_, &pub_cmem_state_, &pub_dmem_state_,
-                                        &mem_ops_,
-                                        &pending_mem_ops_,
-                                        &pending_wmma_uops_,
-                                        &pending_tensorcore_retires_,
-                                        &pending_wmma_jobs_,
-                                        &active_wmma_job_,
-                                        &active_wmma_job_valid_,
-                                        &prev_or_,
-                                        &tensorcore_,
-                                        &mem_arbiter_,
-                                        &next_tensor_mem_request_id_,
-                                        &completed_tensor_mem_responses_);
+    perf_stats_ = PerfStats();
     tc_decode_.reset();
+    pending_mma_.clear();
+    completed_tensor_mem_responses_.clear();
+    next_tensor_mem_request_id_ = 1;
+    amem_.reset();
+    bmem_.reset();
+    cmem_.reset();
+    dmem_.reset();
+    tensorcore_.reset();
   }
 
   void tick() {
-    // 阶段 0: 发布 Mem 状态快照
-    TensorMemManager::snapshot_for_scheduler(amem_state_, bmem_state_, cmem_state_, dmem_state_,
-                                             &pub_amem_state_, &pub_bmem_state_,
-                                             &pub_cmem_state_, &pub_dmem_state_);
+    ++perf_stats_.latency;
+    latch_tensor_instruction_pipe();
+    receive_tensor_mem_responses();
 
-    // 阶段 1: 排空 TMEM 响应端口
-    TensorMemPipeline::receive_one_tmem_response(&simobject_->TensorMemRspIn,
-                                                  &completed_tensor_mem_responses_);
-
-    // 阶段 2: 锁存张量指令到输出延迟管线
-    vortex::latch_tensor_instructions_into_output_pipe(simobject_);
-
-    // 阶段 3: 推进 TMEM↔SRAM 搬运流水线
-    vortex::tick_tmem_to_local_sram_transfer_pipeline(core_,
-                                              &simobject_->TensorMemReqOut,
-                                              &simobject_->TensorAsyncOpCompletionOut,
-                                              &mem_arbiter_,
-                                              kAmemWriteLinesPerCycle,
-                                              kBmemWriteLinesPerCycle,
-                                              kCmemWriteSubtilesPerCycle,
-                                              kCmemReadSubtilesPerCycle,
-                                              kMetaWritePacketsPerCycle,
-                                              &amem_, &bmem_, &cmem_, &dmem_, &metamem_,
-                                              &mem_ops_,
-                                              &pending_mem_ops_,
-                                              &completed_tensor_mem_responses_,
-                                              &next_tensor_mem_request_id_,
-                                              &amem_state_, &bmem_state_, &cmem_state_, &dmem_state_,
-                                              &perf_stats_,
-                                              &tmem_bus_rr_index_);
-
-    // 阶段 4: 展开宏 WMMA 并发射原语
-    TensorWmmaIssueEngine::issue_wmma_primitives(core_,
-                                                 arch_,
-                                                 &mem_arbiter_,
-                                                 &amem_, &bmem_, &cmem_, &dmem_, &metamem_,
-                                                 &tensorcore_,
-                                                 &amem_state_, &bmem_state_, &cmem_state_, &dmem_state_,
-                                                 mem_ops_,
-                                                 &pending_wmma_uops_,
-                                                 &pending_wmma_jobs_,
-                                                 &active_wmma_job_,
-                                                 &active_wmma_job_valid_,
-                                                 &perf_stats_);
-    TensorWmmaIssueEngine::sample_pending_wmma_depth(pending_wmma_jobs_,
-                                                     active_wmma_job_valid_,
-                                                     &perf_stats_);
     if (tensorcore_.active()) {
       ++perf_stats_.tc_active_cycles;
+    } else {
+      ++perf_stats_.tc_idle_cycles;
     }
 
-    // 阶段 5: 推进 TensorCore 计算管线并退休
-    TensorWmmaRetireUnit::advance_tensorcore_pipeline(core_,
-                                                      &tensorcore_,
-                                                      &mem_arbiter_,
-                                                      &cmem_state_, &dmem_state_,
-                                                      &pending_wmma_uops_,
-                                                      &pending_tensorcore_retires_,
-                                                      &cmem_, &dmem_,
-                                                      &perf_stats_,
-                                                      &simobject_->TensorAsyncOpCompletionOut);
+    if (!pending_mma_.empty()) {
+      advance_mma(pending_mma_.front());
+      if (!pending_mma_.empty()
+       && pending_mma_.front().stage == MmaStage::Complete) {
+        complete_front_mma();
+      }
+    }
+  }
+
+  bool enqueue_tcu_mma(uint32_t wid,
+                       uint32_t rs1_value,
+                       uint32_t rs2_value,
+                       uint32_t qualifier,
+                       ExeTraceData* trace_data) {
+    if (pending_mma_.size() >= kMaxQueuedMma) {
+      if (trace_data) {
+        trace_data->retry = true;
+      }
+      return false;
+    }
+
+    TcDecodedMmaCmd cmd;
+    if (!tc_decode_.decode_tcu_mma(core_, wid, rs1_value, rs2_value,
+                                   qualifier, &cmd)) {
+      std::cerr << "TensorUnit error: tcgen05.mma tcdecode failed"
+                << " rs1_idesc=0x" << std::hex << rs1_value
+                << " rs2_opblock=0x" << rs2_value
+                << " qualifier=0x" << qualifier << std::dec
+                << std::endl;
+      std::abort();
+    }
+    if (!validate_mma(cmd)) {
+      std::cerr << "TensorUnit error: unsupported tcgen05.mma idesc"
+                << " fmt_a=" << cmd.fmt_a
+                << " fmt_b=" << cmd.fmt_b
+                << " fmt_d=" << cmd.fmt_d
+                << " shape_m=" << cmd.shape_m
+                << " shape_n=" << cmd.shape_n
+                << " enable_input_d=" << static_cast<uint32_t>(cmd.enable_input_d)
+                << " ws=" << static_cast<uint32_t>(cmd.ws)
+                << " sp=" << static_cast<uint32_t>(cmd.sp)
+                << std::endl;
+      std::abort();
+    }
+
+    MmaOp op{};
+    op.cmd = cmd;
+    op.wid = wid;
+    op.wgid = arch_.warpgroup_id(wid);
+
+    if (!resolve_taddr(cmd.a_taddr, &op.a_region)
+     || !resolve_taddr(cmd.d_taddr, &op.d_region)) {
+      std::cerr << "TensorUnit error: tcgen05.mma TADDR does not map to TMEM allocation"
+                << " a_taddr=0x" << std::hex << cmd.a_taddr
+                << " d_taddr=0x" << cmd.d_taddr << std::dec << std::endl;
+      std::abort();
+    }
+
+    auto a_block_reason = core_->tmem_handle_load_block_reason(op.a_region.col_base,
+                                                               TcuTarget::A,
+                                                               cmd.sparsity_kind);
+    if (a_block_reason != TmemHandleBlockReason::None) {
+      if (trace_data) {
+        trace_data->retry = true;
+      }
+      record_issue_stall(IssueBlockReason::MmaLoadHandleNotReady);
+      return false;
+    }
+    auto d_block_reason = (cmd.enable_input_d != 0)
+        ? core_->tmem_handle_load_block_reason(op.d_region.col_base,
+                                               TcuTarget::C,
+                                               tensor::sparse_none)
+        : core_->tmem_handle_store_block_reason(op.d_region.col_base);
+    if (d_block_reason != TmemHandleBlockReason::None) {
+      if (trace_data) {
+        trace_data->retry = true;
+      }
+      record_issue_stall(IssueBlockReason::HandleBusyDueToTmaStoreOrShift);
+      return false;
+    }
+
+    op.async_id = core_->wmma_async_issue(wid);
+    if ((op.a_region.byte_offset % Tmem::kPacketBytes) != 0
+     || (op.d_region.byte_offset % Tmem::kPacketBytes) != 0) {
+      std::cerr << "TensorUnit error: tcgen05.mma requires 64B-aligned A/D TADDR offsets"
+                << std::endl;
+      std::abort();
+    }
+
+    auto a_bytes = AMem::packet_count(cmd.fmt_a) * Tmem::kPacketBytes;
+    if (op.a_region.byte_offset + a_bytes > op.a_region.size_bytes) {
+      std::cerr << "TensorUnit error: A TMEM tile exceeds allocation" << std::endl;
+      std::abort();
+    }
+    op.a_packet_base = op.a_region.byte_offset / Tmem::kPacketBytes;
+    op.d_packet_base = op.d_region.byte_offset / Tmem::kPacketBytes;
+    op.a_packets.assign(AMem::packet_count(cmd.fmt_a), TmemPacket{});
+    if (cmd.sparsity_kind != tensor::sparse_none) {
+      uint32_t meta_byte_offset = op.a_region.byte_offset
+                                + kSparseMetaPacketBaseByteOffset
+                                + uint32_t(cmd.sparsity_meta_sel) * kSparseMetaPacketBytes;
+      if (meta_byte_offset + kSparseMetaPacketBytes > op.a_region.size_bytes) {
+        std::cerr << "TensorUnit error: sparse metadata packet exceeds A allocation"
+                  << std::endl;
+        std::abort();
+      }
+      op.meta_packet_base = meta_byte_offset / Tmem::kPacketBytes;
+      op.meta_packets.assign(1, TmemPacket{});
+    }
+    op.b_packets.assign(BMem::packet_count(cmd.fmt_b, cmd.sparsity_kind),
+                        BMem::packet_t{});
+    if (cmd.enable_input_d != 0) {
+      auto c_bytes = CMem::packet_count(cmd.fmt_c) * Tmem::kPacketBytes;
+      if (op.d_region.byte_offset + c_bytes > op.d_region.size_bytes) {
+        std::cerr << "TensorUnit error: input D/C TMEM tile exceeds allocation" << std::endl;
+        std::abort();
+      }
+      op.c_packets.assign(CMem::packet_count(cmd.fmt_c), TmemPacket{});
+    }
+
+    pending_mma_.push_back(std::move(op));
+    ++perf_stats_.issued_macro_wmma;
+    perf_stats_.pending_wmma_jobs_max =
+        std::max<uint64_t>(perf_stats_.pending_wmma_jobs_max, pending_mma_.size());
+    return true;
+  }
+
+  uint32_t scheduler_score(uint32_t, TcuType tcu_type) const {
+    if (tcu_type == TcuType::TCU_MMA && pending_mma_.size() >= kMaxQueuedMma) {
+      return 0;
+    }
+    return 1;
+  }
+
+  IssueBlockReason classify_issue_block(uint32_t, TcuType tcu_type) const {
+    if (tcu_type == TcuType::TCU_MMA && pending_mma_.size() >= kMaxQueuedMma) {
+      return IssueBlockReason::TcBusy;
+    }
+    return IssueBlockReason::None;
+  }
+
+  void record_issue_stall(IssueBlockReason reason) {
+    switch (reason) {
+    case IssueBlockReason::ANotReady: ++perf_stats_.stall_a_not_ready; break;
+    case IssueBlockReason::BNotReady: ++perf_stats_.stall_b_not_ready; break;
+    case IssueBlockReason::CNotReady: ++perf_stats_.stall_c_not_ready; break;
+    case IssueBlockReason::TcBusy: ++perf_stats_.stall_tc_busy; break;
+    case IssueBlockReason::NoTensorInstrCandidate:
+      ++perf_stats_.stall_no_tensor_instr_candidate;
+      break;
+    case IssueBlockReason::MmaLoadHandleNotReady:
+      ++perf_stats_.stall_mma_load_handle_not_ready;
+      break;
+    case IssueBlockReason::HandleReuse:
+      ++perf_stats_.stall_handle_reuse;
+      break;
+    case IssueBlockReason::HandleBusyDueToTmaLoad:
+      ++perf_stats_.stall_handle_busy_due_to_tma_load;
+      break;
+    case IssueBlockReason::HandleBusyDueToTmaStoreOrShift:
+      ++perf_stats_.stall_handle_busy_due_to_tma_store_or_shift;
+      break;
+    case IssueBlockReason::SlotBusy:
+      ++perf_stats_.stall_slot_busy;
+      break;
+    case IssueBlockReason::AMetaNotReady:
+      ++perf_stats_.stall_a_meta_not_ready;
+      break;
+    case IssueBlockReason::None:
+      break;
+    }
   }
 
   void dump_debug_state(std::ostream& os) const {
-    vortex::dump_tensor_unit_state(os,
-                                   mem_ops_,
-                                   pending_mem_ops_,
-                                   pending_wmma_jobs_,
-                                   active_wmma_job_valid_,
-                                   active_wmma_job_,
-                                   pending_wmma_uops_,
-                                   completed_tensor_mem_responses_,
-                                   amem_state_, bmem_state_, cmem_state_, dmem_state_,
-                                   pub_amem_state_, pub_bmem_state_, pub_cmem_state_, pub_dmem_state_);
+    os << "[TensorUnit] pending_mma=" << pending_mma_.size()
+       << " completed_tmem_rsp=" << completed_tensor_mem_responses_.size()
+       << " tensorcore_active=" << tensorcore_.active()
+       << "\n";
+    if (!pending_mma_.empty()) {
+      const auto& op = pending_mma_.front();
+      os << "  front async=" << op.async_id
+         << " stage=" << static_cast<uint32_t>(op.stage)
+         << " a_pkt=" << op.next_a_packet << "/" << op.a_packets.size()
+         << " b_pkt=" << op.next_b_packet << "/" << op.b_packets.size()
+         << " c_pkt=" << op.next_c_packet << "/" << op.c_packets.size()
+         << " d_pkt=" << op.next_d_packet << "/" << op.d_store_packets.size()
+         << " subtile=" << op.issue_subtile
+         << " k_phase=" << op.issue_k_phase
+         << " final_retired=" << op.final_retired_subtiles
+         << "\n";
+    }
   }
 
-  void mma_load(uint32_t wid, uint32_t handle, IntrTcuArgs args, ExeTraceData* trace_data) {
-    reset_trace_for_async_dispatch(trace_data);
-    if (!args.macro_op) {
+  const PerfStats& perf_stats() const {
+    return perf_stats_;
+  }
+
+private:
+  bool validate_mma(const TcDecodedMmaCmd& cmd) const {
+    namespace vt = vortex::tensor;
+    uint32_t shape_m = cmd.shape_m == 0 ? kTileM : cmd.shape_m;
+    uint32_t shape_n = cmd.shape_n == 0 ? kTileN : cmd.shape_n;
+    if (shape_m != kTileM || shape_n != kTileN) {
+      return false;
+    }
+    auto supported_input = [](uint32_t fmt) {
+      return fmt == vt::fp16::id || fmt == vt::fp8::id;
+    };
+    auto supported_accum_output = [](uint32_t fmt) {
+      return fmt == vt::fp32::id || fmt == vt::fp16::id || fmt == vt::fp8::id;
+    };
+    if (!supported_input(cmd.fmt_a) || !supported_input(cmd.fmt_b)
+     || !supported_accum_output(cmd.fmt_c) || !supported_accum_output(cmd.fmt_d)) {
+      return false;
+    }
+    if (cmd.ws != 0) {
+      return false;
+    }
+    if (cmd.sparsity_kind == vt::sparse_none) {
+      if (cmd.sp != 0) {
+        return false;
+      }
+    } else {
+      if (cmd.sp == 0 || cmd.fmt_a != vt::fp8::id || cmd.fmt_b != vt::fp8::id) {
+        return false;
+      }
+    }
+    if (cmd.transpose_a != 0 || cmd.transpose_b != 0
+     || cmd.saturate != 0 || cmd.output_negate != 0) {
+      return false;
+    }
+    return true;
+  }
+
+  bool resolve_taddr(uint32_t taddr, TaddrRegion* out) const {
+    if (out == nullptr) {
+      return false;
+    }
+    uint32_t lane_base = taddr & 0xffffu;
+    uint32_t col_byte = (taddr >> 16) & 0xffffu;
+    uint32_t col_base = 0;
+    if (!core_->tmem_find_allocation_by_lane(lane_base, &col_base)) {
+      return false;
+    }
+    uint32_t col_span = 0;
+    uint32_t size_bytes = 0;
+    if (!core_->tmem_query(col_base, &col_span, &size_bytes)) {
+      return false;
+    }
+    if (lane_base < col_base) {
+      return false;
+    }
+    uint32_t byte_offset = (lane_base - col_base) * Tmem::kColBytes + col_byte;
+    if (byte_offset >= size_bytes) {
+      return false;
+    }
+    out->col_base = col_base;
+    out->col_span = col_span;
+    out->byte_offset = byte_offset;
+    out->size_bytes = size_bytes;
+    return true;
+  }
+
+  void latch_tensor_instruction_pipe() {
+    for (uint32_t iw = 0; iw < ISSUE_WIDTH; ++iw) {
+      auto& input = simobject_->Inputs.at(iw);
+      if (input.empty()) {
+        continue;
+      }
+      auto trace = input.front();
+      auto tcu_type = std::get<TcuType>(trace->op_type);
+      uint32_t delay = (tcu_type == TcuType::TCU_MMA) ? 4 : 1;
+      simobject_->Outputs.at(iw).push(trace, 2 + delay);
+      input.pop();
+    }
+  }
+
+  void receive_tensor_mem_responses() {
+    if (simobject_->TensorMemRspIn.empty()) {
+      return;
+    }
+    auto rsp = simobject_->TensorMemRspIn.front();
+    completed_tensor_mem_responses_[rsp.request_id] = rsp;
+    simobject_->TensorMemRspIn.pop();
+  }
+
+  void initialize_op(MmaOp& op) {
+    if (op.initialized) {
+      return;
+    }
+    amem_.clear();
+    bmem_.clear();
+    cmem_.clear();
+    dmem_.clear();
+    tensorcore_.reset();
+    op.initialized = true;
+  }
+
+  void advance_mma(MmaOp& op) {
+    initialize_op(op);
+    switch (op.stage) {
+    case MmaStage::FillA:
+      advance_fill_a(op);
+      break;
+    case MmaStage::FillMeta:
+      advance_fill_meta(op);
+      break;
+    case MmaStage::FillB:
+      advance_fill_b(op);
+      break;
+    case MmaStage::FillC:
+      advance_fill_c(op);
+      break;
+    case MmaStage::Compute:
+      advance_compute(op);
+      break;
+    case MmaStage::StoreD:
+      advance_store_d(op);
+      break;
+    case MmaStage::Complete:
+      break;
+    }
+  }
+
+  void advance_fill_a(MmaOp& op) {
+    if (op.pending_request_id != 0) {
+      auto rsp_it = completed_tensor_mem_responses_.find(op.pending_request_id);
+      if (rsp_it == completed_tensor_mem_responses_.end()) {
+        ++perf_stats_.stall_tmem_read_port_busy;
+        return;
+      }
+      op.a_packets.at(op.pending_packet_index) = rsp_it->second.read_packet;
+      completed_tensor_mem_responses_.erase(rsp_it);
+      op.pending_request_id = 0;
+      ++op.next_a_packet;
+    }
+
+    if (op.next_a_packet >= op.a_packets.size()) {
+      write_amem_lines(op);
+      op.stage = (op.cmd.sparsity_kind != tensor::sparse_none)
+          ? MmaStage::FillMeta
+          : MmaStage::FillB;
+      return;
+    }
+
+    TensorMemPortReq req{};
+    req.request_id = next_tensor_mem_request_id_++;
+    req.arbitration_age = (uint64_t(op.async_id) << 32) | op.next_a_packet;
+    req.access_type = TensorMemPortReq::AccessType::Read;
+    req.port_request.kind = Tmem::PortRequestKind::RegionRead;
+    req.port_request.col_base = op.a_region.col_base;
+    req.port_request.col_span = op.a_region.col_span;
+    req.port_request.packet_idx = op.a_packet_base + op.next_a_packet;
+    simobject_->TensorMemReqOut.push(req, 0);
+    op.pending_request_id = req.request_id;
+    op.pending_packet_index = op.next_a_packet;
+  }
+
+  void advance_fill_meta(MmaOp& op) {
+    if (op.pending_request_id != 0) {
+      auto rsp_it = completed_tensor_mem_responses_.find(op.pending_request_id);
+      if (rsp_it == completed_tensor_mem_responses_.end()) {
+        ++perf_stats_.stall_meta_port_busy;
+        return;
+      }
+      op.meta_packets.at(0) = rsp_it->second.read_packet;
+      completed_tensor_mem_responses_.erase(rsp_it);
+      op.pending_request_id = 0;
+      op.stage = MmaStage::FillB;
+      return;
+    }
+
+    TensorMemPortReq req{};
+    req.request_id = next_tensor_mem_request_id_++;
+    req.arbitration_age = (uint64_t(op.async_id) << 32) | 0x10000ull;
+    req.access_type = TensorMemPortReq::AccessType::Read;
+    req.port_request.kind = Tmem::PortRequestKind::RegionRead;
+    req.port_request.col_base = op.a_region.col_base;
+    req.port_request.col_span = op.a_region.col_span;
+    req.port_request.packet_idx = op.meta_packet_base;
+    simobject_->TensorMemReqOut.push(req, 0);
+    op.pending_request_id = req.request_id;
+    op.pending_packet_index = 0;
+  }
+
+  void write_amem_lines(MmaOp& op) {
+    uint32_t packets_per_line = AMem::packets_per_fill_line(op.cmd.fmt_a);
+    for (uint32_t line = 0; line < AMem::kDepth; ++line) {
+      std::vector<AMem::packet_t> line_packets;
+      line_packets.reserve(packets_per_line);
+      for (uint32_t p = 0; p < packets_per_line; ++p) {
+        line_packets.push_back(op.a_packets.at(line * packets_per_line + p).bytes);
+      }
+      if (!amem_.write_fill_line(op.cmd.fmt_a, line, line_packets)) {
+        std::cerr << "TensorUnit error: AMem fill failed" << std::endl;
+        std::abort();
+      }
+    }
+  }
+
+  void advance_fill_b(MmaOp& op) {
+    if (op.next_b_packet < op.b_packets.size()) {
+      uint64_t b_lmem_addr = shared_desc_to_lmem_addr(op.cmd.b_sdesc)
+                           + uint64_t(op.next_b_packet) * Tmem::kPacketBytes;
+      core_->lmem_read(op.b_packets.at(op.next_b_packet).data(),
+                       b_lmem_addr,
+                       Tmem::kPacketBytes);
+      ++op.next_b_packet;
+      return;
+    }
+
+    uint32_t packets_per_line = BMem::packets_per_fill_line(op.cmd.fmt_b,
+                                                            op.cmd.sparsity_kind);
+    for (uint32_t line = 0; line < BMem::kDepth; ++line) {
+      std::vector<BMem::packet_t> line_packets;
+      line_packets.reserve(packets_per_line);
+      for (uint32_t p = 0; p < packets_per_line; ++p) {
+        line_packets.push_back(op.b_packets.at(line * packets_per_line + p));
+      }
+      if (!bmem_.write_fill_line(op.cmd.fmt_b, line, line_packets,
+                                 op.cmd.sparsity_kind)) {
+        std::cerr << "TensorUnit error: BMem fill failed" << std::endl;
+        std::abort();
+      }
+    }
+    op.stage = (op.cmd.enable_input_d != 0) ? MmaStage::FillC : MmaStage::Compute;
+  }
+
+  void advance_fill_c(MmaOp& op) {
+    if (op.pending_request_id != 0) {
+      auto rsp_it = completed_tensor_mem_responses_.find(op.pending_request_id);
+      if (rsp_it == completed_tensor_mem_responses_.end()) {
+        ++perf_stats_.stall_tmem_read_port_busy;
+        return;
+      }
+      op.c_packets.at(op.pending_packet_index) = rsp_it->second.read_packet;
+      completed_tensor_mem_responses_.erase(rsp_it);
+      op.pending_request_id = 0;
+      ++op.next_c_packet;
+    }
+
+    if (op.next_c_packet >= op.c_packets.size()) {
+      write_input_d_to_cmem(op);
+      op.stage = MmaStage::Compute;
+      return;
+    }
+
+    TensorMemPortReq req{};
+    req.request_id = next_tensor_mem_request_id_++;
+    req.arbitration_age = (uint64_t(op.async_id) << 32) | op.next_c_packet;
+    req.access_type = TensorMemPortReq::AccessType::Read;
+    req.port_request.kind = Tmem::PortRequestKind::RegionRead;
+    req.port_request.col_base = op.d_region.col_base;
+    req.port_request.col_span = op.d_region.col_span;
+    req.port_request.packet_idx = op.d_packet_base + op.next_c_packet;
+    simobject_->TensorMemReqOut.push(req, 0);
+    op.pending_request_id = req.request_id;
+    op.pending_packet_index = op.next_c_packet;
+  }
+
+  void write_input_d_to_cmem(MmaOp& op) {
+    uint32_t packets_per_subtile = CMem::packets_per_subtile(op.cmd.fmt_c);
+    for (uint32_t subtile = 0; subtile < CMem::kDepth; ++subtile) {
+      std::vector<CMem::packet_t> packets;
+      packets.reserve(packets_per_subtile);
+      for (uint32_t p = 0; p < packets_per_subtile; ++p) {
+        packets.push_back(op.c_packets.at(subtile * packets_per_subtile + p).bytes);
+      }
+      if (!cmem_.write_fill_subtile(op.cmd.fmt_c, subtile, packets)) {
+        std::cerr << "TensorUnit error: input D/C fill failed" << std::endl;
+        std::abort();
+      }
+    }
+  }
+
+  bool current_compute_ready(const MmaOp& op) const {
+    if (op.issue_subtile >= kSubtiles) {
+      return false;
+    }
+    if (op.issue_k_phase == 0 && op.cmd.enable_input_d != 0
+     && !cmem_.subtile_valid(op.issue_subtile)) {
+      return false;
+    }
+    return tensorcore_.ready(true);
+  }
+
+  void issue_current_primitive(MmaOp& op) {
+    uint32_t subtile = op.issue_subtile;
+    uint32_t k_phase = op.issue_k_phase;
+    uint32_t storage_m = subtile / 2;
+    uint32_t storage_n = subtile % 2;
+
+    uint16_t a[kPrimitiveDim][kPrimitiveDim] = {};
+    uint16_t b[kPrimitiveDim][kPrimitiveDim] = {};
+    uint32_t c[kPrimitiveDim][kPrimitiveDim] = {};
+    amem_.read_primitive(k_phase * 2 + storage_m, a, false);
+    bmem_.read_primitive(k_phase * 2 + storage_n, b, false);
+    uint8_t sparse_meta[16] = {};
+    if (op.cmd.sparsity_kind != tensor::sparse_none) {
+      if (op.meta_packets.empty()) {
+        std::cerr << "TensorUnit error: sparse metadata packet not loaded"
+                  << std::endl;
+        std::abort();
+      }
+      uint32_t meta_line = storage_m * 2 + k_phase;
+      std::copy_n(op.meta_packets.front().bytes.begin() + meta_line * 16,
+                  16,
+                  sparse_meta);
+      uint16_t a_routed[kPrimitiveDim][kPrimitiveDim] = {};
+      uint16_t b_routed[kPrimitiveDim][kPrimitiveDim] = {};
+      if (!vortex::sparse::route_sparse_primitive(op.cmd.sparsity_kind,
+                                                  sparse_meta,
+                                                  a,
+                                                  b,
+                                                  a_routed,
+                                                  b_routed)) {
+        std::cerr << "TensorUnit error: sparse routing failed"
+                  << " mode=" << static_cast<uint32_t>(op.cmd.sparsity_kind)
+                  << std::endl;
+        std::abort();
+      }
+      std::memcpy(a, a_routed, sizeof(a));
+      std::memcpy(b, b_routed, sizeof(b));
+    }
+    if (k_phase == 0 && op.cmd.enable_input_d != 0) {
+      cmem_.read_subtile_fp22(subtile, c);
+    }
+
+    TensorCoreMeta meta{};
+    meta.wgid = op.wgid;
+    meta.async_id = op.async_id;
+    meta.c_subtile_id = subtile;
+    meta.a_slot_id = k_phase;
+    meta.in_prec = PREC_FP9;
+    meta.out_prec = fmt_to_precision(op.cmd.fmt_d);
+    meta.c_prec = fmt_to_precision(op.cmd.fmt_c);
+    meta.c_bypass_is_fp22 = 1;
+    meta.sparse_mode = op.cmd.sparsity_kind;
+    std::copy_n(sparse_meta, sizeof(meta.sparse_meta), meta.sparse_meta);
+    meta.valid = true;
+
+    tensorcore_.push_uop(a, b, c, meta);
+    ++perf_stats_.issued_primitive_tiles;
+    if (perf_stats_.first_tc_issue_cycle == 0) {
+      perf_stats_.first_tc_issue_cycle = perf_stats_.latency;
+    }
+    perf_stats_.last_tc_issue_cycle = perf_stats_.latency;
+
+    if (op.issue_k_phase + 1 < kKPhases) {
+      ++op.issue_k_phase;
+    } else {
+      op.issue_k_phase = 0;
+      ++op.issue_subtile;
+    }
+  }
+
+  void advance_compute(MmaOp& op) {
+    if (current_compute_ready(op)) {
+      issue_current_primitive(op);
+    } else if (op.issue_subtile < kSubtiles) {
+      ++perf_stats_.stall_tc_busy;
+    }
+
+    tensorcore_.tick(true);
+    TensorCoreRetire retired{};
+    if (tensorcore_.pop_retired(&retired)) {
+      uint32_t subtile = retired.meta.c_subtile_id;
+      if (retired.meta.a_slot_id == 0) {
+        dmem_.write_subtile_fp22(subtile, retired.fp22_out);
+      } else {
+        dmem_.accumulate_subtile_fp22(subtile, retired.fp22_out);
+      }
+      ++perf_stats_.retired_primitive_tiles;
+      if (perf_stats_.first_tc_retire_cycle == 0) {
+        perf_stats_.first_tc_retire_cycle = perf_stats_.latency;
+      }
+      perf_stats_.last_tc_retire_cycle = perf_stats_.latency;
+      if (retired.meta.a_slot_id == (kKPhases - 1)) {
+        ++op.final_retired_subtiles;
+      }
+    }
+
+    if (op.final_retired_subtiles == kSubtiles) {
+      build_d_store_packets(op);
+      op.stage = MmaStage::StoreD;
+    }
+  }
+
+  void build_d_store_packets(MmaOp& op) {
+    if (op.d_region.col_span < 32) {
+      std::cerr << "TensorUnit error: D allocation must cover at least 32 lanes for warp tcgen05.ld"
+                << std::endl;
       std::abort();
     }
-    TensorAsyncFrontend::enqueue_async_mma_load(core_, arch_, wid, handle, args,
-                                                &amem_state_, &bmem_state_, &cmem_state_, &dmem_state_,
-                                                &pub_amem_state_, &pub_bmem_state_, &pub_cmem_state_, &pub_dmem_state_,
-                                                &amem_, &bmem_, &cmem_, &dmem_, &metamem_,
-                                                &mem_ops_,
-                                                &pending_mem_ops_,
-                                                &perf_stats_,
-                                                trace_data);
-  }
-
-  void mma_store(uint32_t wid, uint32_t handle, IntrTcuArgs args, ExeTraceData* trace_data) {
-    reset_trace_for_async_dispatch(trace_data);
-    if (!args.macro_op) {
+    uint32_t elem_bytes = fmt_element_bytes(op.cmd.fmt_d);
+    if (elem_bytes == 0) {
+      std::cerr << "TensorUnit error: unsupported D output format"
+                << " fmt_d=" << op.cmd.fmt_d << std::endl;
       std::abort();
     }
-    TensorAsyncFrontend::enqueue_async_mma_store(core_, arch_, wid, handle, args,
-                                                 &cmem_state_, &dmem_state_,
-                                                 &pub_cmem_state_, &pub_dmem_state_,
-                                                 &cmem_, &dmem_,
-                                                 &mem_ops_,
-                                                 &perf_stats_,
-                                                 trace_data);
-  }
-
-  void wmma(uint32_t wid,
-            IntrTcuArgs args,
-            const std::vector<reg_data_t>& rs1_data,
-            const std::vector<reg_data_t>& rs2_data,
-            const std::vector<reg_data_t>& rs3_data,
-            std::vector<reg_data_t>& rd_data,
-            ExeTraceData* trace_data) {
-    reset_trace_for_async_dispatch(trace_data);
-    if (!args.macro_op) {
-      std::abort();
+    std::vector<uint8_t> row_major(kTileM * kTileN * elem_bytes, 0);
+    for (uint32_t subtile = 0; subtile < kSubtiles; ++subtile) {
+      std::vector<DMem::packet_t> packets;
+      if (!dmem_.dump_subtile_packets(op.cmd.fmt_d, subtile, &packets)) {
+        std::cerr << "TensorUnit error: DMem dump failed" << std::endl;
+        std::abort();
+      }
+      uint32_t storage_m = subtile / 2;
+      uint32_t storage_n = subtile % 2;
+      uint32_t rows_per_packet = dmem_rows_per_packet(op.cmd.fmt_d);
+      for (uint32_t segment = 0; segment < packets.size(); ++segment) {
+        const auto& packet = packets.at(segment);
+        for (uint32_t row_in_packet = 0; row_in_packet < rows_per_packet; ++row_in_packet) {
+          uint32_t local_row = segment * rows_per_packet + row_in_packet;
+          for (uint32_t col = 0; col < kPrimitiveDim; ++col) {
+            uint32_t global_row = storage_m * kPrimitiveDim + local_row;
+            uint32_t global_col = storage_n * kPrimitiveDim + col;
+            uint32_t src = (row_in_packet * kPrimitiveDim + col) * elem_bytes;
+            uint32_t dst = (global_row * kTileN + global_col) * elem_bytes;
+            std::memcpy(row_major.data() + dst, packet.data() + src, elem_bytes);
+          }
+        }
+      }
     }
-    TensorAsyncFrontend::enqueue_async_wmma(core_, arch_, wid, args,
-                                            args.fmt_a, args.fmt_b, args.fmt_c,
-                                            &amem_state_, &bmem_state_, &cmem_state_, &dmem_state_,
-                                            &pub_amem_state_, &pub_bmem_state_, &pub_cmem_state_, &pub_dmem_state_,
-                                            &pending_wmma_uops_,
-                                            &pending_wmma_jobs_,
-                                            &prev_or_,
-                                            active_wmma_job_valid_,
-                                            &perf_stats_,
-                                            trace_data);
-    (void)rs1_data; (void)rs2_data; (void)rs3_data; (void)rd_data;
+
+    uint32_t packet_count = op.d_region.col_span * Tmem::kPacketsPerCol;
+    op.d_store_packets.assign(packet_count, TmemPacket{});
+    for (uint32_t elem = 0; elem < kTileM * kTileN; ++elem) {
+      uint32_t lane = elem % 32;
+      uint32_t chunk = elem / 32;
+      uint32_t byte_offset = lane * Tmem::kColBytes + chunk * elem_bytes;
+      uint32_t packet_idx = byte_offset / Tmem::kPacketBytes;
+      uint32_t packet_off = byte_offset % Tmem::kPacketBytes;
+      std::memcpy(op.d_store_packets.at(packet_idx).bytes.data() + packet_off,
+                  row_major.data() + elem * elem_bytes,
+                  elem_bytes);
+    }
   }
 
-  TensorUnit*   simobject_;
-  Core*         core_;
-  Arch          arch_;
-  PerfStats     perf_stats_;
+  void advance_store_d(MmaOp& op) {
+    if (op.pending_request_id != 0) {
+      auto rsp_it = completed_tensor_mem_responses_.find(op.pending_request_id);
+      if (rsp_it == completed_tensor_mem_responses_.end()) {
+        ++perf_stats_.stall_tmem_write_port_busy;
+        return;
+      }
+      completed_tensor_mem_responses_.erase(rsp_it);
+      op.pending_request_id = 0;
+      ++op.next_d_packet;
+    }
 
-  // 单实例 Mem 状态
-  AMemState amem_state_;
-  BMemState bmem_state_;
-  CMemState cmem_state_;
-  DMemState dmem_state_;
-  AMemState pub_amem_state_;
-  BMemState pub_bmem_state_;
-  CMemState pub_cmem_state_;
-  DMemState pub_dmem_state_;
+    if (op.next_d_packet >= op.d_store_packets.size()) {
+      op.stage = MmaStage::Complete;
+      return;
+    }
 
-  // 本地 SRAM
+    TensorMemPortReq req{};
+    req.request_id = next_tensor_mem_request_id_++;
+    req.arbitration_age = (uint64_t(op.async_id) << 32) | op.next_d_packet;
+    req.access_type = TensorMemPortReq::AccessType::Write;
+    req.port_request.kind = Tmem::PortRequestKind::RegionWrite;
+    req.port_request.col_base = op.d_region.col_base;
+    req.port_request.col_span = op.d_region.col_span;
+    req.port_request.packet_idx = op.d_packet_base + op.next_d_packet;
+    req.write_packet = op.d_store_packets.at(op.next_d_packet);
+    simobject_->TensorMemReqOut.push(req, 0);
+    op.pending_request_id = req.request_id;
+    op.pending_packet_index = op.next_d_packet;
+  }
+
+  void complete_front_mma() {
+    TensorAsyncOpCompletion completion{};
+    completion.async_id = pending_mma_.front().async_id;
+    simobject_->TensorAsyncOpCompletionOut.push(completion, 0);
+    ++perf_stats_.retired_macro_wmma;
+    pending_mma_.pop_front();
+  }
+
+  TensorUnit* simobject_;
+  Core* core_;
+  const Arch& arch_;
+  PerfStats perf_stats_;
   AMem amem_;
   BMem bmem_;
   CMem cmem_;
   DMem dmem_;
-  MetaMem metamem_;
-
-  // 操作队列
-  std::deque<MemUop> mem_ops_;
-  std::unordered_map<uint32_t, uint32_t> pending_mem_ops_;
-  std::unordered_map<uint32_t, uint32_t> pending_wmma_uops_;
-  std::deque<TensorCoreRetire> pending_tensorcore_retires_;
-  std::deque<PendingWmmaJob> pending_wmma_jobs_;
-  PendingWmmaJob active_wmma_job_;
-  bool active_wmma_job_valid_ = false;
-
-  // 累加序列上升沿检测寄存器
-  bool prev_or_ = false;
-
   TensorCoreTop tensorcore_;
-  TensorLocalMemArbiter mem_arbiter_;
-
   TcDecode tc_decode_;
-
-  uint32_t tmem_bus_rr_index_ = 0;
+  std::deque<MmaOp> pending_mma_;
   uint64_t next_tensor_mem_request_id_ = 1;
   std::unordered_map<uint64_t, TensorMemPortRsp> completed_tensor_mem_responses_;
 };
@@ -289,135 +877,33 @@ void TensorUnit::tick() {
   impl_->tick();
 }
 
-// Phase-2: legacy TensorUnit::set_descriptor() and the multi-type
-// dispatch(TcuType, ...) entry are removed. The new public surface is
-// dispatch_tcu_mma() (PTX tcgen05.mma fan-out) below.
-
 void TensorUnit::dispatch_tcu_mma(uint32_t wid,
                                   uint32_t rs1_value,
                                   uint32_t rs2_value,
                                   uint32_t qualifier,
                                   ExeTraceData* trace_data) {
   reset_trace_for_async_dispatch(trace_data);
-
-  // Stage 1: tc_decode -> TcDecodedMmaCmd (reads idesc + operand_block_t).
-  TcDecodedMmaCmd mma_cmd;
-  if (!impl_->tc_decode_.decode_tcu_mma(impl_->core_, wid,
-                                        rs1_value, rs2_value,
-                                        qualifier, &mma_cmd)) {
-    if (trace_data) { trace_data->retry = true; }
-    return;
-  }
-
-  // Stage 2: synthesize an IntrTcuArgs that the existing fan-out path expects.
-  // We translate the PTX-level cmd back into the legacy field set used by
-  // enqueue_async_tcu_mma's stage helpers.
-  IntrTcuArgs args{};
-  args.fmt_a           = mma_cmd.fmt_a;
-  args.fmt_b           = mma_cmd.fmt_b;
-  args.fmt_c           = mma_cmd.fmt_c;
-  args.fmt_d           = mma_cmd.fmt_d;
-  args.a_sparse_mode   = mma_cmd.sparsity_kind;
-  args.output_resident = mma_cmd.enable_input_d;
-  args.ws              = mma_cmd.ws;
-  args.sp              = mma_cmd.sp;
-  args.cta_group       = mma_cmd.cta_group;
-  args.collector_a_fill = mma_cmd.collector_a_state;
-  args.multicast       = mma_cmd.multicast;
-  args.transpose_a     = mma_cmd.transpose_a;
-  args.transpose_b     = mma_cmd.transpose_b;
-  args.macro_op        = 1;
-  args.descriptor      = rs1_value;  // idesc value as opaque descriptor key
-
-  // Operand routing: the legacy fill helpers expect (handle, target, tile_id).
-  // PTX semantics: A from TMEM (a_taddr); B is always 64-bit sdesc;
-  // C input source = d_taddr (read-modify-write when enable_input_d=1).
-  uint32_t a_handle = mma_cmd.a_taddr;
-  uint32_t b_handle = static_cast<uint32_t>(mma_cmd.b_sdesc & 0xFFFFFFFFu);
-  uint32_t c_handle = mma_cmd.d_taddr;   // PTX: D location doubles as C input
-  uint32_t d_handle = mma_cmd.d_taddr;
-
-  // Phase-3.3.7 Step A (per user): drive an outer 16x16 sub-tile loop from
-  // idesc.shape_m / shape_n. PTX shape_m/shape_n holds the M/N dimension
-  // (must be a multiple of 16 to align to the underlying 16x16 sub-array).
-  // shape_m=0 fallback to 16 for back-compat with kernels that don't fill it.
-  uint32_t shape_m = (mma_cmd.shape_m != 0) ? mma_cmd.shape_m : 16u;
-  uint32_t shape_n = (mma_cmd.shape_n != 0) ? mma_cmd.shape_n : 16u;
-  if (shape_m % 16 != 0) shape_m = ((shape_m + 15) / 16) * 16;
-  if (shape_n % 16 != 0) shape_n = ((shape_n + 15) / 16) * 16;
-  uint32_t m_tiles = shape_m / 16;
-  uint32_t n_tiles = shape_n / 16;
-  if (m_tiles == 0) m_tiles = 1;
-  if (n_tiles == 0) n_tiles = 1;
-
-  for (uint32_t m_idx = 0; m_idx < m_tiles; ++m_idx) {
-    for (uint32_t n_idx = 0; n_idx < n_tiles; ++n_idx) {
-      uint32_t tile_id = m_idx * n_tiles + n_idx;
-      TensorAsyncFrontend::enqueue_async_tcu_mma(
-          impl_->core_, impl_->arch_, wid, args,
-          mma_cmd.fmt_a, mma_cmd.fmt_b, mma_cmd.fmt_c, mma_cmd.fmt_d,
-          a_handle, /*a_tile_id=*/tile_id,
-          b_handle, /*b_tile_id=*/tile_id,
-          c_handle, /*c_tile_id=*/tile_id,
-          d_handle, /*d_tile_id=*/tile_id,
-          &impl_->amem_state_, &impl_->bmem_state_, &impl_->cmem_state_, &impl_->dmem_state_,
-          &impl_->pub_amem_state_, &impl_->pub_bmem_state_, &impl_->pub_cmem_state_, &impl_->pub_dmem_state_,
-          &impl_->amem_, &impl_->bmem_, &impl_->cmem_, &impl_->dmem_, &impl_->metamem_,
-          &impl_->mem_ops_,
-          &impl_->pending_mem_ops_,
-          &impl_->pending_wmma_uops_,
-          &impl_->pending_wmma_jobs_,
-          &impl_->prev_or_,
-          impl_->active_wmma_job_valid_,
-          &impl_->perf_stats_,
-          trace_data);
-      if (trace_data && trace_data->retry) return;
-    }
-  }
+  impl_->enqueue_tcu_mma(wid, rs1_value, rs2_value, qualifier, trace_data);
 }
 
 uint32_t TensorUnit::scheduler_score(uint32_t wid, TcuType tcu_type) const {
-  // Phase-2: descriptor-cache lookup is gone (each TCU_MMA carries its own
-  // 32-bit idesc in rs1). Issue-side scoring now operates on the published
-  // operand state plus a synthetic args (descriptor=0xffffffff means no
-  // cached descriptor). Issue policy returns 1 for non-TCU_MMA types.
-  IntrTcuArgs args{};
-  args.macro_op = 1;
-  return TensorIssuePolicy::scheduler_score(impl_->core_,
-                                            wid,
-                                            tcu_type,
-                                            args,
-                                            impl_->arch_,
-                                            impl_->pub_amem_state_,
-                                            impl_->pub_bmem_state_,
-                                            impl_->pub_cmem_state_,
-                                            impl_->pub_dmem_state_);
+  return impl_->scheduler_score(wid, tcu_type);
 }
 
 TensorUnit::IssueBlockReason TensorUnit::classify_issue_block(uint32_t wid, TcuType tcu_type) const {
-  IntrTcuArgs args{};
-  args.macro_op = 1;
-  return TensorIssuePolicy::classify_issue_block(impl_->core_,
-                                                 wid,
-                                                 tcu_type,
-                                                 args,
-                                                 impl_->arch_,
-                                                 impl_->pub_amem_state_,
-                                                 impl_->pub_bmem_state_,
-                                                 impl_->pub_cmem_state_,
-                                                 impl_->pub_dmem_state_);
+  return impl_->classify_issue_block(wid, tcu_type);
 }
 
 void TensorUnit::record_issue_stall(IssueBlockReason reason) {
-  TensorIssuePolicy::record_issue_stall(reason, &impl_->perf_stats_);
+  impl_->record_issue_stall(reason);
 }
 
 void TensorUnit::record_no_tensor_instr_candidate_stall() {
-  TensorIssuePolicy::record_issue_stall(IssueBlockReason::NoTensorInstrCandidate, &impl_->perf_stats_);
+  impl_->record_issue_stall(IssueBlockReason::NoTensorInstrCandidate);
 }
 
 const TensorUnit::PerfStats& TensorUnit::perf_stats() const {
-  return impl_->perf_stats_;
+  return impl_->perf_stats();
 }
 
 void TensorUnit::dump_debug_state(std::ostream& os) const {

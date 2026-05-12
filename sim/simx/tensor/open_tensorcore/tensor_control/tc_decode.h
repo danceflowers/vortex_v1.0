@@ -22,8 +22,7 @@ namespace vortex {
 
 class Core;
 
-// Phase-2: legacy TcDecodedCmd removed; TcDecodedMmaCmd / TcDecodedLdStCmd
-// (defined below) supersede it.
+// TcDecodedMmaCmd / TcDecodedLdStCmd are the only decoded tensor compute forms.
 
 // ============================================================================
 // TcDecodedMmaCmd —— TCU_MMA 译码结果，喂给 TensorAsyncFrontend::enqueue_async_tcu_mma
@@ -39,6 +38,7 @@ struct TcDecodedMmaCmd {
   uint32_t shape_m = 0;
   uint32_t shape_n = 0;
   uint8_t  sparsity_kind = 0;       // 0=dense, 1=2:4, 2=1:4
+  uint8_t  sparsity_meta_sel = 0;   // selects the 64B metadata packet next to A payload
   uint8_t  saturate = 0;
   uint8_t  transpose_a = 0;
   uint8_t  transpose_b = 0;

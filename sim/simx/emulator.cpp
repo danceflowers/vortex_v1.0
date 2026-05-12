@@ -56,7 +56,7 @@ bool is_warpgroup_collective_tcu(TcuType type) {
 bool collective_args_match(TcuType type, const IntrTcuArgs& lhs, const IntrTcuArgs& rhs) {
   switch (type) {
   case TcuType::TCU_MMA:
-    return lhs.descriptor == rhs.descriptor;
+    return lhs.idesc == rhs.idesc;
   case TcuType::MBAR_FENCE:
     return lhs.fence_mode == rhs.fence_mode;
   default:
@@ -615,6 +615,22 @@ bool Emulator::running() const {
 
 int Emulator::get_exitcode() const {
   return warps_.at(0).ireg_file.at(3).at(0);
+}
+
+void Emulator::write_ireg(uint32_t wid, uint32_t reg_idx,
+                          const ThreadMask& tmask,
+                          const std::vector<Word>& values) {
+  if (reg_idx == 0) {
+    return;
+  }
+  auto& warp = warps_.at(wid);
+  auto num_threads = arch_.num_threads();
+  assert(values.size() >= num_threads);
+  for (uint32_t t = 0; t < num_threads; ++t) {
+    if (tmask.test(t)) {
+      warp.ireg_file.at(reg_idx).at(t) = values.at(t);
+    }
+  }
 }
 
 void Emulator::suspend(uint32_t wid, WarpStallReason reason) {

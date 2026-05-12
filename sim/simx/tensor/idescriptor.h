@@ -62,6 +62,8 @@ enum class IDescriptorKind : uint8_t {
   MXF4       = 5,  // .kind::mxf4
   MXF4NVF4   = 6,  // .kind::mxf4nvf4
   I8         = 7,  // .kind::i8
+  F8F16      = 8,  // Vortex extension: A fp8, B fp16
+  F16F8      = 9,  // Vortex extension: A fp16, B fp8
 };
 
 // ============================================================================
@@ -85,6 +87,9 @@ enum class IDescriptorKind : uint8_t {
 //     not encoded yet.
 //   - lanes_off (cta_group::2 lane offset) lives here because it varies
 //     per instruction instance.
+//   - fmt_cd is a Vortex-private extension in the operand block. It carries
+//     fmt_c/fmt_d because the compact RISC-V instruction and 4-bit idesc.kind
+//     do not have enough spare bits for all C/D precision combinations.
 // ============================================================================
 
 struct operand_block_t {
@@ -94,7 +99,8 @@ struct operand_block_t {
   uint32_t b_sdesc_hi;         // high 32 b of 64-bit b_sdesc
   uint16_t lanes_off;          // cta_group::2 cross-CTA lane offset
   uint16_t reserved0;
-  uint32_t reserved1[3];       // tail-pad to 32 B; available for future fields
+  uint32_t fmt_cd;             // [1:0]=fmt_c, [3:2]=fmt_d; 0=fp32, 1=fp16, 2=fp8
+  uint32_t reserved1[2];       // tail-pad to 32 B; available for future fields
 } __attribute__((packed));
 static_assert(sizeof(operand_block_t) == 32, "operand_block_t must be 32 bytes");
 

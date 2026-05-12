@@ -4,15 +4,14 @@
 
 `tensor_helper/` 放的是非主时序路径代码。
 
-这里的代码可以分为三类：
+这里的代码可以分为两类：
 
 1. debug
 2. standalone test helper
-3. legacy 隔离区
 
 设计目的很明确：
 
-- 不让测试/调试/reference 重新混回 `tensor_top / tensor_control / local_memory / tensor_compute`
+- 不让测试/调试/reference 重新混回 `tensor_control / tensor_compute`
 
 ## 2. 当前文件说明
 
@@ -23,8 +22,6 @@
 主要提供：
 
 - `op_string()`
-- `log_window_plan_summary()`
-- `dump_tensor_unit_state()`
 
 ### [tensor_debug_utils.cpp](./tensor_debug_utils.cpp)
 
@@ -33,8 +30,6 @@
 作用：
 
 - 把 tensor 指令格式化成可读字符串
-- 打印 TMEM window 计划摘要
-- 导出 `TensorUnit` 内部完整状态，便于死锁和流水问题定位
 
 ### [tensor_core_test_utils.h](./tensor_core_test_utils.h)
 
@@ -67,10 +62,6 @@
 ### [test/](./test/ARCHITECTURE.md)
 
 standalone 测试与 decode 示例。
-
-### [legacy/](./legacy/ARCHITECTURE.md)
-
-旧代码隔离区，不应参与主路径构建和新功能开发。
 
 ## 4. 维护建议
 

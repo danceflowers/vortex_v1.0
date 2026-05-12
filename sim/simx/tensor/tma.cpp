@@ -12,396 +12,360 @@
 // limitations under the License.
 
 #include <algorithm>
-#include <vector>
-#include <tensor_cfg.h>
+#include <stdexcept>
+#include <ostream>
 #include "tma.h"
+#include "core.h"
 #include "tmem.h"
+#include "VX_config.h"
 
 using namespace vortex;
 
 namespace {
 
-uint32_t fmt_bytes(uint32_t fmt) {
-  switch (fmt) {
-  case vortex::tensor::fp8::id:
-  case vortex::tensor::uint8::id:
-    return 1;
-  case vortex::tensor::fp16::id:
-  case vortex::tensor::bf16::id:
-    return 2;
-  case vortex::tensor::fp32::id:
-    return 4;
-  default:
-    return 0;
+struct CpAsyncBulkTransferArgs {
+  uint32_t smem_addr;
+  uint32_t mbar_addr;
+  int32_t  coords[5];
+  uint32_t reserved;
+} __attribute__((packed));
+
+struct TensorMap {
+  uint64_t global_address;
+  uint64_t box_size[5];
+  uint64_t global_stride[5];
+  uint32_t element_strides[5];
+  uint8_t  element_type;
+  uint8_t  interleave;
+  uint8_t  swizzle;
+  uint8_t  l2_promotion;
+  uint8_t  oob_fill;
+  uint8_t  rank;
+  uint8_t  reserved0[2];
+  uint32_t reserved1[3];
+} __attribute__((packed));
+
+static_assert(sizeof(CpAsyncBulkTransferArgs) == 32,
+              "cpabulk_transfer_args_t must be 32 B");
+static_assert(sizeof(TensorMap) == 128,
+              "tensor_map_t must be 128 B");
+
+uint32_t tensor_map_rank(const TensorMap& tmap) {
+  return tmap.rank == 0 ? 1u : (tmap.rank > 5 ? 5u : tmap.rank);
+}
+
+uint32_t tensor_map_total_bytes(const TensorMap& tmap) {
+  auto rank = tensor_map_rank(tmap);
+  auto elem_bytes = Tma::element_type_bytes(tmap.element_type);
+  if (elem_bytes == 0) {
+    elem_bytes = 1;
   }
+
+  uint64_t total_elems = 1;
+  for (uint32_t d = 0; d < rank; ++d) {
+    auto box = tmap.box_size[d];
+    if (box == 0) {
+      box = 1;
+    }
+    total_elems *= box;
+  }
+  return static_cast<uint32_t>(total_elems * elem_bytes);
+}
+
+uint64_t tensor_map_address(const TensorMap& tmap,
+                            const CpAsyncBulkTransferArgs& args) {
+  auto rank = tensor_map_rank(tmap);
+  auto elem_bytes = Tma::element_type_bytes(tmap.element_type);
+  if (elem_bytes == 0) {
+    elem_bytes = 1;
+  }
+
+  auto address = tmap.global_address;
+  for (uint32_t d = 0; d < rank; ++d) {
+    auto stride = tmap.global_stride[d];
+    if (stride == 0) {
+      stride = (d == 0) ? elem_bytes : tmap.box_size[d - 1] * elem_bytes;
+    }
+    address += static_cast<uint64_t>(args.coords[d]) * stride;
+  }
+  return address;
 }
 
 } // namespace
 
-// TmaModel is the descriptor/launch-side front-end of the tensor memory
-// accelerator. It translates software-visible descriptors into launch latency
-// estimates plus row-major packet/line-chunk accesses against external memory.
-// TmaFrontend later uses these helpers to build the small packet-sized reorder
-// buffers that feed TMEM ingress.
-
-TmaModel::TmaModel(bool realistic_load)
-  : descriptor_tables_loaded_(false)
-  , realistic_load_(realistic_load) {
-  (void)realistic_load_;
+Tma::Tma(const SimContext& ctx, const char* name, Core* core)
+  : SimObject(ctx, name)
+  , TmemReqOut(this)
+  , TmemRspIn(this)
+  , AsyncOpCompletionOut(this)
+  , CacheReqOut(1, this)
+  , CacheRspIn(1, this)
+  , core_(core)
+  , next_lmem_to_tmem_request_id_(1) {
+  (void)name;
 }
 
-void TmaModel::reset() {
-  descriptor_tables_loaded_ = false;
-  tma_desc_table_.clear();
-  mma_desc_table_.clear();
+void Tma::reset() {
+  pending_lmem_to_tmem_copy_ops_.clear();
+  completed_lmem_to_tmem_transfer_responses_.clear();
+  next_lmem_to_tmem_request_id_ = 1;
 }
 
-bool TmaModel::ensure_descriptor_tables_loaded(uint64_t startup_arg, const ReadCallback& dcache_read) {
-  if (descriptor_tables_loaded_) {
-    return true;
+void Tma::tick() {
+  drain_tmem_responses();
+  advance_lmem_to_tmem_copy_ops();
+}
+
+bool Tma::is_lmem_addr(uint64_t addr) {
+  if (addr < LMEM_BASE_ADDR) {
+    return false;
   }
-  if (0 == startup_arg || !dcache_read) {
+  return (addr - LMEM_BASE_ADDR) < (uint64_t{1} << LMEM_LOG_SIZE);
+}
+
+uint32_t Tma::element_type_bytes(uint8_t element_type) {
+  // CUtensorMapDataType encoding (PTX §6.4.10.4):
+  //   0: U8   1: U16  2: U32  3: I32   4: U64
+  //   5: I64  6: F16  7: F32  8: F64
+  //   9: BF16 10: FP8 11: FP4 ...
+  switch (element_type) {
+    case 0:  return 1;
+    case 1:  return 2;
+    case 2:  return 4;
+    case 3:  return 4;
+    case 4:  return 8;
+    case 5:  return 8;
+    case 6:  return 2;
+    case 7:  return 4;
+    case 8:  return 8;
+    case 9:  return 2;
+    case 10: return 1;
+    case 11: return 1;  // 4-bit packed; keep the previous Cmodel behavior.
+    default: return 4;
+  }
+}
+
+TmaCpAsyncBulkResult Tma::cpabulk_tensor_load(uint64_t tensor_map_addr,
+                                              uint64_t args_lmem_ptr,
+                                              bool complete_tx) {
+  if (!is_lmem_addr(args_lmem_ptr)) {
+    throw std::runtime_error(
+      "cp.async.bulk.tensor.load requires args_lmem_ptr to point to LMEM; "
+      "raw window operands are not part of the PTX path");
+  }
+
+  CpAsyncBulkTransferArgs args = {};
+  core_->lmem_read(&args, args_lmem_ptr, sizeof(args));
+
+  TensorMap tmap = {};
+  core_->dcache_read(&tmap, tensor_map_addr, sizeof(tmap));
+
+  auto total_bytes = tensor_map_total_bytes(tmap);
+  auto src_addr = tensor_map_address(tmap, args);
+
+  constexpr uint32_t kChunk = 64;
+  uint8_t buf[kChunk];
+  auto lmem_dst = static_cast<uint64_t>(args.smem_addr);
+  uint32_t copied = 0;
+  while (copied < total_bytes) {
+    auto take = std::min(kChunk, total_bytes - copied);
+    core_->dcache_read(buf, src_addr + copied, take);
+    core_->lmem_write(buf, lmem_dst + copied, take);
+    copied += take;
+  }
+
+  TmaCpAsyncBulkResult result{};
+  result.payload_size_bytes = total_bytes;
+  if (complete_tx && args.mbar_addr != 0) {
+    result.tx_bound_mbar = static_cast<uint64_t>(args.mbar_addr);
+    result.tx_bytes = total_bytes;
+  }
+  return result;
+}
+
+TmaCpAsyncBulkResult Tma::cpabulk_tensor_store(uint64_t tensor_map_addr,
+                                               uint64_t args_lmem_ptr) {
+  if (!is_lmem_addr(args_lmem_ptr)) {
+    throw std::runtime_error(
+      "cp.async.bulk.tensor.store requires args_lmem_ptr to point to LMEM; "
+      "raw window operands are not part of the PTX path");
+  }
+
+  CpAsyncBulkTransferArgs args = {};
+  core_->lmem_read(&args, args_lmem_ptr, sizeof(args));
+
+  TensorMap tmap = {};
+  core_->dcache_read(&tmap, tensor_map_addr, sizeof(tmap));
+
+  auto total_bytes = tensor_map_total_bytes(tmap);
+  auto dst_addr = tensor_map_address(tmap, args);
+
+  constexpr uint32_t kChunk = 64;
+  uint8_t buf[kChunk];
+  auto lmem_src = static_cast<uint64_t>(args.smem_addr);
+  uint32_t copied = 0;
+  while (copied < total_bytes) {
+    auto take = std::min(kChunk, total_bytes - copied);
+    core_->lmem_read(buf, lmem_src + copied, take);
+    core_->dcache_write(buf, dst_addr + copied, take);
+    copied += take;
+  }
+
+  TmaCpAsyncBulkResult result{};
+  result.payload_size_bytes = total_bytes;
+  return result;
+}
+
+bool Tma::issue_lmem_to_tmem_copy(uint32_t async_id,
+                                  uint32_t wid,
+                                  uint32_t wgid,
+                                  uint32_t col_base,
+                                  uint32_t col_span,
+                                  uint64_t lmem_addr,
+                                  uint32_t byte_offset,
+                                  uint32_t total_bytes) {
+  if (total_bytes == 0) {
     return false;
   }
 
-  vortex::tensor::descriptor_table_arg_t header;
-  dcache_read(&header, startup_arg, sizeof(header));
-  if (header.magic != vortex::tensor::descriptor_table_magic
-   || header.version != vortex::tensor::descriptor_table_version) {
-    return false;
-  }
-
-  tma_desc_table_.clear();
-  mma_desc_table_.clear();
-  if (header.tma_desc_count != 0) {
-    tma_desc_table_.resize(header.tma_desc_count);
-    dcache_read(tma_desc_table_.data(),
-                header.tma_desc_addr,
-                header.tma_desc_count * sizeof(TmaDescriptor));
-  }
-  if (header.mma_desc_count != 0) {
-    mma_desc_table_.resize(header.mma_desc_count);
-    dcache_read(mma_desc_table_.data(),
-                header.mma_desc_addr,
-                header.mma_desc_count * sizeof(IDescriptor));
-  }
-  descriptor_tables_loaded_ = true;
+  PendingLmemToTmemCopyOp op{};
+  op.async_id = async_id;
+  op.wid = wid;
+  op.wgid = wgid;
+  op.col_base = col_base;
+  op.col_span = col_span;
+  op.lmem_addr = lmem_addr;
+  op.byte_offset = byte_offset;
+  op.total_bytes = total_bytes;
+  pending_lmem_to_tmem_copy_ops_[async_id] = op;
   return true;
 }
 
-bool TmaModel::read_tma_descriptor(uint64_t startup_arg,
-                                   uint32_t desc_id,
-                                   TmaDescriptor* out,
-                                   const ReadCallback& dcache_read) {
-  if (nullptr == out || !ensure_descriptor_tables_loaded(startup_arg, dcache_read) || desc_id >= tma_desc_table_.size()) {
-    return false;
-  }
-  *out = tma_desc_table_.at(desc_id);
-  return true;
-}
-
-bool TmaModel::read_idescriptor(uint64_t startup_arg,
-                                   uint32_t desc_id,
-                                   IDescriptor* out,
-                                   const ReadCallback& dcache_read) {
-  if (nullptr == out || !ensure_descriptor_tables_loaded(startup_arg, dcache_read) || desc_id >= mma_desc_table_.size()) {
-    return false;
-  }
-  *out = mma_desc_table_.at(desc_id);
-  return true;
-}
-
-uint32_t TmaModel::estimate_load_latency(const TmaDescriptor& desc) const {
-  uint32_t size_bytes = payload_size_bytes(desc);
-  if (desc.meta_addr != 0 && desc.meta_size_bytes != 0 && desc.meta_col_span != 0) {
-    size_bytes += desc.meta_size_bytes;
-  }
-  uint32_t transfer_cycles = std::max<uint32_t>(1, (size_bytes + kLoadBytesPerCycle - 1) / kLoadBytesPerCycle);
-  return kLoadBaseLatency + transfer_cycles;
-}
-
-uint32_t TmaModel::payload_size_bytes(const TmaDescriptor& desc) const {
-  uint32_t matrix_bytes = desc.rows * desc.cols * desc.elem_bytes;
-  uint32_t requested_size = desc.size_bytes ? desc.size_bytes : matrix_bytes;
-  return requested_size ? requested_size : matrix_bytes;
-}
-
-uint32_t TmaModel::payload_packet_count(const TmaDescriptor& desc) const {
-  auto size_bytes = payload_size_bytes(desc);
-  return (size_bytes + Tmem::kPacketBytes - 1) / Tmem::kPacketBytes;
-}
-
-uint32_t TmaModel::meta_packet_count(const TmaDescriptor& desc) const {
-  if (desc.meta_addr == 0 || desc.meta_size_bytes == 0 || desc.meta_col_span == 0) {
-    return 0;
-  }
-  return (desc.meta_size_bytes + Tmem::kPacketBytes - 1) / Tmem::kPacketBytes;
-}
-
-bool TmaModel::load_linear_packet(uint64_t base_addr,
-                                  uint32_t size_bytes,
-                                  uint32_t packet_idx,
-                                  TmemPacket* out,
-                                  const ReadCallback& dcache_read) const {
-  if (nullptr == out || !dcache_read) {
-    return false;
-  }
-  out->bytes.fill(0);
-  auto byte_offset = packet_idx * Tmem::kPacketBytes;
-  if (byte_offset >= size_bytes) {
-    return true;
-  }
-  auto valid_bytes = std::min<uint32_t>(Tmem::kPacketBytes, size_bytes - byte_offset);
-  dcache_read(out->bytes.data(), base_addr + byte_offset, valid_bytes);
-  return true;
-}
-
-void TmaModel::store_linear_packet(uint64_t base_addr,
-                                   uint32_t size_bytes,
-                                   uint32_t packet_idx,
-                                   const TmemPacket& packet,
-                                   const WriteCallback& dcache_write) const {
-  if (!dcache_write) {
+void Tma::drain_tmem_responses() {
+  if (TmemRspIn.empty()) {
     return;
   }
-  auto byte_offset = packet_idx * Tmem::kPacketBytes;
-  if (byte_offset >= size_bytes) {
-    return;
-  }
-  auto valid_bytes = std::min<uint32_t>(Tmem::kPacketBytes, size_bytes - byte_offset);
-  dcache_write(packet.bytes.data(), base_addr + byte_offset, valid_bytes);
+  auto response = TmemRspIn.front();
+  completed_lmem_to_tmem_transfer_responses_[response.request_id] = response;
+  TmemRspIn.pop();
 }
 
-bool TmaModel::load_math_packet(uint64_t base_addr,
-                                uint32_t row_stride_bytes,
-                                uint32_t rows,
-                                uint32_t cols,
-                                uint32_t elem_bytes,
-                                const TmemWindowPlan& window,
-                                uint32_t packet_idx,
-                                TmemPacket* out,
-                                const ReadCallback& dcache_read,
-                                bool transpose) const {
-  if (nullptr == out || !dcache_read || elem_bytes == 0) {
-    return false;
+void Tma::advance_lmem_to_tmem_copy_ops() {
+  if (pending_lmem_to_tmem_copy_ops_.empty()) {
+    return;
   }
-  out->bytes.fill(0);
-  TmemMathPacketRegion region{};
-  if (!TmemWindowPlanner::packet_math_region(window, packet_idx, &region)) {
-    return false;
-  }
-  if (row_stride_bytes == 0) {
-    row_stride_bytes = cols * elem_bytes;
-  }
-  uint32_t packet_byte_offset = 0;
-  std::array<uint8_t, Tmem::kPacketBytes> row_chunk{};
-  for (uint32_t packet_row = 0; packet_row < region.packet_rows; ++packet_row) {
-    auto math_row = region.math_row_base + packet_row;
-    auto valid_cols = (math_row < rows && region.math_col_base < cols)
-                    ? std::min<uint32_t>(region.packet_cols, cols - region.math_col_base)
-                    : 0;
-    auto valid_bytes = valid_cols * elem_bytes;
-    if (valid_bytes != 0) {
-      if (transpose) {
-        // Cycle-accurate 转置: 逐元素 strided 读取
-        // 目标 (math_row, math_col) ← 源 (math_col, math_row)
-        // 源地址: base + src_row * stride + src_col * elem_bytes
-        // 其中 src_row = math_col, src_col = math_row
-        // 每个元素单独一次 dcache 请求 (strided access → 更多 cache miss)
-        for (uint32_t pc = 0; pc < valid_cols; ++pc) {
-          auto src_row = region.math_col_base + pc;  // 目标列 → 源行
-          auto src_col = math_row;                    // 目标行 → 源列
-          dcache_read(row_chunk.data() + pc * elem_bytes,
-                      base_addr + static_cast<uint64_t>(src_row) * row_stride_bytes
-                               + static_cast<uint64_t>(src_col) * elem_bytes,
-                      elem_bytes);
+
+  auto issue_request = [this](PendingLmemToTmemCopyOp& op,
+                              TensorMemPortReq::AccessType access_type) {
+    TensorMemPortReq request{};
+    request.request_id = next_lmem_to_tmem_request_id_++;
+    request.arbitration_age =
+        (uint64_t(op.async_id) << 32)
+      | (uint64_t(op.packet_idx) << 1)
+      | (access_type == TensorMemPortReq::AccessType::Write ? 1ull : 0ull);
+    request.access_type = access_type;
+    request.port_request.kind =
+        (access_type == TensorMemPortReq::AccessType::Write)
+      ? Tmem::PortRequestKind::RegionWrite
+      : Tmem::PortRequestKind::RegionRead;
+    request.port_request.col_base = op.col_base;
+    request.port_request.col_span = op.col_span;
+    request.port_request.packet_idx = op.packet_idx;
+    if (access_type == TensorMemPortReq::AccessType::Write) {
+      request.write_packet = op.packet;
+    }
+    TmemReqOut.push(request, 0);
+    op.request_id = request.request_id;
+  };
+
+  auto prepare_packet_window = [](PendingLmemToTmemCopyOp& op) {
+    auto absolute_offset = op.byte_offset + op.cursor;
+    op.packet_idx = absolute_offset / Tmem::kPacketBytes;
+    op.packet_offset = absolute_offset % Tmem::kPacketBytes;
+    op.packet_bytes = std::min<uint32_t>(Tmem::kPacketBytes - op.packet_offset,
+                                         op.total_bytes - op.cursor);
+  };
+
+  std::vector<uint32_t> completed_ops;
+  for (auto& entry : pending_lmem_to_tmem_copy_ops_) {
+    auto& op = entry.second;
+
+    if (op.request_id != 0) {
+      auto response_it = completed_lmem_to_tmem_transfer_responses_.find(op.request_id);
+      if (response_it == completed_lmem_to_tmem_transfer_responses_.end()) {
+        if (op.stage == LmemToTmemCopyStage::WaitRead) {
+          ++core_->mutable_perf_stats().stall_tmem_read_port_busy;
+        } else if (op.stage == LmemToTmemCopyStage::WaitWrite) {
+          ++core_->mutable_perf_stats().stall_tmem_write_port_busy;
         }
-      } else {
-        // 非转置: 连续读取一行 (cache-friendly)
-        dcache_read(row_chunk.data(),
-                    base_addr + static_cast<uint64_t>(math_row) * row_stride_bytes
-                             + static_cast<uint64_t>(region.math_col_base) * elem_bytes,
-                    valid_bytes);
+        continue;
       }
-      std::copy_n(row_chunk.data(), valid_bytes, out->bytes.data() + packet_byte_offset);
+
+      auto response = response_it->second;
+      completed_lmem_to_tmem_transfer_responses_.erase(response_it);
+      op.request_id = 0;
+
+      if (op.stage == LmemToTmemCopyStage::WaitRead) {
+        ++core_->mutable_perf_stats().tmem_read_packets;
+        op.packet = response.read_packet;
+        core_->lmem_read(op.packet.bytes.data() + op.packet_offset,
+                         op.lmem_addr + op.cursor,
+                         op.packet_bytes);
+        op.stage = LmemToTmemCopyStage::Ready;
+        issue_request(op, TensorMemPortReq::AccessType::Write);
+        op.stage = LmemToTmemCopyStage::WaitWrite;
+        continue;
+      } else if (op.stage == LmemToTmemCopyStage::WaitWrite) {
+        ++core_->mutable_perf_stats().tmem_write_packets;
+        op.cursor += op.packet_bytes;
+        op.stage = LmemToTmemCopyStage::Ready;
+      }
     }
-    packet_byte_offset += region.packet_cols * elem_bytes;
-  }
-  return true;
-}
 
-void TmaModel::store_math_packet(uint64_t base_addr,
-                                 uint32_t row_stride_bytes,
-                                 uint32_t rows,
-                                 uint32_t cols,
-                                 uint32_t elem_bytes,
-                                 const TmemWindowPlan& window,
-                                 uint32_t packet_idx,
-                                 const TmemPacket& packet,
-                                 const WriteCallback& dcache_write) const {
-  if (!dcache_write || elem_bytes == 0) {
-    return;
-  }
-  TmemMathPacketRegion region{};
-  if (!TmemWindowPlanner::packet_math_region(window, packet_idx, &region)) {
-    return;
-  }
-  if (row_stride_bytes == 0) {
-    row_stride_bytes = cols * elem_bytes;
-  }
-  uint32_t packet_byte_offset = 0;
-  for (uint32_t packet_row = 0; packet_row < region.packet_rows; ++packet_row) {
-    auto math_row = region.math_row_base + packet_row;
-    auto valid_cols = (math_row < rows && region.math_col_base < cols)
-                    ? std::min<uint32_t>(region.packet_cols, cols - region.math_col_base)
-                    : 0;
-    auto valid_bytes = valid_cols * elem_bytes;
-    if (valid_bytes != 0) {
-      dcache_write(packet.bytes.data() + packet_byte_offset,
-                   base_addr + static_cast<uint64_t>(math_row) * row_stride_bytes
-                            + static_cast<uint64_t>(region.math_col_base) * elem_bytes,
-                   valid_bytes);
+    if (op.cursor >= op.total_bytes) {
+      core_->tmem_set_payload_ready(op.col_base, true);
+      AsyncOpCompletionOut.push({op.async_id}, 0);
+      completed_ops.push_back(entry.first);
+      continue;
     }
-    packet_byte_offset += region.packet_cols * elem_bytes;
+
+    if (op.stage != LmemToTmemCopyStage::Ready || op.request_id != 0) {
+      continue;
+    }
+
+    prepare_packet_window(op);
+    if (op.packet_offset == 0 && op.packet_bytes == Tmem::kPacketBytes) {
+      core_->lmem_read(op.packet.bytes.data(),
+                       op.lmem_addr + op.cursor,
+                       Tmem::kPacketBytes);
+      issue_request(op, TensorMemPortReq::AccessType::Write);
+      op.stage = LmemToTmemCopyStage::WaitWrite;
+    } else {
+      issue_request(op, TensorMemPortReq::AccessType::Read);
+      op.stage = LmemToTmemCopyStage::WaitRead;
+    }
+  }
+
+  for (auto async_id : completed_ops) {
+    pending_lmem_to_tmem_copy_ops_.erase(async_id);
   }
 }
 
-bool TmaModel::load_payload_packet(const TmaDescriptor& desc,
-                                   uint32_t payload_size_bytes,
-                                   const TmemWindowPlan* payload_window,
-                                   uint32_t packet_idx,
-                                   TmemPacket* out,
-                                   const ReadCallback& dcache_read) const {
-  if (nullptr != payload_window && TmemWindowPlanner::uses_math_packet_adapter(*payload_window)) {
-    return load_math_packet(desc.addr,
-                            desc.stride_bytes,
-                            desc.rows,
-                            desc.cols,
-                            desc.elem_bytes,
-                            *payload_window,
-                            packet_idx,
-                            out,
-                            dcache_read,
-                            desc.transpose != 0);
+void Tma::dump_debug_state(std::ostream& os) const {
+  os << "[Tma] lmem_to_tmem_pending=" << pending_lmem_to_tmem_copy_ops_.size()
+     << " completed_tmem_responses=" << completed_lmem_to_tmem_transfer_responses_.size()
+     << "\n";
+  for (const auto& entry : pending_lmem_to_tmem_copy_ops_) {
+    const auto& op = entry.second;
+    os << "  async_id=" << op.async_id
+       << " wid=" << op.wid
+       << " wgid=" << op.wgid
+       << " col_base=" << op.col_base
+       << " col_span=" << op.col_span
+       << " cursor=" << op.cursor
+       << " total=" << op.total_bytes
+       << " stage=" << static_cast<uint32_t>(op.stage)
+       << " pending_req=" << op.request_id
+       << "\n";
   }
-  return load_linear_packet(desc.addr, payload_size_bytes, packet_idx, out, dcache_read);
-}
-
-void TmaModel::store_payload_packet(const TmaDescriptor& desc,
-                                    uint32_t payload_size_bytes,
-                                    const TmemWindowPlan* payload_window,
-                                    uint32_t packet_idx,
-                                    const TmemPacket& packet,
-                                    const WriteCallback& dcache_write) const {
-  if (nullptr != payload_window && TmemWindowPlanner::uses_math_packet_adapter(*payload_window)) {
-    store_math_packet(desc.addr,
-                      desc.stride_bytes,
-                      desc.rows,
-                      desc.cols,
-                      desc.elem_bytes,
-                      *payload_window,
-                      packet_idx,
-                      packet,
-                      dcache_write);
-    return;
-  }
-  store_linear_packet(desc.addr, payload_size_bytes, packet_idx, packet, dcache_write);
-}
-
-bool TmaModel::load_meta_packet(const TmaDescriptor& desc,
-                                uint32_t meta_size_bytes,
-                                const TmemWindowPlan* meta_window,
-                                uint32_t packet_idx,
-                                TmemPacket* out,
-                                const ReadCallback& dcache_read) const {
-  if (nullptr == out || !dcache_read || desc.meta_addr == 0) {
-    return false;
-  }
-  if (nullptr != meta_window && TmemWindowPlanner::uses_math_packet_adapter(*meta_window)) {
-    auto elem_bytes = fmt_bytes(meta_window->fmt);
-    return load_math_packet(desc.meta_addr,
-                            meta_window->elem_shape.cols * elem_bytes,
-                            meta_window->elem_shape.rows,
-                            meta_window->elem_shape.cols,
-                            elem_bytes,
-                            *meta_window,
-                            packet_idx,
-                            out,
-                            dcache_read);
-  }
-  return load_linear_packet(desc.meta_addr, meta_size_bytes, packet_idx, out, dcache_read);
-}
-
-bool TmaModel::load_row_chunk_packet(uint64_t base_addr,
-                                     uint32_t row_stride_bytes,
-                                     uint32_t row_idx,
-                                     uint32_t chunk_idx,
-                                     uint32_t row_bytes,
-                                     TmemPacket* out,
-                                     const ReadCallback& dcache_read) const {
-  if (nullptr == out || !dcache_read) {
-    return false;
-  }
-  out->bytes.fill(0);
-  auto byte_offset = chunk_idx * Tmem::kPacketBytes;
-  if (byte_offset >= row_bytes) {
-    return true;
-  }
-  auto valid_bytes = std::min<uint32_t>(Tmem::kPacketBytes, row_bytes - byte_offset);
-  dcache_read(out->bytes.data(),
-              base_addr + static_cast<uint64_t>(row_idx) * row_stride_bytes + byte_offset,
-              valid_bytes);
-  return true;
-}
-
-bool TmaModel::load_payload(const TmaDescriptor& desc,
-                            uint32_t capacity,
-                            std::vector<uint8_t>* out,
-                            const ReadCallback& dcache_read) const {
-  // TMA payload traffic is still described in mathematical row-major order at
-  // this boundary. Any conversion into TMEM-internal window layout happens
-  // later inside the Core/TMEM packet adapter path.
-  if (nullptr == out || !dcache_read) {
-    return false;
-  }
-
-  uint32_t size_bytes = std::min<uint32_t>(payload_size_bytes(desc), capacity);
-  out->assign(size_bytes, 0);
-  if (size_bytes == 0) {
-    return true;
-  }
-
-  dcache_read(out->data(), desc.addr, size_bytes);
-  return true;
-}
-
-bool TmaModel::load_meta(const TmaDescriptor& desc,
-                         uint32_t capacity,
-                         std::vector<uint8_t>* out,
-                         const ReadCallback& dcache_read) const {
-  // Sparse metadata is modeled as a separate row-major byte image here. TMEM
-  // may later place it into a dedicated shadow window.
-  if (nullptr == out || !dcache_read || desc.meta_addr == 0 || desc.meta_size_bytes == 0 || desc.meta_col_span == 0) {
-    return false;
-  }
-
-  uint32_t size_bytes = std::min<uint32_t>(desc.meta_size_bytes, capacity);
-  out->assign(size_bytes, 0);
-  if (size_bytes != 0) {
-    dcache_read(out->data(), desc.meta_addr, size_bytes);
-  }
-  return true;
-}
-
-void TmaModel::store_payload(const TmaDescriptor& desc,
-                             const uint8_t* data,
-                             uint32_t size_bytes,
-                             const WriteCallback& dcache_write) const {
-  // The TMA front-end stores the mathematical window image back to device
-  // memory. Any TMEM-specific packet layout has already been decoded before
-  // this point.
-  if (0 == size_bytes || nullptr == data || !dcache_write) {
-    return;
-  }
-  dcache_write(data, desc.addr, size_bytes);
 }

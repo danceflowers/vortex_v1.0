@@ -16,6 +16,10 @@ VX_SRCS := $(SRC_DIR)/kernel.cpp
 
 CXXFLAGS += -I$(THIRD_PARTY_DIR)/softfloat/source/include
 CXXFLAGS += -I$(VORTEX_HOME)/sim/simx
+CXXFLAGS += -I$(VORTEX_HOME)/sim/simx/tensor
+CXXFLAGS += -I$(VORTEX_HOME)/sim/simx/tensor/open_tensorcore/tensor_compute
+CXXFLAGS += -I$(VORTEX_HOME)/sim/simx/tensor/open_tensorcore/tensor_control
+CXXFLAGS += -I$(VORTEX_HOME)/sim/simx/tensor/open_tensorcore/local_memory
 CXXFLAGS += -I$(VORTEX_HOME)/kernel/include
 
 LDFLAGS += $(THIRD_PARTY_DIR)/softfloat/build/Linux-x86_64-GCC/softfloat.a

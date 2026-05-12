@@ -6,6 +6,8 @@
 #include "core.h"
 #include "tensor_cfg.h"
 
+#include <cstring>
+
 namespace vortex {
 
 namespace vt = vortex::tensor;
@@ -34,6 +36,14 @@ bool kind_to_fmt(uint32_t kind, uint32_t* fmt_a, uint32_t* fmt_b,
     *fmt_a = vt::fp8::id; *fmt_b = vt::fp8::id;
     *fmt_c = vt::fp32::id; *fmt_d = vt::fp32::id;
     return true;
+  case IDescriptorKind::F8F16:
+    *fmt_a = vt::fp8::id; *fmt_b = vt::fp16::id;
+    *fmt_c = vt::fp32::id; *fmt_d = vt::fp32::id;
+    return true;
+  case IDescriptorKind::F16F8:
+    *fmt_a = vt::fp16::id; *fmt_b = vt::fp8::id;
+    *fmt_c = vt::fp32::id; *fmt_d = vt::fp32::id;
+    return true;
   case IDescriptorKind::I8:
     // Vortex CModel doesn't yet implement int8 path; placeholder.
     *fmt_a = 0; *fmt_b = 0; *fmt_c = 0; *fmt_d = 0;
@@ -41,6 +51,21 @@ bool kind_to_fmt(uint32_t kind, uint32_t* fmt_a, uint32_t* fmt_b,
   default:
     return false;
   }
+}
+
+bool fmt_code_to_fmt(uint32_t code, uint32_t* fmt) {
+  switch (code & 0x3u) {
+  case 0: *fmt = vt::fp32::id; return true;
+  case 1: *fmt = vt::fp16::id; return true;
+  case 2: *fmt = vt::fp8::id;  return true;
+  default:
+    return false;
+  }
+}
+
+bool fmt_cd_to_fmt(uint32_t fmt_cd, uint32_t* fmt_c, uint32_t* fmt_d) {
+  return fmt_code_to_fmt(fmt_cd & 0x3u, fmt_c)
+      && fmt_code_to_fmt((fmt_cd >> 2) & 0x3u, fmt_d);
 }
 
 // PTX idesc.sparsity_kind (1 bit + sparsity_meta_sel 2 bit) -> Vortex sparse_mode.
@@ -84,6 +109,7 @@ bool TcDecode::decode_tcu_mma(Core* core,
   out->sparsity_kind = sparsity_to_mode(idesc.sparsity_kind,
                                         idesc.sparsity_meta_sel,
                                         out->sp != 0);
+  out->sparsity_meta_sel = idesc.sparsity_meta_sel;
   out->saturate      = idesc.saturate;
   out->transpose_a   = idesc.transpose_a;
   out->transpose_b   = idesc.transpose_b;
@@ -98,6 +124,9 @@ bool TcDecode::decode_tcu_mma(Core* core,
   out->a_taddr   = op_block.a_taddr;
   out->b_sdesc   = (uint64_t(op_block.b_sdesc_hi) << 32) | uint64_t(op_block.b_sdesc_lo);
   out->lanes_off = op_block.lanes_off;
+  if (!fmt_cd_to_fmt(op_block.fmt_cd, &out->fmt_c, &out->fmt_d)) {
+    return false;
+  }
 
   return true;
 }
@@ -116,7 +145,7 @@ bool TcDecode::decode_tcu_ld_st(uint32_t wid,
 }
 
 void TcDecode::reset() {
-  // Phase-2: legacy cached_desc_* fields removed; reset is now a no-op.
+  // idesc is carried by each instruction, so reset has no descriptor state.
 }
 
 } // namespace vortex

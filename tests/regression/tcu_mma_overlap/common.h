@@ -21,7 +21,7 @@
 #endif
 
 #ifndef OTYPE
-#define OTYPE fp16
+#define OTYPE fp8
 #endif
 
 #ifndef SPARSE_MODE
@@ -30,16 +30,16 @@
 
 // Matrix dimensions
 #ifndef MATRIX_M
-#define MATRIX_M 512
+#define MATRIX_M 32
 #endif
 #ifndef MATRIX_N
-#define MATRIX_N 512
+#define MATRIX_N 32
 #endif
 #ifndef MATRIX_K
-#define MATRIX_K 512
+#define MATRIX_K 32
 #endif
 
-// Window shape: 32×32 → A=32×32, B=32×32, C=D=32×32 (m32n32k32)
+// Window shape: A=32x32, B=32x32, C=D=32x32 (m32n32k32)
 #define WIN_M 32
 #define WIN_N 32
 #define WIN_K 32
@@ -50,22 +50,22 @@
 #define TILE_K 8
 
 // 每个 window 内的 tile 数
-#define A_TILES_PER_WIN  ((WIN_M / TILE_M) * (WIN_K / TILE_K))  // 2×4=8
-#define B_TILES_PER_WIN  ((WIN_K / TILE_K) * (WIN_N / TILE_N))  // 4×2=8
-#define CD_TILES_PER_WIN ((WIN_M / TILE_M) * (WIN_N / TILE_N))  // 2×2=4
+#define A_TILES_PER_WIN  ((WIN_M / TILE_M) * (WIN_K / TILE_K))
+#define B_TILES_PER_WIN  ((WIN_K / TILE_K) * (WIN_N / TILE_N))
+#define CD_TILES_PER_WIN ((WIN_M / TILE_M) * (WIN_N / TILE_N))
 
 // A/B window 内 tile 布局
-#define A_TILE_COLS (WIN_K / TILE_K)  // 4 (K 维 tile 列数)
-#define B_TILE_COLS (WIN_N / TILE_N)  // 2 (N 维 tile 列数)
+#define A_TILE_COLS (WIN_K / TILE_K)
+#define B_TILE_COLS (WIN_N / TILE_N)
 #define C_TILE_COLS (WIN_N / TILE_N)  // 2
 
 // K 维 tile 数 (一个 window 内)
-#define K_TILES_PER_WIN (WIN_K / TILE_K)  // 4
+#define K_TILES_PER_WIN (WIN_K / TILE_K)
 
 // 全局 group 计数
-#define M_GROUPS (MATRIX_M / WIN_M)  // 16
-#define N_GROUPS (MATRIX_N / WIN_N)  // 16
-#define K_PHASES (MATRIX_K / WIN_K)  // 16
+#define M_GROUPS (MATRIX_M / WIN_M)
+#define N_GROUPS (MATRIX_N / WIN_N)
+#define K_PHASES (MATRIX_K / WIN_K)
 
 // 每个 32×32 output block 内有 4 个 16×16 output tile
 // CMem 只有 2 slot，分 2 批处理: 批0=(m=0,n=0/1), 批1=(m=1,n=0/1)
@@ -105,7 +105,7 @@ typedef struct __attribute__((packed)) {
   uint32_t fmt_b;
   uint32_t fmt_c;
   uint32_t fmt_d;
-  uint8_t ws;
+  uint8_t output_resident;
   uint8_t sp;
   uint8_t sparse_mode;
   uint8_t reserved[5];

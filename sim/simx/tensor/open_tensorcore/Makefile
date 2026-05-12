@@ -37,12 +37,11 @@ RELEASE_FLAGS ?= -O2
 DEBUG_FLAGS   ?= -O0 -g -DDEBUG
 
 # Runtime options (override on command line)
-PREC     ?= FP8_E5M2
-TEST_ID  ?= 2
+TEST_ID  ?= 0
 RM_MODE  ?= RNE
 SEED     ?= 0
 
-RUN_ARGS := --prec $(PREC) --test $(TEST_ID)
+RUN_ARGS := --test $(TEST_ID)
 ifneq ($(RM_MODE),RNE)
 RUN_ARGS += --rm $(RM_MODE)
 endif
@@ -99,11 +98,10 @@ help:
 	@echo   mingw32-make clean                     Remove build outputs
 	@echo.
 	@echo Runtime options (override):
-	@echo   PREC: FP4_E2M1 or FP8_E4M3 or FP8_E5M2 or FP16 or FP32
-	@echo   TEST_ID: integer
+	@echo   TEST_ID: 0=all, 1=dense, 2=asym, 3=multi-K, 4=sparse-2:4, 5=sparse-1:4
 	@echo   RM_MODE: RNE or RTZ or RDN or RUP or RMM
 	@echo   SEED: unsigned integer
 	@echo Example:
-	@echo   mingw32-make run PREC=FP16 TEST_ID=2 RM_MODE=RNE
+	@echo   mingw32-make run TEST_ID=4 RM_MODE=RNE SEED=1
 
 -include $(DEPS)

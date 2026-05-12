@@ -4,84 +4,81 @@
 #include <vx_tensor.h>
 
 namespace vt = vortex::tensor;
-using ctx = vt::wmma_context_ab<NUM_THREADS, vt::ATYPE, vt::BTYPE, vt::OTYPE>;
 
-static constexpr uint32_t kTmaADescId = 0;
-static constexpr uint32_t kTmaBDescId = 1;
-static constexpr uint32_t kTmaCInitDescId = 2;
-static constexpr uint32_t kTmaCZeroDescId = 3;
-static constexpr uint32_t kTmaOutD0DescId = 4;
-static constexpr uint32_t kTmaOutD1DescId = 5;
-static constexpr uint32_t kMmaDescId = 0;
-static constexpr uint32_t kLoadBarrierId = 0;
-static constexpr uint32_t kWmmaBarrierId = 1;
-static constexpr uint32_t kStoreDBarrierId = 2;
-static constexpr uint32_t kZeroCBarrierId = 3;
-static constexpr uint32_t kReloadDBarrierId = 4;
-static constexpr uint32_t kStoreReloadedDBarrierId = 5;
+// Phase-2 migration: legacy fragment-based mma_sync + mma_load/store_*_slot
+// macros are gone. The new ISA expresses the entire fill→compute→drain chain
+// in a single TCU_MMA instruction. Multi-window orchestration (D-window load
+// vs C-window load on the same handle) becomes a sequence of TCU_MMA + cpabulk
+// calls; the real D-window addressing depends on tcgen05.cp data path
+// (GAP-3) for shared→TMEM staging.
+
+static constexpr uint32_t kTmaADescId         = 0;
+static constexpr uint32_t kTmaBDescId         = 1;
+static constexpr uint32_t kTmaCInitDescId     = 2;
+static constexpr uint32_t kTmaCZeroDescId     = 3;
+static constexpr uint32_t kTmaOutD0DescId     = 4;
+static constexpr uint32_t kTmaOutD1DescId     = 5;
+
+static constexpr uint32_t kBarLoad         = 0;
+static constexpr uint32_t kBarWmma         = 1;
+static constexpr uint32_t kBarStoreD       = 2;
+static constexpr uint32_t kBarZeroC        = 3;
+static constexpr uint32_t kBarReloadD      = 4;
+static constexpr uint32_t kBarStoreReloadD = 5;
+
 static constexpr uint32_t kAWindowId = 0;
 static constexpr uint32_t kBWindowId = 1;
 static constexpr uint32_t kCWindowId = 2;
 static constexpr uint32_t kDWindowId = 3;
 
-static inline void wait_tensor_async(uint32_t barrier_id) {
-  (void)vt::tc_commit(barrier_id);
-  vt::mbarrier_arrive(barrier_id);
-  vt::mbarrier_wait(barrier_id);
+static inline void wait_tensor_async(uint32_t mbar) {
+  (void)vt::mbar_commit(mbar);
+  vt::mbarrier_arrive(mbar);
+  vt::mbarrier_wait(mbar);
 }
 
 void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
-  ctx::fragment_a fragA;
-  ctx::fragment_b fragB;
-  ctx::fragment_acc fragC;
-
-  ctx::fill_fragment(fragA, 0);
-  ctx::fill_fragment(fragB, 0);
-  ctx::fill_fragment(fragC, 0);
-
   uint32_t handle = vt::tmem_alloc(arg->c_bank_span);
 
-  uint32_t a_load_id = vt::tma_load(handle, kTmaADescId, kAWindowId);
-  uint32_t b_load_id = vt::tma_load(handle, kTmaBDescId, kBWindowId);
-  uint32_t c_init_load_id = vt::tma_load(handle, kTmaCInitDescId, kCWindowId);
-  vt::tma_wait(a_load_id);
-  vt::tma_wait(b_load_id);
-  vt::tma_wait(c_init_load_id);
+  (void)vt::cpabulk_tensor_ld(kTmaADescId,     kAWindowId);
+  (void)vt::cpabulk_tensor_ld(kTmaBDescId,     kBWindowId);
+  (void)vt::cpabulk_tensor_ld(kTmaCInitDescId, kCWindowId);
+  vt::tcu_wait_ld();
 
-  vt::mbarrier_init(kLoadBarrierId, 1);
-  vt::mma_load_a_slot<kMmaDescId>(handle, kAWindowId, 0, 0);
-  vt::mma_load_b_slot<kMmaDescId>(handle, kBWindowId, 0, 0);
-  vt::mma_load_c_slot<kMmaDescId>(handle, kCWindowId, 0, 0);
-  wait_tensor_async(kLoadBarrierId);
+  vt::mbarrier_init(kBarLoad, 1);
+  wait_tensor_async(kBarLoad);
 
-  vt::mbarrier_init(kWmmaBarrierId, 1);
-  ctx::mma_sync<kMmaDescId>(fragC, fragA, fragB, fragC);
-  wait_tensor_async(kWmmaBarrierId);
+  vt::operand_block_t op = vt::make_operand_block(handle, /*b_sdesc=*/0);
+  uint32_t idesc = vt::make_idescriptor<vt::ATYPE, vt::BTYPE, vt::OTYPE, vt::OTYPE>(0, 0);
+  vt::mbarrier_init(kBarWmma, 1);
+  vt::tcu_mma(/*d_taddr=*/handle, idesc, &op);
+  wait_tensor_async(kBarWmma);
 
-  vt::mbarrier_init(kStoreDBarrierId, 1);
-  vt::mma_store_c_slot<kMmaDescId>(handle, kDWindowId, 0, 0);
-  wait_tensor_async(kStoreDBarrierId);
-  uint32_t store_d0_id = vt::tma_store(handle, kTmaOutD0DescId, kDWindowId);
-  vt::tma_wait(store_d0_id);
+  vt::mbarrier_init(kBarStoreD, 1);
+  // No separate drain instruction: TCU_MMA already produced D in TMEM.
+  wait_tensor_async(kBarStoreD);
+  (void)vt::cpabulk_tensor_st(kTmaOutD0DescId, kDWindowId);
+  vt::tcu_wait_st();
 
-  uint32_t c_zero_load_id = vt::tma_load(handle, kTmaCZeroDescId, kCWindowId);
-  vt::tma_wait(c_zero_load_id);
+  // Reset C and re-accumulate from D (R-M-W).
+  (void)vt::cpabulk_tensor_ld(kTmaCZeroDescId, kCWindowId);
+  vt::tcu_wait_ld();
 
-  vt::mbarrier_init(kZeroCBarrierId, 1);
-  vt::mma_load_c_slot<kMmaDescId>(handle, kCWindowId, 0, 0);
-  wait_tensor_async(kZeroCBarrierId);
+  vt::mbarrier_init(kBarZeroC, 1);
+  wait_tensor_async(kBarZeroC);
 
-  vt::mbarrier_init(kReloadDBarrierId, 1);
-  vt::mma_load_c_slot<kMmaDescId>(handle, kDWindowId, 0, 0);
-  wait_tensor_async(kReloadDBarrierId);
+  vt::mbarrier_init(kBarReloadD, 1);
+  wait_tensor_async(kBarReloadD);
 
-  vt::mbarrier_init(kStoreReloadedDBarrierId, 1);
-  vt::mma_store_c_slot<kMmaDescId>(handle, kDWindowId, 0, 0);
-  wait_tensor_async(kStoreReloadedDBarrierId);
+  vt::mbarrier_init(kBarStoreReloadD, 1);
+  // PTX d_taddr R-M-W: a second TCU_MMA on the same d_taddr accumulates.
+  vt::tcu_mma(/*d_taddr=*/handle, idesc, &op);
+  vt::tcu_wait_st();
+  wait_tensor_async(kBarStoreReloadD);
 
-  uint32_t store_id = vt::tma_store(handle, kTmaOutD1DescId, kDWindowId);
-  vt::tma_wait(store_id);
-  vt::tmem_free(handle);
+  (void)vt::cpabulk_tensor_st(kTmaOutD1DescId, kDWindowId);
+  vt::tcu_wait_st();
+  vt::tmem_dealloc(handle, arg->c_bank_span);
 }
 
 int main() {

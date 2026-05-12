@@ -1,11 +1,11 @@
 ROOT_DIR := $(realpath ../../..)
 include $(ROOT_DIR)/config.mk
 
-PROJECT := tcu_wmma_overlap
+PROJECT := tcu_mma_overlap
 ITYPE ?= fp8
 ATYPE ?= $(ITYPE)
 BTYPE ?= $(ITYPE)
-OTYPE ?= fp16
+OTYPE ?= fp8
 SPARSE_MODE ?= 0
 
 SRC_DIR := $(VORTEX_HOME)/tests/regression/$(PROJECT)

@@ -24,121 +24,209 @@ enum mem_layout {
   col_major
 };
 
-enum tcu_target : uint8_t {
-  tcu_target_none = 0,
-  tcu_target_a = 1,
-  tcu_target_b = 2,
-  tcu_target_c = 3,
+static constexpr uint32_t tmem_alloc_reserved_operand = 0xffffffffu;
+
+// ============================================================================
+// PTX-aligned descriptor types — mirror sim/simx/tensor/idescriptor.h.
+// Kernel-side declarations so user code can construct on-LMEM blobs that simx
+// (and future RTL) can read byte-for-byte.
+// ============================================================================
+
+// Bit-packed 32-bit tcgen05.mma instruction descriptor (PTX §9.7.16.5.4).
+struct idescriptor_t {
+  uint32_t sparsity_meta_sel : 2;  // [1:0]
+  uint32_t sparsity_kind     : 1;  // [2]
+  uint32_t reserved_3        : 1;  // [3]
+  uint32_t kind              : 4;  // [7:4]
+  uint32_t shape_m           : 8;  // [15:8]
+  uint32_t shape_n           : 8;  // [23:16]
+  uint32_t a_storage_layout  : 2;  // [25:24]
+  uint32_t b_storage_layout  : 2;  // [27:26]
+  uint32_t output_negate     : 1;  // [28]
+  uint32_t saturate          : 1;  // [29]
+  uint32_t transpose_a       : 1;  // [30]
+  uint32_t transpose_b       : 1;  // [31]
+} __attribute__((packed));
+static_assert(sizeof(idescriptor_t) == 4, "idescriptor_t must be 32 bits");
+
+enum class idesc_kind : uint8_t {
+  F16        = 0,
+  TF32       = 1,
+  BF16       = 2,
+  F8F6F4     = 3,
+  MXF8F6F4   = 4,
+  MXF4       = 5,
+  MXF4NVF4   = 6,
+  I8         = 7,
+  F8F16      = 8,
+  F16F8      = 9,
 };
 
-// TMA descriptors describe which logical TMEM window a payload belongs to.
-// This is distinct from MMA_LOAD.target, which selects the local fill destination.
-enum tma_tile_role : uint8_t {
-  tma_tile_role_none = 0,
-  tma_tile_role_a = 1,
-  tma_tile_role_b = 2,
-  tma_tile_role_c = 3,
-  tma_tile_role_d = 4,
+// Map (At, Bt) type tags from tensor_cfg.h to PTX `.kind` encoding.
+// Specialise per supported precision pair; unspecialised pairs trigger
+// static_assert at use-site.
+template <typename At, typename Bt>
+struct idesc_kind_for {
+  static_assert(sizeof(At) == 0,
+                "Unsupported tcgen05.mma type pair; specialise idesc_kind_for<At,Bt>");
+};
+template <> struct idesc_kind_for<fp16, fp16> { static constexpr idesc_kind value = idesc_kind::F16; };
+template <> struct idesc_kind_for<bf16, bf16> { static constexpr idesc_kind value = idesc_kind::BF16; };
+template <> struct idesc_kind_for<fp32, fp32> { static constexpr idesc_kind value = idesc_kind::TF32; };
+template <> struct idesc_kind_for<fp8,  fp8 > { static constexpr idesc_kind value = idesc_kind::F8F6F4; };
+template <> struct idesc_kind_for<fp8,  fp16> { static constexpr idesc_kind value = idesc_kind::F8F16; };
+template <> struct idesc_kind_for<fp16, fp8 > { static constexpr idesc_kind value = idesc_kind::F16F8; };
+template <> struct idesc_kind_for<int8, int8> { static constexpr idesc_kind value = idesc_kind::I8; };
+
+enum class operand_fmt_code : uint32_t {
+  FP32 = 0,
+  FP16 = 1,
+  FP8  = 2,
 };
 
-static constexpr uint32_t max_operand_slots = 2;
-static constexpr uint32_t tcu_tmem_op_ctl_window_bits = 8;
-static constexpr uint32_t tcu_tmem_op_ctl_desc_bits = 16;
-static constexpr uint32_t tcu_tmem_op_ctl_flags_bits = 8;
-static constexpr uint32_t tcu_tmem_op_ctl_window_shift = 0;
-static constexpr uint32_t tcu_tmem_op_ctl_desc_shift =
-    tcu_tmem_op_ctl_window_shift + tcu_tmem_op_ctl_window_bits;
-static constexpr uint32_t tcu_tmem_op_ctl_flags_shift =
-    tcu_tmem_op_ctl_desc_shift + tcu_tmem_op_ctl_desc_bits;
-static constexpr uint32_t tcu_tmem_op_flag_refill = 0x1u;
-static constexpr uint32_t wmma_slot_ctl_slot_bits = 2;
-static constexpr uint32_t wmma_slot_ctl_a_shift = 0;
-static constexpr uint32_t wmma_slot_ctl_b_shift = wmma_slot_ctl_a_shift + wmma_slot_ctl_slot_bits;
+template <typename T>
+struct operand_fmt_code_for {
+  static_assert(sizeof(T) == 0,
+                "Unsupported tcgen05.mma C/D type; specialise operand_fmt_code_for<T>");
+};
+template <> struct operand_fmt_code_for<fp32> { static constexpr operand_fmt_code value = operand_fmt_code::FP32; };
+template <> struct operand_fmt_code_for<fp16> { static constexpr operand_fmt_code value = operand_fmt_code::FP16; };
+template <> struct operand_fmt_code_for<fp8 > { static constexpr operand_fmt_code value = operand_fmt_code::FP8;  };
 
-inline __attribute__((always_inline)) constexpr uint32_t encode_wmma_slot_control(uint32_t a_slot_id,
-                                                                                   uint32_t b_slot_id) {
-  return ((a_slot_id & ((1u << wmma_slot_ctl_slot_bits) - 1)) << wmma_slot_ctl_a_shift)
-       | ((b_slot_id & ((1u << wmma_slot_ctl_slot_bits) - 1)) << wmma_slot_ctl_b_shift);
+template <typename Ct, typename Dt>
+inline __attribute__((always_inline)) constexpr uint32_t make_operand_fmt_cd() {
+  return (static_cast<uint32_t>(operand_fmt_code_for<Ct>::value) & 0x3u)
+       | ((static_cast<uint32_t>(operand_fmt_code_for<Dt>::value) & 0x3u) << 2);
 }
 
-enum tcu_payload_kind : uint8_t {
-  tcu_payload_dense = 0,
-  tcu_payload_sparse_payload = 1,
-  tcu_payload_sparse_meta = 2,
-};
-
-enum tcu_sparse_mode : uint8_t {
-  tcu_sparse_none = sparse_none,
-  tcu_sparse_2_4 = sparse_2_4,
-  tcu_sparse_1_4 = sparse_1_4,
-};
-
-struct tma_descriptor_t {
-  uint64_t addr;
-  uint32_t size_bytes;
-  uint32_t stride_bytes;
-  uint16_t rows;
-  uint16_t cols;
-  uint16_t elem_bytes;
-  uint16_t flags;
-  uint64_t meta_addr;
-  uint32_t meta_size_bytes;
-  uint16_t tmem_base;
-  uint16_t meta_tmem_base;
-  uint16_t bank_span;
-  uint16_t meta_col_span;
-  uint8_t tile_role;
-  uint8_t payload_kind;
-  uint8_t transpose;      // 转置标志: TMA 以转置寻址从 DRAM 读取
-  uint8_t reserved;
+// 32 B operand block (Vortex-private, lives in shared memory / LMEM).
+// Pointed to by TCU_MMA rs2.
+struct operand_block_t {
+  uint32_t d_taddr;        // PTX d_taddr (D output and optional D input)
+  uint32_t a_taddr;        // PTX a_taddr (A matrix TMEM address)
+  uint32_t b_sdesc_lo;     // low 32b of 64-bit b_sdesc (PTX §9.7.16.2)
+  uint32_t b_sdesc_hi;     // high 32b of 64-bit b_sdesc
+  uint16_t lanes_off;      // cta_group::2 cross-CTA lane offset
+  uint16_t reserved0;
+  uint32_t fmt_cd;         // [1:0]=fmt_c, [3:2]=fmt_d; 0=fp32, 1=fp16, 2=fp8
+  uint32_t reserved1[2];
 } __attribute__((packed));
+static_assert(sizeof(operand_block_t) == 32, "operand_block_t must be 32 bytes");
 
-struct mma_descriptor_t {
-  uint32_t fmt_a;
-  uint32_t fmt_b;
-  uint32_t fmt_c;
-  uint32_t fmt_d;
-  uint8_t ws;
-  uint8_t sp;
-  uint8_t sparse_mode;
-  uint8_t reserved[5];     // transpose 已移至 tma_descriptor_t
-  uint16_t a_rows;
-  uint16_t a_cols;
-  uint16_t b_rows;
-  uint16_t b_cols;
-  uint16_t c_rows;
-  uint16_t c_cols;
+// 32 B cpabulk_tensor transfer args (Vortex-private, lives in LMEM).
+// Pointed to by CPABULK_TENSOR_LD/ST rs2.
+struct cpabulk_transfer_args_t {
+  uint32_t smem_addr;       // LMEM destination (LD) or source (ST)
+  uint32_t mbar_addr;       // mbarrier object address (only used if qualifier[5]=1)
+  int32_t  coords[5];       // tensor coordinates (first dim_count entries valid)
+  uint32_t reserved;
 } __attribute__((packed));
+static_assert(sizeof(cpabulk_transfer_args_t) == 32, "cpabulk_transfer_args_t must be 32 bytes");
 
-template <typename At, typename Bt, typename Ct, typename Dt = Ct>
-inline __attribute__((always_inline)) constexpr mma_descriptor_t make_mma_descriptor(uint8_t ws = 0,
-                                                                                     uint8_t sp = 0,
-                                                                                     uint8_t sparse_mode = 0,
-                                                                                     uint16_t a_rows = 0,
-                                                                                     uint16_t a_cols = 0,
-                                                                                     uint16_t b_rows = 0,
-                                                                                     uint16_t b_cols = 0,
-                                                                                     uint16_t c_rows = 0,
-                                                                                     uint16_t c_cols = 0) {
-  return mma_descriptor_t{At::id, Bt::id, Ct::id, Dt::id,
-                          ws, sp, sparse_mode, {0, 0, 0, 0, 0},
-                          a_rows, a_cols, b_rows, b_cols, c_rows, c_cols};
+// 8 B mbarrier object (PTX §7.6.1). Lives in shared memory / LMEM.
+struct mbarrier_state_t {
+  uint32_t expected_arrival_count : 20;  // [19:0]
+  uint32_t pending_tx_count       : 12;  // [31:20]
+  uint32_t pending_arrival_count  : 30;  // [61:32]
+  uint32_t phase                  : 2;   // [63:62]
+} __attribute__((packed));
+static_assert(sizeof(mbarrier_state_t) == 8, "mbarrier_state_t must be 8 bytes");
+
+// 128 B CUtensorMap-aligned descriptor for cp.async.bulk.tensor (PTX §6.4.10.4).
+// Lives in DRAM constant area; host runtime prepares it.
+struct tensor_map_t {
+  uint64_t global_address;
+  uint64_t box_size[5];
+  uint64_t global_stride[5];
+  uint32_t element_strides[5];
+  uint8_t  element_type;
+  uint8_t  interleave;
+  uint8_t  swizzle;
+  uint8_t  l2_promotion;
+  uint8_t  oob_fill;
+  uint8_t  rank;
+  uint8_t  reserved0[2];
+  uint32_t reserved1[3];
+} __attribute__((packed));
+static_assert(sizeof(tensor_map_t) == 128, "tensor_map_t must be 128 bytes");
+
+// ----- Factories ------------------------------------------------------------
+
+// make_idescriptor — returns the 32-bit packed idesc value to pass as TCU_MMA rs1.
+//   At, Bt: input matrix type tags (fp16, bf16, fp32, fp8, int8 from tensor_cfg.h)
+//   Ct, Dt: accumulator / output type tags are not encoded in idesc.kind.
+//           Use make_operand_block<Ct, Dt>() to carry fmt_c/fmt_d in operand_block_t.
+//   M, N  : tile dimensions (matched to NVIDIA shape_m/shape_n encoding)
+template <typename At, typename Bt, typename Ct = At, typename Dt = Ct>
+inline __attribute__((always_inline)) constexpr uint32_t make_idescriptor(
+    uint16_t M,
+    uint16_t N,
+    bool saturate          = false,
+    bool transpose_a       = false,
+    bool transpose_b       = false,
+    bool output_negate     = false,
+    uint8_t sparsity_kind  = 0,
+    uint8_t sparsity_meta_sel = 0,
+    uint8_t a_storage_layout = 0,
+    uint8_t b_storage_layout = 0) {
+  static_cast<void>(sizeof(Ct));  // suppress unused-template-parameter warning
+  static_cast<void>(sizeof(Dt));
+  uint32_t v = 0;
+  v |= (static_cast<uint32_t>(sparsity_meta_sel) & 0x3u) << 0;
+  v |= (static_cast<uint32_t>(sparsity_kind)     & 0x1u) << 2;
+  v |= (static_cast<uint32_t>(idesc_kind_for<At, Bt>::value) & 0xFu) << 4;
+  v |= (static_cast<uint32_t>(M) & 0xFFu) << 8;
+  v |= (static_cast<uint32_t>(N) & 0xFFu) << 16;
+  v |= (static_cast<uint32_t>(a_storage_layout) & 0x3u) << 24;
+  v |= (static_cast<uint32_t>(b_storage_layout) & 0x3u) << 26;
+  v |= (static_cast<uint32_t>(output_negate ? 1u : 0u))  << 28;
+  v |= (static_cast<uint32_t>(saturate      ? 1u : 0u))  << 29;
+  v |= (static_cast<uint32_t>(transpose_a   ? 1u : 0u))  << 30;
+  v |= (static_cast<uint32_t>(transpose_b   ? 1u : 0u))  << 31;
+  return v;
 }
 
-// 便捷接口: 从 (M, N, K) 推导各操作数 window shape
-//   A = M × K,  B = K × N,  C = D = M × N
-// ws 与 window shape 正交: 任何 shape 都可以 ws=0(非驻留) 或 ws=1(驻留)
-// transpose 已移至 TMA descriptor (数据搬运侧)
-template <typename At, typename Bt, typename Ct, typename Dt = Ct>
-inline __attribute__((always_inline)) constexpr mma_descriptor_t make_mma_descriptor_mnk(
-    uint16_t M, uint16_t N, uint16_t K,
-    uint8_t ws = 0,
-    uint8_t sparse_mode = 0) {
-  return make_mma_descriptor<At, Bt, Ct, Dt>(
-      ws, 0, sparse_mode,
-      M, K,    // A = M × K
-      K, N,    // B = K × N
-      M, N);   // C = M × N
+// make_operand_block — populate a 32B LMEM operand_block_t.
+//   d_taddr   : D matrix TMEM address; callers may also set it via tcu_mma()
+//   a_taddr   : A matrix TMEM address (output of tmem_alloc + offset)
+//   b_sdesc   : 64-bit shared-memory descriptor for B (PTX §9.7.16.2)
+//   lanes_off : cta_group::2 cross-CTA lane offset (single CTA: 0)
+//   Ct, Dt    : accumulator-input and D-output external formats (fp32/fp16/fp8)
+template <typename Ct = fp32, typename Dt = Ct>
+inline __attribute__((always_inline)) constexpr operand_block_t make_operand_block(
+    uint32_t a_taddr,
+    uint64_t b_sdesc,
+    uint16_t lanes_off = 0) {
+  return operand_block_t{
+    0,
+    a_taddr,
+    static_cast<uint32_t>(b_sdesc & 0xffffffffu),
+    static_cast<uint32_t>(b_sdesc >> 32),
+    lanes_off,
+    0,
+    make_operand_fmt_cd<Ct, Dt>(),
+    {0, 0}
+  };
+}
+
+// make_cpabulk_args — populate a 32B LMEM cpabulk_transfer_args_t.
+//   smem_addr : LMEM destination (LD) or source (ST) byte address
+//   mbar_addr : LMEM mbarrier object address (only consumed if qualifier[5]=1)
+//   c0..c4    : tensor coordinates (first `dim_count` are valid; rest 0)
+inline __attribute__((always_inline)) constexpr cpabulk_transfer_args_t make_cpabulk_args(
+    uint32_t smem_addr,
+    uint32_t mbar_addr = 0,
+    int32_t  c0 = 0,
+    int32_t  c1 = 0,
+    int32_t  c2 = 0,
+    int32_t  c3 = 0,
+    int32_t  c4 = 0) {
+  return cpabulk_transfer_args_t{
+    smem_addr,
+    mbar_addr,
+    {c0, c1, c2, c3, c4},
+    0
+  };
 }
 
 inline __attribute__((always_inline)) uint16_t tmem_handle_base(uint32_t handle) {
@@ -149,276 +237,389 @@ inline __attribute__((always_inline)) uint16_t tmem_handle_span(uint32_t handle)
   return (handle >> 8) & 0xff;
 }
 
-static constexpr uint32_t mma_mem_ctl_target_bits = 2;
-static constexpr uint32_t mma_mem_ctl_tile_bits = 16;
-static constexpr uint32_t mma_mem_ctl_slot_bits = 2;
-static constexpr uint32_t mma_mem_ctl_target_shift = 0;
-static constexpr uint32_t mma_mem_ctl_tile_shift = mma_mem_ctl_target_shift + mma_mem_ctl_target_bits;
-static constexpr uint32_t mma_mem_ctl_slot_shift = mma_mem_ctl_tile_shift + mma_mem_ctl_tile_bits;
+// ============================================================================
+// custom-1 (RISCV_CUSTOM1, 0x2B): tcgen05 TMEM management + cp.async.bulk.tensor
+// ============================================================================
+//
+// Encoding: .insn r opcode, funct3, funct7=qualifier, rd, rs1, rs2
+//   funct3=0b001 TMEM_REL_PERMIT
+//   funct3=0b010 TMEM_ALLOC
+//   funct3=0b011 TMEM_DEALLOC
+//   funct3=0b100 TMEM_CP
+//   funct3=0b101 TMEM_SHIFT
+//   funct3=0b110 CPABULK_TENSOR_LD
+//   funct3=0b111 CPABULK_TENSOR_ST
 
-inline __attribute__((always_inline)) constexpr uint32_t mma_mem_ctl_mask(uint32_t bits) {
-  return (bits >= 32) ? 0xffffffffu : ((1u << bits) - 1);
-}
-
-inline __attribute__((always_inline)) constexpr uint32_t encode_tmem_op_control(uint32_t window_id,
-                                                                                 uint32_t desc_id = 0,
-                                                                                 uint32_t flags = 0) {
-  return ((window_id & mma_mem_ctl_mask(tcu_tmem_op_ctl_window_bits)) << tcu_tmem_op_ctl_window_shift)
-       | ((desc_id & mma_mem_ctl_mask(tcu_tmem_op_ctl_desc_bits)) << tcu_tmem_op_ctl_desc_shift)
-       | ((flags & mma_mem_ctl_mask(tcu_tmem_op_ctl_flags_bits)) << tcu_tmem_op_ctl_flags_shift);
-}
-
-// auto-routing: 硬件从 target 自动推导 window (A→0, B→1, C→2, D→3)
-inline __attribute__((always_inline)) constexpr uint32_t encode_mma_mem_control(tcu_target target,
-                                                                                uint32_t slot_id,
-                                                                                uint32_t tile_id) {
-  return ((static_cast<uint32_t>(target) & mma_mem_ctl_mask(mma_mem_ctl_target_bits)) << mma_mem_ctl_target_shift)
-       | ((tile_id & mma_mem_ctl_mask(mma_mem_ctl_tile_bits)) << mma_mem_ctl_tile_shift)
-       | ((slot_id & mma_mem_ctl_mask(mma_mem_ctl_slot_bits)) << mma_mem_ctl_slot_shift);
-}
-
-inline __attribute__((always_inline)) void bind_tmem_payload_region(tma_descriptor_t* desc, uint32_t handle) {
-  desc->tmem_base = tmem_handle_base(handle);
-  desc->bank_span = tmem_handle_span(handle);
-}
-
-inline __attribute__((always_inline)) void bind_tmem_meta_region(tma_descriptor_t* desc, uint32_t handle) {
-  desc->meta_tmem_base = tmem_handle_base(handle);
-  desc->meta_col_span = tmem_handle_span(handle);
-}
-
-inline __attribute__((always_inline)) uint32_t tmem_alloc(uint32_t col_span, uint32_t mma_desc_id) {
+inline __attribute__((always_inline)) uint32_t tmem_alloc(uint32_t col_span, uint32_t reserved_operand) {
   uint32_t handle;
-  __asm__ volatile (".insn r %3, 1, 2, %0, %1, %2"
+  // funct3=0b010, qualifier[0]=cta_group::1
+  __asm__ volatile (".insn r %3, 0x2, 0x0, %0, %1, %2"
     : "=r"(handle)
-    : "r"(col_span), "r"(mma_desc_id), "i"(RISCV_CUSTOM0)
+    : "r"(col_span), "r"(reserved_operand), "i"(RISCV_CUSTOM1)
     : "memory");
   return handle;
 }
 
-// 无 descriptor 绑定的分配 (legacy 路径, desc_id=0)
 inline __attribute__((always_inline)) uint32_t tmem_alloc(uint32_t col_span) {
-  return tmem_alloc(col_span, 0);
+  return tmem_alloc(col_span, tmem_alloc_reserved_operand);
 }
 
-inline __attribute__((always_inline)) void tmem_free(uint32_t handle) {
-  __asm__ volatile (".insn r %1, 2, 2, x0, %0, x0"
+inline __attribute__((always_inline)) void tmem_dealloc(uint32_t handle, uint32_t n_cols = 0) {
+  // funct3=0b011, qualifier[0]=cta_group::1
+  __asm__ volatile (".insn r %2, 0x3, 0x0, x0, %0, %1"
     :
-    : "r"(handle), "i"(RISCV_CUSTOM0)
+    : "r"(handle), "r"(n_cols), "i"(RISCV_CUSTOM1)
     : "memory");
 }
 
 inline __attribute__((always_inline)) void tmem_rel_permit() {
-  __asm__ volatile (".insn r %0, 0, 3, x0, x0, x0"
+  // funct3=0b001, qualifier[0]=cta_group::1
+  __asm__ volatile (".insn r %0, 0x1, 0x0, x0, x0, x0"
     :
-    : "i"(RISCV_CUSTOM0)
+    : "i"(RISCV_CUSTOM1)
     : "memory");
 }
 
-inline __attribute__((always_inline)) uint32_t tma_load_ctl(uint32_t handle, uint32_t control) {
-  uint32_t async_id;
-  __asm__ volatile (".insn r %3, 3, 2, %0, %1, %2"
-    : "=r"(async_id)
-    : "r"(handle), "r"(control), "i"(RISCV_CUSTOM0)
-    : "memory");
-  return async_id;
-}
-
-inline __attribute__((always_inline)) uint32_t tma_load(uint32_t handle, uint32_t desc_id) {
-  return tma_load_ctl(handle, encode_tmem_op_control(0, desc_id));
-}
-
-inline __attribute__((always_inline)) uint32_t tma_load(uint32_t handle, uint32_t desc_id, uint32_t window_id) {
-  return tma_load_ctl(handle, encode_tmem_op_control(window_id, desc_id));
-}
-
-inline __attribute__((always_inline)) uint32_t tma_store_ctl(uint32_t handle, uint32_t control) {
-  uint32_t async_id;
-  __asm__ volatile (".insn r %3, 4, 2, %0, %1, %2"
-    : "=r"(async_id)
-    : "r"(handle), "r"(control), "i"(RISCV_CUSTOM0)
-    : "memory");
-  return async_id;
-}
-
-inline __attribute__((always_inline)) uint32_t tma_store(uint32_t handle, uint32_t desc_id) {
-  return tma_store_ctl(handle, encode_tmem_op_control(0, desc_id));
-}
-
-inline __attribute__((always_inline)) uint32_t tma_store(uint32_t handle, uint32_t desc_id, uint32_t window_id) {
-  return tma_store_ctl(handle, encode_tmem_op_control(window_id, desc_id));
-}
-
-inline __attribute__((always_inline)) void tma_wait(uint32_t async_id) {
-  __asm__ volatile (".insn r %1, 7, 2, x0, %0, x0"
+// tcgen05.cp — shared->TMEM copy.
+template <uint32_t Qualifier>
+inline __attribute__((always_inline)) void tmem_cp_q(uint32_t taddr, uint32_t s_desc) {
+  static_assert(Qualifier < 128, "tcgen05.cp qualifier must fit in funct7");
+  // funct3=0b100, qualifier[0]=cta_group::1, [3:1]=shape, [5:4]=decompress, [6]=multicast
+  __asm__ volatile (".insn r %2, 0x4, %3, x0, %0, %1"
     :
-    : "r"(async_id), "i"(RISCV_CUSTOM0)
+    : "r"(taddr), "r"(s_desc), "i"(RISCV_CUSTOM1), "i"(Qualifier)
     : "memory");
 }
 
-inline __attribute__((always_inline)) uint32_t tc_commit(uint32_t barrier_id) {
-  uint32_t committed;
-  __asm__ volatile (".insn r %2, 1, 3, %0, %1, x0"
-    : "=r"(committed)
-    : "r"(barrier_id), "i"(RISCV_CUSTOM0)
-    : "memory");
-  return committed;
+inline __attribute__((always_inline)) void tmem_cp(uint32_t taddr, uint32_t s_desc) {
+  tmem_cp_q<0>(taddr, s_desc);
 }
 
-inline __attribute__((always_inline)) void tc_fence_before() {
-  __asm__ volatile (".insn r %0, 2, 3, x0, x0, x0"
-    :
-    : "i"(RISCV_CUSTOM0)
-    : "memory");
-}
-
-inline __attribute__((always_inline)) void tc_fence_after() {
-  __asm__ volatile (".insn r %0, 2, 3, x1, x0, x0"
-    :
-    : "i"(RISCV_CUSTOM0)
-    : "memory");
-}
-
-inline __attribute__((always_inline)) void tc_fence() {
-  tc_fence_before();
-}
-
-inline __attribute__((always_inline)) void tc_wait() {
-  __asm__ volatile (".insn r %0, 7, 3, x0, x0, x0"
-    :
-    : "i"(RISCV_CUSTOM0)
-    : "memory");
+template <uint32_t Shape, uint32_t Decompress = 0, bool CtaGroup = false, bool Multicast = false>
+inline __attribute__((always_inline)) void tmem_cp_shape(uint32_t taddr, uint32_t s_desc) {
+  static_assert(Shape < 8, "tcgen05.cp shape must fit in qualifier[3:1]");
+  static_assert(Decompress < 4, "tcgen05.cp decompress must fit in qualifier[5:4]");
+  constexpr uint32_t qualifier = (CtaGroup ? 1u : 0u)
+                               | ((Shape & 0x7u) << 1)
+                               | ((Decompress & 0x3u) << 4)
+                               | (Multicast ? (1u << 6) : 0u);
+  tmem_cp_q<qualifier>(taddr, s_desc);
 }
 
 inline __attribute__((always_inline)) uint32_t tmem_shift_ctl(uint32_t handle, uint32_t control) {
   uint32_t async_id;
-  __asm__ volatile (".insn r %3, 3, 3, %0, %1, %2"
+  // funct3=0b101 in custom-1
+  __asm__ volatile (".insn r %3, 0x5, 0x0, %0, %1, %2"
     : "=r"(async_id)
-    : "r"(handle), "r"(control), "i"(RISCV_CUSTOM0)
+    : "r"(handle), "r"(control), "i"(RISCV_CUSTOM1)
     : "memory");
   return async_id;
 }
 
 inline __attribute__((always_inline)) uint32_t tmem_shift(uint32_t handle) {
-  return tmem_shift_ctl(handle, encode_tmem_op_control(0));
+  return tmem_shift_ctl(handle, 0);
 }
 
-inline __attribute__((always_inline)) uint32_t tmem_shift(uint32_t handle, uint32_t window_id) {
-  return tmem_shift_ctl(handle, encode_tmem_op_control(window_id));
+// cp.async.bulk.tensor — DRAM -> shared.
+inline __attribute__((always_inline)) uint32_t cpabulk_tensor_ld(uint32_t tensor_map_handle, uint32_t coords_ctl) {
+  uint32_t async_id;
+  // funct3=0b110, qualifier[2:0]=dim_count-1, [3]=im2col/tile, [4]=multicast, [5]=mbar_complete_tx
+  __asm__ volatile (".insn r %3, 0x6, 0x0, %0, %1, %2"
+    : "=r"(async_id)
+    : "r"(tensor_map_handle), "r"(coords_ctl), "i"(RISCV_CUSTOM1)
+    : "memory");
+  return async_id;
 }
 
-inline __attribute__((always_inline)) uint32_t tmem_shift_refill(uint32_t handle, uint32_t refill_desc_id) {
-  return tmem_shift_ctl(handle, encode_tmem_op_control(0, refill_desc_id, tcu_tmem_op_flag_refill));
+// cp.async.bulk.tensor.mbarrier::complete_tx::bytes variant.
+// qualifier[5]=1 wires the cpabulk completion to mbarrier_complete_tx via the
+// args.mbar_addr field of cpabulk_transfer_args_t. Use this with the typed
+// overload (rs2 in LMEM range) to drive Phase-3.2 GAP-2.
+inline __attribute__((always_inline)) uint32_t cpabulk_tensor_ld_complete_tx(uint32_t tensor_map_handle, uint32_t args_lmem_ptr) {
+  uint32_t async_id;
+  // funct7 = 0x20 = bit 5 set
+  __asm__ volatile (".insn r %3, 0x6, 0x20, %0, %1, %2"
+    : "=r"(async_id)
+    : "r"(tensor_map_handle), "r"(args_lmem_ptr), "i"(RISCV_CUSTOM1)
+    : "memory");
+  return async_id;
 }
 
-inline __attribute__((always_inline)) uint32_t tmem_shift_refill(uint32_t handle, uint32_t window_id, uint32_t refill_desc_id) {
-  return tmem_shift_ctl(handle, encode_tmem_op_control(window_id, refill_desc_id, tcu_tmem_op_flag_refill));
+// cp.async.bulk.tensor — shared -> DRAM.
+inline __attribute__((always_inline)) uint32_t cpabulk_tensor_st(uint32_t tensor_map_handle, uint32_t coords_ctl) {
+  uint32_t async_id;
+  __asm__ volatile (".insn r %3, 0x7, 0x0, %0, %1, %2"
+    : "=r"(async_id)
+    : "r"(tensor_map_handle), "r"(coords_ctl), "i"(RISCV_CUSTOM1)
+    : "memory");
+  return async_id;
+}
+
+// ============================================================================
+// custom-2 (RISCV_CUSTOM2, 0x5B): tcgen05 sync + full mbarrier
+// ============================================================================
+//
+// Encoding: .insn r opcode, funct3, funct7=qualifier, rd, rs1, rs2
+//   funct3=0b000 MBAR_FENCE
+//   funct3=0b001 MBAR_COMMIT
+//   funct3=0b010 MBAR_INIT / INVALIDATE
+//   funct3=0b011 MBAR_ARRIVE
+//   funct3=0b100 MBAR_EXPECT_TX
+//   funct3=0b101 MBAR_COMPLETE_TX
+//   funct3=0b110 MBAR_WAIT
+//   funct3=0b111 MBAR_TEST_TRY_WAIT
+
+inline __attribute__((always_inline)) void mbar_fence_before() {
+  // funct3=0b000, qualifier[0]=0 (before_thread_sync)
+  __asm__ volatile (".insn r %0, 0x0, 0x0, x0, x0, x0"
+    :
+    : "i"(RISCV_CUSTOM2)
+    : "memory");
+}
+
+inline __attribute__((always_inline)) void mbar_fence_after() {
+  // funct3=0b000, qualifier[0]=1 (after_thread_sync)
+  __asm__ volatile (".insn r %0, 0x0, 0x1, x0, x0, x0"
+    :
+    : "i"(RISCV_CUSTOM2)
+    : "memory");
+}
+
+inline __attribute__((always_inline)) uint32_t mbar_commit(uint32_t barrier_id, uint32_t cta_mask = 0) {
+  uint32_t committed;
+  __asm__ volatile (".insn r %2, 0x1, 0x0, %0, %1, %3"
+    : "=r"(committed)
+    : "r"(barrier_id), "i"(RISCV_CUSTOM2), "r"(cta_mask)
+    : "memory");
+  return committed;
 }
 
 inline __attribute__((always_inline)) void mbarrier_init(uint32_t barrier_id, uint32_t count) {
-  __asm__ volatile (".insn r %2, 4, 3, x0, %0, %1"
+  // funct3=0b010, qualifier[0]=0 (init), [1]=cluster_scope=0
+  __asm__ volatile (".insn r %2, 0x2, 0x0, x0, %0, %1"
     :
-    : "r"(barrier_id), "r"(count), "i"(RISCV_CUSTOM0)
+    : "r"(barrier_id), "r"(count), "i"(RISCV_CUSTOM2)
+    : "memory");
+}
+
+inline __attribute__((always_inline)) void mbarrier_invalidate(uint32_t barrier_id) {
+  // funct3=0b010, qualifier[0]=1 (invalidate)
+  __asm__ volatile (".insn r %1, 0x2, 0x1, x0, %0, x0"
+    :
+    : "r"(barrier_id), "i"(RISCV_CUSTOM2)
     : "memory");
 }
 
 inline __attribute__((always_inline)) void mbarrier_arrive(uint32_t barrier_id) {
-  __asm__ volatile (".insn r %1, 5, 3, x0, %0, x0"
+  // funct3=0b011, qualifier[3:0]=0
+  __asm__ volatile (".insn r %1, 0x3, 0x0, x0, %0, x0"
     :
-    : "r"(barrier_id), "i"(RISCV_CUSTOM0)
+    : "r"(barrier_id), "i"(RISCV_CUSTOM2)
     : "memory");
 }
 
-inline __attribute__((always_inline)) void mbarrier_wait(uint32_t barrier_id) {
-  __asm__ volatile (".insn r %1, 6, 3, x0, %0, x0"
+inline __attribute__((always_inline)) uint32_t mbarrier_arrive_token(uint32_t barrier_id) {
+  uint32_t phase_token;
+  // funct3=0b011, qualifier[3:0]=0; rd receives the observed phase token.
+  __asm__ volatile (".insn r %2, 0x3, 0x0, %0, %1, x0"
+    : "=r"(phase_token)
+    : "r"(barrier_id), "i"(RISCV_CUSTOM2)
+    : "memory");
+  return phase_token;
+}
+
+inline __attribute__((always_inline)) void mbarrier_arrive_drop(uint32_t barrier_id) {
+  // funct3=0b011, qualifier[1]=arrive_drop
+  __asm__ volatile (".insn r %1, 0x3, 0x2, x0, %0, x0"
     :
-    : "r"(barrier_id), "i"(RISCV_CUSTOM0)
+    : "r"(barrier_id), "i"(RISCV_CUSTOM2)
     : "memory");
 }
 
-template <uint32_t DescId>
-inline __attribute__((always_inline)) void mma_load_mem(uint32_t handle,
-                                                        uint32_t control) {
-  static_assert(DescId < max_static_descriptor_id, "desc_id must fit in the encoded desc_id field");
-  __asm__ volatile (".insn r %[insn], 5, 4, x%[desc_id], %[handle], %[control]"
+inline __attribute__((always_inline)) void mbarrier_arrive_expect_tx(uint32_t barrier_id, uint32_t tx_count) {
+  // funct3=0b011, qualifier[3]=expect_tx_combo
+  __asm__ volatile (".insn r %2, 0x3, 0x8, x0, %0, %1"
     :
-    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle), [control]"r"(control)
+    : "r"(barrier_id), "r"(tx_count), "i"(RISCV_CUSTOM2)
     : "memory");
 }
 
-// auto-routing: 无需 window_id, 硬件从 target 推导
-template <uint32_t DescId>
-inline __attribute__((always_inline)) void mma_load_a_slot(uint32_t handle,
-                                                           uint32_t tile_id,
-                                                           uint32_t slot_id) {
-  if (slot_id >= max_operand_slots) {
-    __builtin_trap();
-  }
-  auto control = encode_mma_mem_control(tcu_target_a, slot_id, tile_id);
-  mma_load_mem<DescId>(handle, control);
-}
-
-template <uint32_t DescId>
-inline __attribute__((always_inline)) void mma_load_b_slot(uint32_t handle,
-                                                           uint32_t tile_id,
-                                                           uint32_t slot_id) {
-  if (slot_id >= max_operand_slots) {
-    __builtin_trap();
-  }
-  auto control = encode_mma_mem_control(tcu_target_b, slot_id, tile_id);
-  mma_load_mem<DescId>(handle, control);
-}
-
-template <uint32_t DescId>
-inline __attribute__((always_inline)) void mma_load_c_slot(uint32_t handle,
-                                                           uint32_t tile_id,
-                                                           uint32_t slot_id) {
-  if (slot_id >= max_operand_slots) {
-    __builtin_trap();
-  }
-  auto control = encode_mma_mem_control(tcu_target_c, slot_id, tile_id);
-  mma_load_mem<DescId>(handle, control);
-}
-
-template <uint32_t DescId>
-inline __attribute__((always_inline)) void mma_store_mem(uint32_t handle,
-                                                         uint32_t control) {
-  static_assert(DescId < max_static_descriptor_id, "desc_id must fit in the encoded desc_id field");
-  __asm__ volatile (".insn r %[insn], 6, 4, x%[desc_id], %[handle], %[control]"
+inline __attribute__((always_inline)) void mbarrier_expect_tx(uint32_t barrier_id, uint32_t tx_count) {
+  // funct3=0b100
+  __asm__ volatile (".insn r %2, 0x4, 0x0, x0, %0, %1"
     :
-    : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [handle]"r"(handle), [control]"r"(control)
+    : "r"(barrier_id), "r"(tx_count), "i"(RISCV_CUSTOM2)
     : "memory");
 }
 
-// store 写入 D window (auto-route: target_c → D window)
-template <uint32_t DescId>
-inline __attribute__((always_inline)) void mma_store_c_slot(uint32_t handle,
-                                                            uint32_t tile_id,
-                                                            uint32_t slot_id) {
-  if (slot_id >= max_operand_slots) {
-    __builtin_trap();
-  }
-  auto control = encode_mma_mem_control(tcu_target_c, slot_id, tile_id);
-  mma_store_mem<DescId>(handle, control);
+inline __attribute__((always_inline)) void mbarrier_complete_tx(uint32_t barrier_id, uint32_t tx_count) {
+  // funct3=0b101
+  __asm__ volatile (".insn r %2, 0x5, 0x0, x0, %0, %1"
+    :
+    : "r"(barrier_id), "r"(tx_count), "i"(RISCV_CUSTOM2)
+    : "memory");
 }
 
-// 4 参数重载: window_id 被硬件忽略 (auto-routing), 保留供现有测试编译
-template <uint32_t DescId>
-inline __attribute__((always_inline)) void mma_load_a_slot(uint32_t handle, uint32_t /*window_id*/, uint32_t tile_id, uint32_t slot_id) {
-  mma_load_a_slot<DescId>(handle, tile_id, slot_id);
+inline __attribute__((always_inline)) void mbarrier_wait(uint32_t barrier_id, uint32_t phase_token = 0) {
+  // funct3=0b110 (blocking, no timeout)
+  __asm__ volatile (".insn r %2, 0x6, 0x0, x0, %0, %1"
+    :
+    : "r"(barrier_id), "r"(phase_token), "i"(RISCV_CUSTOM2)
+    : "memory");
 }
-template <uint32_t DescId>
-inline __attribute__((always_inline)) void mma_load_b_slot(uint32_t handle, uint32_t /*window_id*/, uint32_t tile_id, uint32_t slot_id) {
-  mma_load_b_slot<DescId>(handle, tile_id, slot_id);
+
+inline __attribute__((always_inline)) uint32_t mbarrier_test_wait(uint32_t barrier_id, uint32_t phase_token = 0) {
+  uint32_t status;
+  // funct3=0b111, qualifier[0]=0 (test_wait, non-blocking)
+  __asm__ volatile (".insn r %3, 0x7, 0x0, %0, %1, %2"
+    : "=r"(status)
+    : "r"(barrier_id), "r"(phase_token), "i"(RISCV_CUSTOM2)
+    : "memory");
+  return status;
 }
-template <uint32_t DescId>
-inline __attribute__((always_inline)) void mma_load_c_slot(uint32_t handle, uint32_t /*window_id*/, uint32_t tile_id, uint32_t slot_id) {
-  mma_load_c_slot<DescId>(handle, tile_id, slot_id);
+
+inline __attribute__((always_inline)) uint32_t mbarrier_try_wait(uint32_t barrier_id,
+                                                                  uint32_t phase_token = 0,
+                                                                  uint32_t timeout_bucket = 0) {
+  uint32_t status;
+  // funct3=0b111, qualifier[0]=1 (try_wait), [6:2]=timeout_bucket
+  // GAS requires literal funct7; use a switch over common buckets.
+  if (timeout_bucket == 0) {
+    __asm__ volatile (".insn r %3, 0x7, 0x1, %0, %1, %2"
+      : "=r"(status)
+      : "r"(barrier_id), "r"(phase_token), "i"(RISCV_CUSTOM2)
+      : "memory");
+  } else {
+    // Approximate: bake the LSB only; broader buckets need template/codegen.
+    __asm__ volatile (".insn r %3, 0x7, 0x5, %0, %1, %2"
+      : "=r"(status)
+      : "r"(barrier_id), "r"(phase_token), "i"(RISCV_CUSTOM2)
+      : "memory");
+  }
+  return status;
 }
-template <uint32_t DescId>
-inline __attribute__((always_inline)) void mma_store_c_slot(uint32_t handle, uint32_t /*window_id*/, uint32_t tile_id, uint32_t slot_id) {
-  mma_store_c_slot<DescId>(handle, tile_id, slot_id);
+
+// ============================================================================
+// custom-3 (RISCV_CUSTOM3, 0x7B): tcgen05 compute family
+// ============================================================================
+//
+// Encoding: .insn r opcode, funct3, funct7=qualifier, rd, rs1, rs2
+//   funct3=0b000 TCU_MMA
+//   funct3=0b001 TCU_LD
+//   funct3=0b010 TCU_ST
+//   funct3=0b011 TCU_WAIT_LD
+//   funct3=0b100 TCU_WAIT_ST
+//
+// TCU_MMA compact qualifier:
+//   funct7[0]   enable-input-d
+//   funct7[1]   .ws
+//   funct7[2]   .sp
+//   funct7[3]   .cta_group::2
+//   funct7[5:4] collector_a_state: fill/use/lastuse/discard
+//   funct7[6]   .multicast::cluster
+
+template <uint32_t Qualifier>
+inline __attribute__((always_inline)) void tcu_mma_q(uint32_t d_taddr,
+                                                     uint32_t idesc,
+                                                     uint32_t op_block_ptr) {
+  static_assert(Qualifier < 128, "TCU_MMA qualifier must fit in funct7");
+  reinterpret_cast<operand_block_t*>(op_block_ptr)->d_taddr = d_taddr;
+  // rd is x0; rs1 carries idesc, rs2 points at operand_block_t.
+  __asm__ volatile (".insn r %2, 0x0, %3, x0, %0, %1"
+    :
+    : "r"(idesc), "r"(op_block_ptr), "i"(RISCV_CUSTOM3), "i"(Qualifier)
+    : "memory");
 }
+
+inline __attribute__((always_inline)) void tcu_mma(uint32_t d_taddr, uint32_t idesc, uint32_t op_block_ptr) {
+  // enable-input-d=1, dense non-ws.
+  tcu_mma_q<0x1>(d_taddr, idesc, op_block_ptr);
+}
+
+inline __attribute__((always_inline)) void tcu_mma_no_accum(uint32_t d_taddr, uint32_t idesc, uint32_t op_block_ptr) {
+  // enable-input-d=0, dense non-ws.
+  tcu_mma_q<0x0>(d_taddr, idesc, op_block_ptr);
+}
+
+// Typed convenience overload: pass a built idesc + pointer to operand_block_t.
+// Phase-2 PTX-aligned form. enable_input_d defaults to 1 (D = A*B + D).
+inline __attribute__((always_inline)) void tcu_mma(uint32_t d_taddr,
+                                                    uint32_t idesc,
+                                                    const operand_block_t* op_block) {
+  tcu_mma(d_taddr, idesc, reinterpret_cast<uint32_t>(op_block));
+}
+
+inline __attribute__((always_inline)) void tcu_mma_no_accum(uint32_t d_taddr,
+                                                             uint32_t idesc,
+                                                             const operand_block_t* op_block) {
+  tcu_mma_no_accum(d_taddr, idesc, reinterpret_cast<uint32_t>(op_block));
+}
+
+// cpabulk_tensor_ld typed overload: takes tensor_map address and args pointer.
+inline __attribute__((always_inline)) uint32_t cpabulk_tensor_ld(const tensor_map_t* tmap,
+                                                                  const cpabulk_transfer_args_t* args) {
+  return cpabulk_tensor_ld(reinterpret_cast<uint32_t>(tmap),
+                           reinterpret_cast<uint32_t>(args));
+}
+
+inline __attribute__((always_inline)) uint32_t cpabulk_tensor_st(const tensor_map_t* tmap,
+                                                                  const cpabulk_transfer_args_t* args) {
+  return cpabulk_tensor_st(reinterpret_cast<uint32_t>(tmap),
+                           reinterpret_cast<uint32_t>(args));
+}
+
+// tmem_cp typed overload: rs2 = LMEM ptr to 64-bit s_desc storage.
+inline __attribute__((always_inline)) void tmem_cp(uint32_t taddr,
+                                                    const uint64_t* s_desc_ptr) {
+  tmem_cp(taddr, reinterpret_cast<uint32_t>(s_desc_ptr));
+}
+
+template <uint32_t Shape, uint32_t Decompress = 0, bool CtaGroup = false, bool Multicast = false>
+inline __attribute__((always_inline)) void tmem_cp_shape(uint32_t taddr,
+                                                          const uint64_t* s_desc_ptr) {
+  tmem_cp_shape<Shape, Decompress, CtaGroup, Multicast>(
+      taddr, reinterpret_cast<uint32_t>(s_desc_ptr));
+}
+
+inline __attribute__((always_inline)) uint32_t tcu_ld(uint32_t taddr) {
+  uint32_t data;
+  __asm__ volatile (".insn r %2, 0x1, 0x0, %0, %1, x0"
+    : "=r"(data)
+    : "r"(taddr), "i"(RISCV_CUSTOM3)
+    : "memory");
+  return data;
+}
+
+inline __attribute__((always_inline)) void tcu_st(uint32_t taddr, uint32_t value) {
+  __asm__ volatile (".insn r %2, 0x2, 0x0, x0, %0, %1"
+    :
+    : "r"(taddr), "r"(value), "i"(RISCV_CUSTOM3)
+    : "memory");
+}
+
+inline __attribute__((always_inline)) void tcu_wait_ld() {
+  __asm__ volatile (".insn r %0, 0x3, 0x0, x0, x0, x0"
+    :
+    : "i"(RISCV_CUSTOM3)
+    : "memory");
+}
+
+inline __attribute__((always_inline)) void tcu_wait_st() {
+  __asm__ volatile (".insn r %0, 0x4, 0x0, x0, x0, x0"
+    :
+    : "i"(RISCV_CUSTOM3)
+    : "memory");
+}
+
+// NOTE: The following intrinsics from the previous Vortex ISA have been
+// REMOVED in this revision:
+//   mma_load_mem / mma_load_a_slot / mma_load_b_slot / mma_load_c_slot
+//   mma_store_mem / mma_store_c_slot
+//   tma_load / tma_load_ctl / tma_store / tma_store_ctl / tma_wait
+//   tc_set_desc / tc_commit_scope / mma_sync (both fragment-based variants)
+// These were Vortex-private macros not present in NVIDIA tcgen05 PTX. The
+// new ISA exposes only TCU_MMA (custom-3.000) which internally fans out
+// the equivalent fill-then-compute-then-drain microarchitecture.
 
 namespace detail {
 
@@ -756,294 +957,6 @@ public:
           *ptr = *reinterpret_cast<const output_t*>(&tmp);
         }
       });
-    }
-  }
-
-  template <typename FragD, typename FragA, typename FragB, typename FragC>
-  static __attribute__((always_inline)) void mma_sync(FragD &fragD, const FragA &fragA, const FragB &fragB, const FragC &fragC) {
-    static_assert(FragA::Use == matrix_a, "A must be matrix_a");
-    static_assert(FragB::Use == matrix_b, "B must be matrix_b");
-    static_assert(FragC::Use == accumulator, "C must be accumulator");
-    static_assert(FragD::Use == accumulator, "D must be accumulator");
-
-    // fragA: caller-saved registers (f0-f7)
-    register float fa0 __asm__("f0")  = fragA.data[0];
-    register float fa1 __asm__("f1")  = fragA.data[1];
-    register float fa2 __asm__("f2")  = fragA.data[2];
-    register float fa3 __asm__("f3")  = fragA.data[3];
-    register float fa4 __asm__("f4")  = fragA.data[4];
-    register float fa5 __asm__("f5")  = fragA.data[5];
-    register float fa6 __asm__("f6")  = fragA.data[6];
-    register float fa7 __asm__("f7")  = fragA.data[7];
-
-    if constexpr (FragB::NR == 8) {
-      // fragB: caller-saved registers (f10-f17)
-      register float fb0 __asm__("f10") = fragB.data[0];
-      register float fb1 __asm__("f11") = fragB.data[1];
-      register float fb2 __asm__("f12") = fragB.data[2];
-      register float fb3 __asm__("f13") = fragB.data[3];
-      register float fb4 __asm__("f14") = fragB.data[4];
-      register float fb5 __asm__("f15") = fragB.data[5];
-      register float fb6 __asm__("f16") = fragB.data[6];
-      register float fb7 __asm__("f17") = fragB.data[7];
-
-      // fragC: mix of caller-saved (f28-f31) and callee-saved (f18-f21)
-      float c0 = (FragC::NR > 0) ? fragC.data[0] : 0.0f;
-      float c1 = (FragC::NR > 1) ? fragC.data[1] : 0.0f;
-      float c2 = (FragC::NR > 2) ? fragC.data[2] : 0.0f;
-      float c3 = (FragC::NR > 3) ? fragC.data[3] : 0.0f;
-      float c4 = (FragC::NR > 4) ? fragC.data[4] : 0.0f;
-      float c5 = (FragC::NR > 5) ? fragC.data[5] : 0.0f;
-      float c6 = (FragC::NR > 6) ? fragC.data[6] : 0.0f;
-      float c7 = (FragC::NR > 7) ? fragC.data[7] : 0.0f;
-      register float fc0 __asm__("f24") = c0;
-      register float fc1 __asm__("f25") = c1;
-      register float fc2 __asm__("f26") = c2;
-      register float fc3 __asm__("f27") = c3;
-      register float fc4 __asm__("f28") = c4;
-      register float fc5 __asm__("f29") = c5;
-      register float fc6 __asm__("f30") = c6;
-      register float fc7 __asm__("f31") = c7;
-
-      // Force outputs into accumulator registers
-      register float fd0 __asm__("f24");
-      register float fd1 __asm__("f25");
-      register float fd2 __asm__("f26");
-      register float fd3 __asm__("f27");
-      register float fd4 __asm__("f28");
-      register float fd5 __asm__("f29");
-      register float fd6 __asm__("f30");
-      register float fd7 __asm__("f31");
-
-      __asm__ volatile (".insn r %[insn], 0, 2, x%[fmd], x%[fma], x%[fmb]"
-        : "=f"(fd0), "=f"(fd1), "=f"(fd2), "=f"(fd3), "=f"(fd4), "=f"(fd5), "=f"(fd6), "=f"(fd7)
-        : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Ot::id), [fma]"i"(At::id), [fmb]"i"(Bt::id),
-          "f"(fa0), "f"(fa1), "f"(fa2), "f"(fa3), "f"(fa4), "f"(fa5), "f"(fa6), "f"(fa7),
-          "f"(fb0), "f"(fb1), "f"(fb2), "f"(fb3), "f"(fb4), "f"(fb5), "f"(fb6), "f"(fb7),
-          "f"(fc0), "f"(fc1), "f"(fc2), "f"(fc3), "f"(fc4), "f"(fc5), "f"(fc6), "f"(fc7)
-      );
-
-      // Write results to fragD
-      if constexpr (FragD::NR == 8) {
-        fragD.data = {fd0, fd1, fd2, fd3, fd4, fd5, fd6, fd7};
-      } else {
-        static_assert(FragD::NR == 4, "Unsupported accumulator register count");
-        fragD.data = {fd0, fd1, fd2, fd3};
-      }
-    } else {
-      static_assert(FragB::NR == 4, "Unsupported number of registers for FragB");
-      // fragB: caller-saved registers (f28-f31)
-      register float fb0 __asm__("f28") = fragB.data[0];
-      register float fb1 __asm__("f29") = fragB.data[1];
-      register float fb2 __asm__("f30") = fragB.data[2];
-      register float fb3 __asm__("f31") = fragB.data[3];
-
-      // fragC: mix of caller-saved (f10-f17)
-      float c0 = (FragC::NR > 0) ? fragC.data[0] : 0.0f;
-      float c1 = (FragC::NR > 1) ? fragC.data[1] : 0.0f;
-      float c2 = (FragC::NR > 2) ? fragC.data[2] : 0.0f;
-      float c3 = (FragC::NR > 3) ? fragC.data[3] : 0.0f;
-      float c4 = (FragC::NR > 4) ? fragC.data[4] : 0.0f;
-      float c5 = (FragC::NR > 5) ? fragC.data[5] : 0.0f;
-      float c6 = (FragC::NR > 6) ? fragC.data[6] : 0.0f;
-      float c7 = (FragC::NR > 7) ? fragC.data[7] : 0.0f;
-      register float fc0 __asm__("f10") = c0;
-      register float fc1 __asm__("f11") = c1;
-      register float fc2 __asm__("f12") = c2;
-      register float fc3 __asm__("f13") = c3;
-      register float fc4 __asm__("f14") = c4;
-      register float fc5 __asm__("f15") = c5;
-      register float fc6 __asm__("f16") = c6;
-      register float fc7 __asm__("f17") = c7;
-
-      // Force outputs into accumulator registers
-      register float fd0 __asm__("f10");
-      register float fd1 __asm__("f11");
-      register float fd2 __asm__("f12");
-      register float fd3 __asm__("f13");
-      register float fd4 __asm__("f14");
-      register float fd5 __asm__("f15");
-      register float fd6 __asm__("f16");
-      register float fd7 __asm__("f17");
-
-      __asm__ volatile (".insn r %[insn], 0, 2, x%[fmd], x%[fma], x%[fmb]"
-        : "=f"(fd0), "=f"(fd1), "=f"(fd2), "=f"(fd3), "=f"(fd4), "=f"(fd5), "=f"(fd6), "=f"(fd7)
-        : [insn]"i"(RISCV_CUSTOM0), [fmd]"i"(Ot::id), [fma]"i"(At::id), [fmb]"i"(Bt::id),
-          "f"(fa0), "f"(fa1), "f"(fa2), "f"(fa3), "f"(fa4), "f"(fa5), "f"(fa6), "f"(fa7),
-          "f"(fb0), "f"(fb1), "f"(fb2), "f"(fb3),
-          "f"(fc0), "f"(fc1), "f"(fc2), "f"(fc3), "f"(fc4), "f"(fc5), "f"(fc6), "f"(fc7)
-      );
-
-      // Write results to fragD
-      if constexpr (FragD::NR == 8) {
-        fragD.data = {fd0, fd1, fd2, fd3, fd4, fd5, fd6, fd7};
-      } else {
-        static_assert(FragD::NR == 4, "Unsupported accumulator register count");
-        fragD.data = {fd0, fd1, fd2, fd3};
-      }
-    }
-  }
-
-  template <uint32_t DescId,
-            uint32_t ASlotId = 0,
-            uint32_t BSlotId = ASlotId,
-            uint32_t CSlotId = ASlotId,
-            typename FragD,
-            typename FragA,
-            typename FragB,
-            typename FragC>
-  static __attribute__((always_inline)) void mma_sync(FragD &fragD, const FragA &fragA, const FragB &fragB, const FragC &fragC) {
-    static_assert(DescId < max_static_descriptor_id, "desc_id must fit in the encoded desc_id field");
-    static_assert(ASlotId < max_operand_slots, "a_slot_id out of range");
-    static_assert(BSlotId < max_operand_slots, "b_slot_id out of range");
-    static_assert(CSlotId < max_operand_slots, "c_slot_id out of range");
-    static_assert(FragA::Use == matrix_a, "A must be matrix_a");
-    static_assert(FragB::Use == matrix_b, "B must be matrix_b");
-    static_assert(FragC::Use == accumulator, "C must be accumulator");
-    static_assert(FragD::Use == accumulator, "D must be accumulator");
-
-    constexpr uint32_t AbSlotCtl = encode_wmma_slot_control(ASlotId, BSlotId);
-
-    register float fa0 __asm__("f0")  = fragA.data[0];
-    register float fa1 __asm__("f1")  = fragA.data[1];
-    register float fa2 __asm__("f2")  = fragA.data[2];
-    register float fa3 __asm__("f3")  = fragA.data[3];
-    register float fa4 __asm__("f4")  = fragA.data[4];
-    register float fa5 __asm__("f5")  = fragA.data[5];
-    register float fa6 __asm__("f6")  = fragA.data[6];
-    register float fa7 __asm__("f7")  = fragA.data[7];
-
-    if constexpr (FragB::NR == 8) {
-      register float fb0 __asm__("f10") = fragB.data[0];
-      register float fb1 __asm__("f11") = fragB.data[1];
-      register float fb2 __asm__("f12") = fragB.data[2];
-      register float fb3 __asm__("f13") = fragB.data[3];
-      register float fb4 __asm__("f14") = fragB.data[4];
-      register float fb5 __asm__("f15") = fragB.data[5];
-      register float fb6 __asm__("f16") = fragB.data[6];
-      register float fb7 __asm__("f17") = fragB.data[7];
-
-      float c0 = (FragC::NR > 0) ? fragC.data[0] : 0.0f;
-      float c1 = (FragC::NR > 1) ? fragC.data[1] : 0.0f;
-      float c2 = (FragC::NR > 2) ? fragC.data[2] : 0.0f;
-      float c3 = (FragC::NR > 3) ? fragC.data[3] : 0.0f;
-      float c4 = (FragC::NR > 4) ? fragC.data[4] : 0.0f;
-      float c5 = (FragC::NR > 5) ? fragC.data[5] : 0.0f;
-      float c6 = (FragC::NR > 6) ? fragC.data[6] : 0.0f;
-      float c7 = (FragC::NR > 7) ? fragC.data[7] : 0.0f;
-      register float fc0 __asm__("f24") = c0;
-      register float fc1 __asm__("f25") = c1;
-      register float fc2 __asm__("f26") = c2;
-      register float fc3 __asm__("f27") = c3;
-      register float fc4 __asm__("f28") = c4;
-      register float fc5 __asm__("f29") = c5;
-      register float fc6 __asm__("f30") = c6;
-      register float fc7 __asm__("f31") = c7;
-
-      register float fd0 __asm__("f24");
-      register float fd1 __asm__("f25");
-      register float fd2 __asm__("f26");
-      register float fd3 __asm__("f27");
-      register float fd4 __asm__("f28");
-      register float fd5 __asm__("f29");
-      register float fd6 __asm__("f30");
-      register float fd7 __asm__("f31");
-
-      __asm__ volatile (".insn r %[insn], 0, 4, x%[desc_id], x%[ab_slot_ctl], x%[c_slot_id]"
-        : "=f"(fd0), "=f"(fd1), "=f"(fd2), "=f"(fd3), "=f"(fd4), "=f"(fd5), "=f"(fd6), "=f"(fd7)
-        : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [ab_slot_ctl]"i"(AbSlotCtl), [c_slot_id]"i"(CSlotId),
-          "f"(fa0), "f"(fa1), "f"(fa2), "f"(fa3), "f"(fa4), "f"(fa5), "f"(fa6), "f"(fa7),
-          "f"(fb0), "f"(fb1), "f"(fb2), "f"(fb3), "f"(fb4), "f"(fb5), "f"(fb6), "f"(fb7),
-          "f"(fc0), "f"(fc1), "f"(fc2), "f"(fc3), "f"(fc4), "f"(fc5), "f"(fc6), "f"(fc7)
-      );
-
-      if constexpr (FragD::NR == 8) {
-        fragD.data = {fd0, fd1, fd2, fd3, fd4, fd5, fd6, fd7};
-      } else {
-        static_assert(FragD::NR == 4, "Unsupported accumulator register count");
-        fragD.data = {fd0, fd1, fd2, fd3};
-      }
-    } else {
-      static_assert(FragB::NR == 4, "Unsupported number of registers for FragB");
-      register float fb0 __asm__("f28") = fragB.data[0];
-      register float fb1 __asm__("f29") = fragB.data[1];
-      register float fb2 __asm__("f30") = fragB.data[2];
-      register float fb3 __asm__("f31") = fragB.data[3];
-
-      float c0 = (FragC::NR > 0) ? fragC.data[0] : 0.0f;
-      float c1 = (FragC::NR > 1) ? fragC.data[1] : 0.0f;
-      float c2 = (FragC::NR > 2) ? fragC.data[2] : 0.0f;
-      float c3 = (FragC::NR > 3) ? fragC.data[3] : 0.0f;
-      float c4 = (FragC::NR > 4) ? fragC.data[4] : 0.0f;
-      float c5 = (FragC::NR > 5) ? fragC.data[5] : 0.0f;
-      float c6 = (FragC::NR > 6) ? fragC.data[6] : 0.0f;
-      float c7 = (FragC::NR > 7) ? fragC.data[7] : 0.0f;
-      register float fc0 __asm__("f10") = c0;
-      register float fc1 __asm__("f11") = c1;
-      register float fc2 __asm__("f12") = c2;
-      register float fc3 __asm__("f13") = c3;
-      register float fc4 __asm__("f14") = c4;
-      register float fc5 __asm__("f15") = c5;
-      register float fc6 __asm__("f16") = c6;
-      register float fc7 __asm__("f17") = c7;
-
-      register float fd0 __asm__("f10");
-      register float fd1 __asm__("f11");
-      register float fd2 __asm__("f12");
-      register float fd3 __asm__("f13");
-      register float fd4 __asm__("f14");
-      register float fd5 __asm__("f15");
-      register float fd6 __asm__("f16");
-      register float fd7 __asm__("f17");
-
-      __asm__ volatile (".insn r %[insn], 0, 4, x%[desc_id], x%[ab_slot_ctl], x%[c_slot_id]"
-        : "=f"(fd0), "=f"(fd1), "=f"(fd2), "=f"(fd3), "=f"(fd4), "=f"(fd5), "=f"(fd6), "=f"(fd7)
-        : [insn]"i"(RISCV_CUSTOM0), [desc_id]"i"(DescId), [ab_slot_ctl]"i"(AbSlotCtl), [c_slot_id]"i"(CSlotId),
-          "f"(fa0), "f"(fa1), "f"(fa2), "f"(fa3), "f"(fa4), "f"(fa5), "f"(fa6), "f"(fa7),
-          "f"(fb0), "f"(fb1), "f"(fb2), "f"(fb3),
-          "f"(fc0), "f"(fc1), "f"(fc2), "f"(fc3), "f"(fc4), "f"(fc5), "f"(fc6), "f"(fc7)
-      );
-
-      if constexpr (FragD::NR == 8) {
-        fragD.data = {fd0, fd1, fd2, fd3, fd4, fd5, fd6, fd7};
-      } else {
-        static_assert(FragD::NR == 4, "Unsupported accumulator register count");
-        fragD.data = {fd0, fd1, fd2, fd3};
-      }
-    }
-  }
-
-  template <uint32_t DescId, typename FragD, typename FragA, typename FragB, typename FragC>
-  static __attribute__((always_inline)) void mma_sync_slots(uint32_t a_slot_id,
-                                                            uint32_t b_slot_id,
-                                                            uint32_t c_slot_id,
-                                                            FragD &fragD,
-                                                            const FragA &fragA,
-                                                            const FragB &fragB,
-                                                            const FragC &fragC) {
-    switch ((a_slot_id << 2) | (b_slot_id << 1) | c_slot_id) {
-    case 0: mma_sync<DescId, 0, 0, 0>(fragD, fragA, fragB, fragC); break;
-    case 1: mma_sync<DescId, 0, 0, 1>(fragD, fragA, fragB, fragC); break;
-    case 2: mma_sync<DescId, 0, 1, 0>(fragD, fragA, fragB, fragC); break;
-    case 3: mma_sync<DescId, 0, 1, 1>(fragD, fragA, fragB, fragC); break;
-    case 4: mma_sync<DescId, 1, 0, 0>(fragD, fragA, fragB, fragC); break;
-    case 5: mma_sync<DescId, 1, 0, 1>(fragD, fragA, fragB, fragC); break;
-    case 6: mma_sync<DescId, 1, 1, 0>(fragD, fragA, fragB, fragC); break;
-    case 7: mma_sync<DescId, 1, 1, 1>(fragD, fragA, fragB, fragC); break;
-    default: __builtin_trap();
-    }
-  }
-
-  template <uint32_t DescId, typename FragD, typename FragA, typename FragB, typename FragC>
-  static __attribute__((always_inline)) void mma_sync_slot(uint32_t slot_id,
-                                                           FragD &fragD,
-                                                           const FragA &fragA,
-                                                           const FragB &fragB,
-                                                           const FragC &fragC) {
-    switch (slot_id) {
-    case 0: mma_sync<DescId, 0, 0, 0>(fragD, fragA, fragB, fragC); break;
-    case 1: mma_sync<DescId, 1, 1, 1>(fragD, fragA, fragB, fragC); break;
-    default: __builtin_trap();
     }
   }
 };

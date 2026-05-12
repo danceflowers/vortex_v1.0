@@ -3,44 +3,40 @@
 #include <vx_tensor.h>
 
 namespace vt = vortex::tensor;
-using ctx = vt::wmma_context_ab<NUM_THREADS, vt::ATYPE, vt::BTYPE, vt::OTYPE>;
+
+// Phase-2 migration: legacy fragment-based mma_sync + mma_load/store_*_slot
+// macros are gone. The new ISA expresses the entire fill→compute→drain chain
+// in a single TCU_MMA instruction (custom-3 funct3=000). cpabulk_tensor_ld/st
+// currently route through the legacy TmaFrontend (GAP-1); rs2=args_lmem_ptr
+// is accepted but ignored until DRAM→LMEM path lands.
 
 static constexpr uint32_t kTmaInDescId = 0;
-static constexpr uint32_t kTmaBDescId = 1;
-static constexpr uint32_t kTmaCDescId = 2;
+static constexpr uint32_t kTmaBDescId  = 1;
+static constexpr uint32_t kTmaCDescId  = 2;
 static constexpr uint32_t kTmaOutDescId = 3;
-static constexpr uint32_t kMmaDescId = 0;
 
 void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
-  ctx::fragment_a fragA;
-  ctx::fragment_b fragB;
-  ctx::fragment_acc fragC;
+  uint32_t a_handle = vt::tmem_alloc(arg->c_bank_span);
 
-  ctx::fill_fragment(fragA, 0);
-  ctx::fill_fragment(fragB, 0);
-  ctx::fill_fragment(fragC, 0);
+  // Stage A/B/C tiles into TMEM via cpabulk.
+  (void)vt::cpabulk_tensor_ld(kTmaInDescId, /*window=*/0);
+  (void)vt::cpabulk_tensor_ld(kTmaBDescId,  /*window=*/1);
+  (void)vt::cpabulk_tensor_ld(kTmaCDescId,  /*window=*/2);
+  vt::tcu_wait_ld();
 
-  uint32_t handle = vt::tmem_alloc(arg->c_bank_span);
+  // tcgen05.mma — d_taddr is read-modify-written (PTX d_taddr R-M-W).
+  // operand_block_t lives in LMEM; we declare it in a thread-local scope and
+  // pass its address as rs2.
+  vt::operand_block_t op = vt::make_operand_block(a_handle, /*b_sdesc=*/0);
+  uint32_t idesc = vt::make_idescriptor<vt::ATYPE, vt::BTYPE, vt::OTYPE, vt::OTYPE>(
+      /*M=*/0, /*N=*/0);
+  vt::tcu_mma(/*d_taddr=*/a_handle, idesc, &op);
+  vt::tcu_wait_st();
 
-  uint32_t load_a_id = vt::tma_load(handle, kTmaInDescId, 0);
-  uint32_t load_b_id = vt::tma_load(handle, kTmaBDescId, 1);
-  uint32_t load_c_id = vt::tma_load(handle, kTmaCDescId, 2);
-  vt::tma_wait(load_a_id);
-  vt::tma_wait(load_b_id);
-  vt::tma_wait(load_c_id);
-
-  vt::mma_load_a_slot<kMmaDescId>(handle, 0, 0, 0);
-  vt::mma_load_b_slot<kMmaDescId>(handle, 1, 0, 0);
-  vt::mma_load_c_slot<kMmaDescId>(handle, 2, 0, 0);
-  vt::tc_wait();
-  ctx::mma_sync_slots<kMmaDescId>(0, 0, 0, fragC, fragA, fragB, fragC);
-  vt::tc_wait();
-  vt::mma_store_c_slot<kMmaDescId>(handle, 3, 0, 0);
-  vt::tc_wait();
-
-  uint32_t store_id = vt::tma_store(handle, kTmaOutDescId, 3);
-  vt::tma_wait(store_id);
-  vt::tmem_free(handle);
+  // Drain D back out to DRAM via cpabulk.tensor.st.
+  (void)vt::cpabulk_tensor_st(kTmaOutDescId, /*window=*/3);
+  vt::tcu_wait_st();
+  vt::tmem_dealloc(a_handle, arg->c_bank_span);
 }
 
 int main() {

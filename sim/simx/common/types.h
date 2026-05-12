@@ -757,54 +757,10 @@ enum class TcuType {
   TCU_WAIT_LD,        // tcgen05.wait::ld
   TCU_WAIT_ST,        // tcgen05.wait::st
 
-  // Phase-2: legacy MMA_LOAD / MMA_STORE / WMMA internal routing tags removed;
-  // TCU_MMA is now the single ISA-visible compute entry. Internal fan-out is
-  // managed by TensorAsyncFrontend without per-stage TcuType discrimination.
 };
 
-static constexpr uint32_t kInvalidTcuDescriptorId = 0xffffffffu;
-// TCU control-word packing used by the macro tensor memory path.
-//
-// TMEM/TMA-style operations use a control word that carries window selection,
-// descriptor id and per-op flags. MMA_LOAD/MMA_STORE use a separate control
-// word that carries target, logical slot, window and tile selection.
-static constexpr uint32_t kTcuTmemOpCtlWindowBits = 8;
-static constexpr uint32_t kTcuTmemOpCtlDescBits = 16;
-static constexpr uint32_t kTcuTmemOpCtlFlagsBits = 8;
-static constexpr uint32_t kTcuTmemOpCtlWindowShift = 0;
-static constexpr uint32_t kTcuTmemOpCtlDescShift =
-    kTcuTmemOpCtlWindowShift + kTcuTmemOpCtlWindowBits;
-static constexpr uint32_t kTcuTmemOpCtlFlagsShift =
-    kTcuTmemOpCtlDescShift + kTcuTmemOpCtlDescBits;
-static constexpr uint32_t kTcuTmemOpFlagRefill = 0x1u;
-// Phase-3.3.8: kTcuMmaMemCtl* / tcu_mma_mem_* helpers excised — MMA_LOAD /
-// MMA_STORE were deleted in Phase-2 (TCU_MMA fans out internally with
-// idesc.M/N driving 16x16 sub-tiles per Phase-3.3.7). Window/tile encoding
-// in the MMA path is no longer part of the ABI surface.
-
-inline uint32_t tcu_control_field_mask(uint32_t bits) {
-  return (bits >= 32) ? 0xffffffffu : ((1u << bits) - 1);
-}
-
-inline uint32_t tcu_tmem_op_make_control(uint32_t window_id,
-                                         uint32_t desc_id = 0,
-                                         uint32_t flags = 0) {
-  return ((window_id & tcu_control_field_mask(kTcuTmemOpCtlWindowBits)) << kTcuTmemOpCtlWindowShift)
-       | ((desc_id & tcu_control_field_mask(kTcuTmemOpCtlDescBits)) << kTcuTmemOpCtlDescShift)
-       | ((flags & tcu_control_field_mask(kTcuTmemOpCtlFlagsBits)) << kTcuTmemOpCtlFlagsShift);
-}
-
-inline uint32_t tcu_tmem_op_ctl_window_id(uint32_t control) {
-  return (control >> kTcuTmemOpCtlWindowShift) & tcu_control_field_mask(kTcuTmemOpCtlWindowBits);
-}
-
-inline uint32_t tcu_tmem_op_ctl_desc_id(uint32_t control) {
-  return (control >> kTcuTmemOpCtlDescShift) & tcu_control_field_mask(kTcuTmemOpCtlDescBits);
-}
-
-inline uint32_t tcu_tmem_op_ctl_flags(uint32_t control) {
-  return (control >> kTcuTmemOpCtlFlagsShift) & tcu_control_field_mask(kTcuTmemOpCtlFlagsBits);
-}
+static constexpr uint32_t kTmemAllocReservedOperand = 0xffffffffu;
+static constexpr uint32_t kTcuTmemOpControlPtxOnly = 0;
 
 // Canonical decoded tensor instruction arguments.
 //
@@ -818,8 +774,7 @@ inline uint32_t tcu_tmem_op_ctl_flags(uint32_t control) {
 //   - TCU_MMA          : enable_input_d, ws, sp, cta_group, collector_a_fill, multicast
 //   - TCU_LD/ST        : ld_shape, ld_num, ld_pack
 struct IntrTcuArgs {
-  // Operand-side state resolved at execute time from idesc memory descriptor
-  // (lazy-loaded for TCU_MMA; not used by other instructions).
+  // Operand-side state resolved at execute time from the PTX idesc.
   uint32_t fmt_a = 0;
   uint32_t fmt_b = 0;
   uint32_t fmt_c = 0;
@@ -869,19 +824,8 @@ struct IntrTcuArgs {
   uint8_t ld_num = 0;               // qualifier[5:3]
   uint8_t ld_pack = 0;              // qualifier[6]
 
-  // ---- Internal microarchitecture routing fields ----
-  // Used by tensor_async_frontend.cpp / tensor_issue_policy.cpp /
-  // tensor_mem_manager.cpp to match operand state caches against the
-  // currently-active idesc/operand_block. Not part of the ISA encoding;
-  // populated by execute.cpp's TCU_MMA fan-out path.
-  uint32_t descriptor = 0xffffffffu;
-  // Phase-3.3.8: window_id is internal-only (always 0 in the new TCU_MMA
-  // path; only TMEM_SHIFT still encodes it from rs2 for legacy refill).
-  // tile_id is now derived inside dispatch_tcu_mma() from idesc.M/N — kernel
-  // does not encode it. Kept for the legacy fill/store helpers in
-  // tensor_async_frontend.cpp; will be removed when those helpers
-  // de-window.
-  uint32_t window_id = 0;
+  // Internal microarchitecture routing fields.
+  uint32_t idesc = 0xffffffffu;
   uint32_t tile_id = 0;
   uint8_t output_resident = 0;
   uint8_t macro_op = 0;

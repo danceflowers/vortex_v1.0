@@ -3,66 +3,62 @@
 #include <vx_tensor.h>
 
 namespace vt = vortex::tensor;
-using ctx = vt::wmma_context_ab<NUM_THREADS, vt::ATYPE, vt::BTYPE, vt::OTYPE>;
+
+// Phase-2: legacy fragment-based mma_sync + mma_load/store_*_slot replaced by
+// a single TCU_MMA (custom-3 funct3=000). MBAR_INIT/ARRIVE/WAIT/COMMIT
+// reorganised under custom-2 (0x5B). cpabulk_tensor_ld currently bridges
+// through legacy TmaFrontend (GAP-1).
 
 static constexpr uint32_t kTmaInDescId = 0;
-static constexpr uint32_t kTmaBDescId = 1;
-static constexpr uint32_t kTmaCDescId = 2;
+static constexpr uint32_t kTmaBDescId  = 1;
+static constexpr uint32_t kTmaCDescId  = 2;
 static constexpr uint32_t kTmaOutDescId = 3;
-static constexpr uint32_t kMmaDescId = 0;
-// The waits are fully sequential, so one local mbarrier is sufficient here.
-static constexpr uint32_t kMmaLoadBarrierId = 0;
-static constexpr uint32_t kWmmaBarrierId = 0;
-static constexpr uint32_t kMmaStoreBarrierId = 0;
 
-static inline void wait_tensor_async(uint32_t barrier_id) {
-  (void)vt::tc_commit(barrier_id);
-  vt::mbarrier_arrive(barrier_id);
-  vt::mbarrier_wait(barrier_id);
+// One mbarrier slot reused across the producer / wmma / store steps.
+static constexpr uint32_t kBarLoad  = 0;
+static constexpr uint32_t kBarWmma  = 0;
+static constexpr uint32_t kBarStore = 0;
+
+static inline void wait_tensor_async(uint32_t mbar) {
+  (void)vt::mbar_commit(mbar);
+  vt::mbarrier_arrive(mbar);
+  vt::mbarrier_wait(mbar);
 }
 
 void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
-  ctx::fragment_a fragA;
-  ctx::fragment_b fragB;
-  ctx::fragment_acc fragC;
-
-  ctx::fill_fragment(fragA, 0);
-  ctx::fill_fragment(fragB, 0);
-  ctx::fill_fragment(fragC, 0);
-
   uint32_t handle = vt::tmem_alloc(arg->c_bank_span);
 
+  // Producer: stage A/B/C in TMEM via cpabulk.
   vt::mbarrier_init(0, 1);
-  (void)vt::tma_load(handle, kTmaInDescId, 0);
-  (void)vt::tma_load(handle, kTmaBDescId, 1);
-  (void)vt::tma_load(handle, kTmaCDescId, 2);
-  (void)vt::tc_commit(0);
-  vt::tc_fence_before();
+  (void)vt::cpabulk_tensor_ld(kTmaInDescId, /*window=*/0);
+  (void)vt::cpabulk_tensor_ld(kTmaBDescId,  /*window=*/1);
+  (void)vt::cpabulk_tensor_ld(kTmaCDescId,  /*window=*/2);
+  (void)vt::mbar_commit(0);
+  vt::mbar_fence_before();
   vt::mbarrier_arrive(0);
   vt::mbarrier_wait(0);
-  vt::tc_fence_after();
+  vt::mbar_fence_after();
 
-  vt::mbarrier_init(kMmaLoadBarrierId, 1);
-  vt::mma_load_a_slot<kMmaDescId>(handle, 0, 0, 0);
-  vt::mma_load_b_slot<kMmaDescId>(handle, 1, 0, 0);
-  vt::mma_load_c_slot<kMmaDescId>(handle, 2, 0, 0);
-  wait_tensor_async(kMmaLoadBarrierId);
-  vt::mbarrier_init(kWmmaBarrierId, 1);
-  ctx::mma_sync_slots<kMmaDescId>(0, 0, 0, fragC, fragA, fragB, fragC);
-  wait_tensor_async(kWmmaBarrierId);
-  vt::mbarrier_init(kMmaStoreBarrierId, 1);
-  vt::mma_store_c_slot<kMmaDescId>(handle, 3, 0, 0);
-  wait_tensor_async(kMmaStoreBarrierId);
+  // Compute: TCU_MMA fans out fill→compute→drain internally.
+  vt::mbarrier_init(kBarLoad, 1);
+  vt::operand_block_t op = vt::make_operand_block(handle, /*b_sdesc=*/0);
+  uint32_t idesc = vt::make_idescriptor<vt::ATYPE, vt::BTYPE, vt::OTYPE, vt::OTYPE>(0, 0);
+  vt::tcu_mma(/*d_taddr=*/handle, idesc, &op);
+  wait_tensor_async(kBarWmma);
+  vt::mbarrier_init(kBarStore, 1);
+  // No separate drain instruction in Phase-2: TCU_MMA already drains DMem→TMEM.
+  wait_tensor_async(kBarStore);
 
+  // Drain to DRAM.
   vt::mbarrier_init(1, 1);
-  (void)vt::tma_store(handle, kTmaOutDescId, 3);
-  (void)vt::tc_commit(1);
-  vt::tc_fence_before();
+  (void)vt::cpabulk_tensor_st(kTmaOutDescId, /*window=*/3);
+  (void)vt::mbar_commit(1);
+  vt::mbar_fence_before();
   vt::mbarrier_arrive(1);
   vt::mbarrier_wait(1);
-  vt::tc_fence_after();
+  vt::mbar_fence_after();
 
-  vt::tmem_free(handle);
+  vt::tmem_dealloc(handle, arg->c_bank_span);
 }
 
 int main() {

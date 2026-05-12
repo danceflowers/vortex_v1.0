@@ -50,10 +50,6 @@ inline int64_t check_boxing(int64_t a) {
   return nan_box(0x7fc00000); // NaN
 }
 
-// Phase-2: legacy MMA descriptor table reads (resolve_mma_descriptor /
-// decode_tc_commit_scope) deleted. TCU_MMA now passes idesc as a 32-bit
-// register value through the dispatch path; tcgen05.commit has no scope.
-
 void Emulator::fetch_registers(std::vector<reg_data_t>& out, uint32_t wid, uint32_t src_index, const RegOpd& reg) {
   __unused(src_index);
   auto& warp = warps_.at(wid);
@@ -175,6 +171,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
 #endif // XLEN_64
 
   bool rd_write = false;
+  bool defer_rd_write = false;
   last_instr_retired_ = true;
 
   visit_var(op_type,
@@ -1468,8 +1465,8 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         // Phase-3.4 Stage 0: returns a PTX TADDR (col_base in low 16, col_byte=0
         // in high 16). 0xFFFFFFFF is the invalid sentinel.
         auto col_span = std::max<uint32_t>(1, rs1_data.at(thread_start).u32);
-        auto mma_desc_id = rs2_data.at(thread_start).u32; // rs2: 0-based MMA descriptor ID, invalid = no prebuilt layout
-        auto taddr = core_->tmem_alloc(col_span, mma_desc_id);
+        auto reserved_operand = rs2_data.at(thread_start).u32;
+        auto taddr = core_->tmem_alloc(col_span, reserved_operand);
         if (taddr == Tmem::kInvalidTaddr) {
           throw std::runtime_error(
             "TMEM allocation failed: requested " + std::to_string(col_span)
@@ -1490,12 +1487,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       case TcuType::TMEM_SHIFT: {
         auto handle = rs1_data.at(thread_start).u32;
         auto tmem_control_word = rs2_data.at(thread_start).u32;
-        tpuArgs.window_id = tcu_tmem_op_ctl_window_id(tmem_control_word);
-        auto shift_flags = tcu_tmem_op_ctl_flags(tmem_control_word);
-        auto refill_desc_id = (shift_flags & kTcuTmemOpFlagRefill) != 0
-                            ? tcu_tmem_op_ctl_desc_id(tmem_control_word)
-                            : 0;
-        auto async_id = core_->tmem_shift(wid, handle, tpuArgs.window_id, refill_desc_id);
+        auto async_id = core_->tmem_shift(wid, handle, tmem_control_word);
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t))
             continue;
@@ -1534,7 +1526,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       // New tcgen05-aligned ISA cases (custom-1 / custom-2 / custom-3)
       // ============================================================
       case TcuType::TMEM_DEALLOC: {
-        // tcgen05.dealloc — alias of legacy TMEM_FREE on the Core API side.
+        // tcgen05.dealloc.
         auto handle = rs1_data.at(thread_start).u32;
         core_->tmem_dealloc(handle);
       } break;
@@ -1659,50 +1651,30 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         //   actual_lane = taddr.lane + t (warp-collective)
         // and reads 4 consecutive 1-byte cells at (actual_lane, col_byte..+3).
         // Allocation is found by lane→col_base reverse lookup.
+        std::vector<uint32_t> taddrs(num_threads, 0);
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t)) continue;
-          uint32_t taddr = rs1_data.at(t).u32;
-          uint32_t lane_base = taddr & 0xFFFFu;
-          uint32_t col_byte  = (taddr >> 16) & 0xFFFFu;
-          uint32_t actual_lane = lane_base + t;
-          uint32_t col_base = 0;
-          uint8_t buf[4] = {0, 0, 0, 0};
-          if (core_->tmem_find_allocation_by_lane(actual_lane, &col_base)) {
-            uint32_t byte_off = (actual_lane - col_base) * Tmem::kColBytes + col_byte;
-            (void)core_->tmem_region_read_bytes(col_base, byte_off, buf, sizeof(buf));
-          }
-          uint32_t word = static_cast<uint32_t>(buf[0])
-                       | (static_cast<uint32_t>(buf[1]) << 8)
-                       | (static_cast<uint32_t>(buf[2]) << 16)
-                       | (static_cast<uint32_t>(buf[3]) << 24);
-          rd_data[t].u = word;
+          taddrs.at(t) = rs1_data.at(t).u32;
         }
+        core_->issue_tcgen05_ld_async(wid, reinterpret_cast<uint64_t>(trace),
+                                      rdest, warp.tmask, taddrs);
         trace_data->rd_write = (rdest.type != RegType::None) && (rdest.idx != 0);
         rd_write = trace_data->rd_write;
+        defer_rd_write = rd_write;
       } break;
       case TcuType::TCU_ST: {
         // Phase-3.4 Stage 0: tcgen05.st per PTX §9.7.16.5.6 — same TADDR
         // decoding as tcgen05.ld; thread t writes 4 cells at
         // (taddr.lane + t, taddr.col_byte..+3).
+        std::vector<uint32_t> taddrs(num_threads, 0);
+        std::vector<uint32_t> values(num_threads, 0);
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t)) continue;
-          uint32_t taddr = rs1_data.at(t).u32;
-          uint32_t value = rs2_data.at(t).u32;
-          uint32_t lane_base = taddr & 0xFFFFu;
-          uint32_t col_byte  = (taddr >> 16) & 0xFFFFu;
-          uint32_t actual_lane = lane_base + t;
-          uint32_t col_base = 0;
-          uint8_t buf[4] = {
-            static_cast<uint8_t>(value & 0xff),
-            static_cast<uint8_t>((value >> 8) & 0xff),
-            static_cast<uint8_t>((value >> 16) & 0xff),
-            static_cast<uint8_t>((value >> 24) & 0xff),
-          };
-          if (core_->tmem_find_allocation_by_lane(actual_lane, &col_base)) {
-            uint32_t byte_off = (actual_lane - col_base) * Tmem::kColBytes + col_byte;
-            (void)core_->tmem_region_write_bytes(col_base, byte_off, buf, sizeof(buf));
-          }
+          taddrs.at(t) = rs1_data.at(t).u32;
+          values.at(t) = rs2_data.at(t).u32;
         }
+        core_->issue_tcgen05_st_async(wid, reinterpret_cast<uint64_t>(trace),
+                                      warp.tmask, taddrs, values);
       } break;
       case TcuType::TCU_WAIT_LD: {
         // tcgen05.wait::ld (PTX §9.7.16.5.8): wait for prior tcgen05.ld ops.
@@ -1732,7 +1704,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
   }
   if (rd_write) {
     trace->wb = true;
-    switch (rdest.type) {
+    if (!defer_rd_write) switch (rdest.type) {
     case RegType::None:
       break;
     case RegType::Integer:

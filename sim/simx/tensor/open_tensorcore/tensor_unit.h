@@ -305,7 +305,7 @@ public:
 
   // ---- 协处理器统一指令接口 ----
   // Vortex Core 只转发原始字段，TensorUnit 内部由 TcDecode 解释语义。
-  // Phase-2: legacy set_descriptor() / dispatch(TcuType, ...) removed.
+  // PTX path: each tcgen05.mma carries its idesc directly.
 
   /// Phase-2 PTX-aligned tcgen05.mma dispatch (single-instruction fan-out).
   /// 接收 decode.cpp 抓的原始字段：rs1_value=idesc(32-bit),

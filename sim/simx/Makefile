@@ -10,8 +10,8 @@ CXXFLAGS += -std=c++17 -Wall -Wextra -Wfatal-errors
 CXXFLAGS += -fPIC -Wno-maybe-uninitialized
 CXXFLAGS += -I$(SRC_DIR) -I$(SRC_DIR)/common -I$(SRC_DIR)/tensor
 CXXFLAGS += -I$(SRC_DIR)/tensor/open_tensorcore -I$(SRC_DIR)/tensor/open_tensorcore/tensor_compute
-CXXFLAGS += -I$(SRC_DIR)/tensor/open_tensorcore/local_memory -I$(SRC_DIR)/tensor/open_tensorcore/tensor_control
-CXXFLAGS += -I$(SRC_DIR)/tensor/open_tensorcore/tensor_helper -I$(SRC_DIR)/tensor/open_tensorcore/tensor_top
+CXXFLAGS += -I$(SRC_DIR)/tensor/open_tensorcore/tensor_control
+CXXFLAGS += -I$(SRC_DIR)/tensor/open_tensorcore/tensor_helper
 CXXFLAGS += -I$(SW_COMMON_DIR) -I$(ROOT_DIR)/hw
 CXXFLAGS += -I$(THIRD_PARTY_DIR)/softfloat/source/include
 CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/spdlog/include
@@ -41,22 +41,13 @@ else
 endif
 # Add TCU extension sources
 ifneq ($(findstring -DEXT_TCU_ENABLE, $(CONFIGS)),)
-	SRCS += $(SRC_DIR)/tensor/tma.cpp $(SRC_DIR)/tensor/tma_frontend.cpp
-	SRCS += $(SRC_DIR)/tensor/tmem.cpp $(SRC_DIR)/tensor/tmem_system.cpp $(SRC_DIR)/tensor/tmem_window_planner.cpp
-	SRCS += $(SRC_DIR)/tensor/tensor_mem_layout_utils.cpp
-	SRCS += $(SRC_DIR)/tensor/open_tensorcore/local_memory/tensor_local_mem_arbiter.cpp
-	# tensor_local_mem_pipeline.cpp references a header that doesn't exist; skip
-	SRCS += $(SRC_DIR)/tensor/open_tensorcore/local_memory/tensor_mem_pipeline.cpp
+	SRCS += $(SRC_DIR)/tensor/tma.cpp
+	SRCS += $(SRC_DIR)/tensor/tmem_utils.cpp
+	SRCS += $(SRC_DIR)/tensor/tmem_math_packet.cpp
+	SRCS += $(SRC_DIR)/tensor/tmem.cpp $(SRC_DIR)/tensor/tmem_system.cpp
 	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_control/tc_decode.cpp
-	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_control/tensor_async_frontend.cpp
-	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_control/tensor_issue_policy.cpp
-	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_control/tensor_mem_manager.cpp
-	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_control/tensor_wmma_issue_engine.cpp
-	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_control/tensor_wmma_retire_unit.cpp
 	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_helper/tensor_debug_utils.cpp
-	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_top/tensor_runtime_utils.cpp
-	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_top/tensor_tick_utils.cpp
-	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_top/tensor_unit.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_unit.cpp
 endif
 
 # Debugging

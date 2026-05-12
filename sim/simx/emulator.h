@@ -22,7 +22,7 @@
 #include "types.h"
 #include "instr.h"
 #ifdef EXT_TCU_ENABLE
-#include "open_tensorcore/tensor_top/tensor_unit.h"
+#include "open_tensorcore/tensor_unit.h"
 #endif
 #ifdef EXT_V_ENABLE
 #include "vec_unit.h"
@@ -136,6 +136,10 @@ public:
   void dcache_read(void* data, uint64_t addr, uint32_t size);
 
   void dcache_write(const void* data, uint64_t addr, uint32_t size);
+
+  void write_ireg(uint32_t wid, uint32_t reg_idx,
+                  const ThreadMask& tmask,
+                  const std::vector<Word>& values);
 
 private:
 

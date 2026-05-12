@@ -12,20 +12,24 @@ static constexpr uint32_t kTmaOutDescId = 2;
 void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   uint32_t handle = vt::tmem_alloc(arg->bank_span);
 
-  uint32_t load_id = vt::tma_load(handle, kTmaInDescId, kWindowId);
-  vt::tma_wait(load_id);
+  // Phase-2 cpabulk routes through legacy TmaFrontend (GAP-1).
+  uint32_t load_id = vt::cpabulk_tensor_ld(kTmaInDescId, /*coords_ctl=*/kWindowId);
+  (void)load_id;
+  vt::tcu_wait_ld();
 
-  vt::tc_fence_before();
+  vt::mbar_fence_before();
 
   uint32_t shift_id = vt::tmem_shift_refill(handle, kWindowId, kTmaRefillDescId);
-  vt::tma_wait(shift_id);
+  (void)shift_id;
+  vt::tcu_wait_ld();
 
-  vt::tc_fence_after();
+  vt::mbar_fence_after();
 
-  uint32_t store_id = vt::tma_store(handle, kTmaOutDescId, kWindowId);
-  vt::tma_wait(store_id);
+  uint32_t store_id = vt::cpabulk_tensor_st(kTmaOutDescId, /*coords_ctl=*/kWindowId);
+  (void)store_id;
+  vt::tcu_wait_st();
 
-  vt::tmem_free(handle);
+  vt::tmem_dealloc(handle, arg->bank_span);
 }
 
 int main() {

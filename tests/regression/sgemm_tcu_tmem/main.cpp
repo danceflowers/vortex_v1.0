@@ -353,7 +353,7 @@ static void build_chained_tile_ref(float out[kTileDim][kTileDim],
   }
 
   CMem cmem;
-  cmem.fill_tile(host_utils::output_fmt(), c_packets);
+  cmem.bulk_fill_tile_for_reference(host_utils::output_fmt(), c_packets);
 
   std::array<std::array<std::array<uint32_t, 8>, 8>, 4> accum_fp22 = {};
   for (uint32_t subtile = 0; subtile < 4; ++subtile) {
@@ -414,9 +414,9 @@ static void build_chained_tile_ref(float out[kTileDim][kTileDim],
       AMem amem;
       MetaMem metamem;
       BMem bmem;
-      amem.fill_tile(host_utils::input_fmt<input_a_t>(), a_packets);
-      metamem.fill_tile(meta_packets);
-      bmem.fill_tile(host_utils::input_fmt<input_b_t>(), b_packets, kSparse2To4 ? vt::sparse_2_4 : vt::sparse_1_4);
+      amem.bulk_fill_tile_for_reference(host_utils::input_fmt<input_a_t>(), a_packets);
+      metamem.bulk_fill_tile_for_reference(meta_packets);
+      bmem.bulk_fill_tile_for_reference(host_utils::input_fmt<input_b_t>(), b_packets, kSparse2To4 ? vt::sparse_2_4 : vt::sparse_1_4);
 
       for (uint32_t storage_k = 0; storage_k < 2; ++storage_k) {
         for (uint32_t storage_m = 0; storage_m < 2; ++storage_m) {
@@ -466,8 +466,8 @@ static void build_chained_tile_ref(float out[kTileDim][kTileDim],
 
       AMem amem;
       BMem bmem;
-      amem.fill_tile(host_utils::input_fmt<input_a_t>(), a_packets);
-      bmem.fill_tile(host_utils::input_fmt<input_b_t>(), b_packets);
+      amem.bulk_fill_tile_for_reference(host_utils::input_fmt<input_a_t>(), a_packets);
+      bmem.bulk_fill_tile_for_reference(host_utils::input_fmt<input_b_t>(), b_packets);
 
       for (uint32_t storage_k = 0; storage_k < 2; ++storage_k) {
         for (uint32_t storage_m = 0; storage_m < 2; ++storage_m) {
@@ -514,7 +514,7 @@ static void build_chained_tile_ref(float out[kTileDim][kTileDim],
   }
 
   std::vector<CMem::packet_t> out_packets;
-  cmem.dump_tile(host_utils::output_fmt(), &out_packets);
+  cmem.bulk_dump_tile_for_reference(host_utils::output_fmt(), &out_packets);
   std::vector<uint8_t> tile_bytes(kCBytes, 0);
   for (size_t i = 0; i < out_packets.size(); ++i) {
     std::copy_n(out_packets[i].begin(), 64, tile_bytes.begin() + i * 64);

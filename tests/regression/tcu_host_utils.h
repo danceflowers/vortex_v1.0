@@ -10,11 +10,12 @@
 #include <tensor_cfg.h>
 #include <util.h>
 
-#include "open_tensorcore/amem.h"
-#include "open_tensorcore/bmem.h"
-#include "open_tensorcore/cmem.h"
-#include "open_tensorcore/fp_types.h"
-#include "open_tensorcore/tensor_core_top.h"
+#include "tensor/open_tensorcore/local_memory/amem.h"
+#include "tensor/open_tensorcore/local_memory/bmem.h"
+#include "tensor/open_tensorcore/local_memory/cmem.h"
+#include "tensor/open_tensorcore/tensor_compute/fp_types.h"
+#include "tensor/open_tensorcore/tensor_compute/tensor_core_top.h"
+#include "tensor/open_tensorcore/tensor_helper/tensor_mem_test_utils.h"
 
 namespace tcu_test {
 
@@ -47,9 +48,11 @@ struct TileHostUtils {
   static constexpr uint32_t output_fmt() {
     if constexpr (std::is_same_v<OutputT, float>) {
       return vortex::tensor::fp32::id;
-    } else {
-      static_assert(std::is_same_v<OutputT, uint16_t>, "unsupported output type");
+    } else if constexpr (std::is_same_v<OutputT, uint16_t>) {
       return vortex::tensor::fp16::id;
+    } else {
+      static_assert(std::is_same_v<OutputT, uint8_t>, "unsupported output type");
+      return vortex::tensor::fp8::id;
     }
   }
 
@@ -90,16 +93,20 @@ struct TileHostUtils {
   static OutputT encode_output(float value) {
     if constexpr (std::is_same_v<OutputT, float>) {
       return value;
-    } else {
+    } else if constexpr (std::is_same_v<OutputT, uint16_t>) {
       return float_to_fp16_bits(value);
+    } else {
+      return double_to_fp8_e4m3(value);
     }
   }
 
   static float decode_output(OutputT value) {
     if constexpr (std::is_same_v<OutputT, float>) {
       return value;
-    } else {
+    } else if constexpr (std::is_same_v<OutputT, uint16_t>) {
       return fp16_bits_to_float(value);
+    } else {
+      return static_cast<float>(fp8_e4m3_to_double(value));
     }
   }
 
@@ -294,15 +301,34 @@ struct TileHostUtils {
     }
   }
 
+  static void pack_c_tile_fp8(std::vector<uint8_t>& composite,
+                              uint32_t byte_offset,
+                              const uint8_t tile[TileDim][TileDim]) {
+    for (uint32_t subtile = 0; subtile < 4; ++subtile) {
+      uint32_t subtile_row = subtile / 2;
+      uint32_t subtile_col = subtile % 2;
+      uint32_t packet_offset = byte_offset + subtile * 64;
+      for (uint32_t r = 0; r < 8; ++r) {
+        for (uint32_t c = 0; c < 8; ++c) {
+          uint32_t row = subtile_row * 8 + r;
+          uint32_t col = subtile_col * 8 + c;
+          composite[packet_offset + r * 8 + c] = tile[row][col];
+        }
+      }
+    }
+  }
+
   template <typename TileT>
   static void pack_c_tile(std::vector<uint8_t>& composite,
                           uint32_t byte_offset,
                           const TileT tile[TileDim][TileDim]) {
     if constexpr (std::is_same_v<TileT, float>) {
       pack_c_tile_fp32(composite, byte_offset, tile);
-    } else {
-      static_assert(std::is_same_v<TileT, uint16_t>, "unsupported output tile type");
+    } else if constexpr (std::is_same_v<TileT, uint16_t>) {
       pack_c_tile_fp16(composite, byte_offset, tile);
+    } else {
+      static_assert(std::is_same_v<TileT, uint8_t>, "unsupported output tile type");
+      pack_c_tile_fp8(composite, byte_offset, tile);
     }
   }
 
@@ -362,6 +388,27 @@ struct TileHostUtils {
     }
   }
 
+  static void scatter_c_tile_fp8(std::vector<uint8_t>& matrix,
+                                 const uint8_t* tile_bytes,
+                                 uint32_t tile_row,
+                                 uint32_t tile_col) {
+    uint32_t row_base = tile_row * TileDim;
+    uint32_t col_base = tile_col * TileDim;
+    for (uint32_t subtile = 0; subtile < 4; ++subtile) {
+      uint32_t subtile_row = subtile / 2;
+      uint32_t subtile_col = subtile % 2;
+      uint32_t packet_offset = subtile * 64;
+      for (uint32_t r = 0; r < 8; ++r) {
+        for (uint32_t c = 0; c < 8; ++c) {
+          uint32_t row = subtile_row * 8 + r;
+          uint32_t col = subtile_col * 8 + c;
+          matrix[(row_base + row) * TileDim + (col_base + col)] =
+            tile_bytes[packet_offset + r * 8 + c];
+        }
+      }
+    }
+  }
+
   template <typename TileT>
   static void scatter_c_tile(std::vector<TileT>& matrix,
                              const uint8_t* tile_bytes,
@@ -369,14 +416,25 @@ struct TileHostUtils {
                              uint32_t tile_col) {
     if constexpr (std::is_same_v<TileT, float>) {
       scatter_c_tile_fp32(matrix, tile_bytes, tile_row, tile_col);
-    } else {
-      static_assert(std::is_same_v<TileT, uint16_t>, "unsupported output matrix type");
+    } else if constexpr (std::is_same_v<TileT, uint16_t>) {
       scatter_c_tile_fp16(matrix, tile_bytes, tile_row, tile_col);
+    } else {
+      static_assert(std::is_same_v<TileT, uint8_t>, "unsupported output matrix type");
+      scatter_c_tile_fp8(matrix, tile_bytes, tile_row, tile_col);
     }
   }
 
   static PrecisionType out_precision() {
-    return (output_fmt() == vortex::tensor::fp32::id) ? PREC_FP32 : PREC_FP16;
+    switch (output_fmt()) {
+    case vortex::tensor::fp8::id:
+      return PREC_FP8_E4M3;
+    case vortex::tensor::fp16::id:
+      return PREC_FP16;
+    case vortex::tensor::fp32::id:
+      return PREC_FP32;
+    default:
+      return PREC_FP16;
+    }
   }
 
   static uint32_t add_fp22_raw(uint32_t a, uint32_t b) {
@@ -395,14 +453,22 @@ struct TileHostUtils {
     g_cfg.precisions.push_back(PREC_FP9);
     g_cfg.out_precisions.push_back(out_precision());
 
-    tc.reset();
-    tc.load_inputs(a_in, b_in, c_raw);
-    tc.tick(true);
-    tc.load_invalid();
+    TensorCoreMeta meta{};
+    meta.in_prec = PREC_FP9;
+    meta.out_prec = out_precision();
+    meta.c_prec = out_precision();
+    meta.c_bypass_is_fp22 = 1;
+    meta.valid = true;
 
+    tc.reset();
+    // 非输出驻留模式: C 通过管线透传, push_uop 传入 c_raw
+    tc.set_circulating(false);
+    tc.push_uop(a_in, b_in, c_raw, meta);
+
+    // 推进流水线直到结果输出
     uint32_t spin_limit = 10000;
     while (spin_limit-- > 0 && tc.jobs_completed < tc.set_jobs) {
-      tc.run();
+      tc.tick(true);
     }
 
     for (uint32_t i = 0; i < 8; ++i) {
@@ -438,43 +504,30 @@ struct TileHostUtils {
     AMem amem;
     BMem bmem;
     CMem cmem;
-    amem.fill_tile(input_fmt<InputAT>(), a_packets);
-    bmem.fill_tile(input_fmt<InputBT>(), b_packets);
-    cmem.fill_tile(output_fmt(), c_packets);
+    tensor_mem_test_utils::bulk_fill_tile_for_reference(&amem, input_fmt<InputAT>(), a_packets);
+    tensor_mem_test_utils::bulk_fill_tile_for_reference(&bmem, input_fmt<InputBT>(), b_packets);
+    tensor_mem_test_utils::bulk_fill_tile_for_reference(&cmem, output_fmt(), c_packets);
 
     std::array<std::array<std::array<uint32_t, 8>, 8>, 4> accum_fp22 = {};
     for (uint32_t subtile = 0; subtile < 4; ++subtile) {
-      uint32_t storage_m = subtile / 2;
-      uint32_t storage_n = subtile % 2;
-      if constexpr (std::is_same_v<OutputT, float>) {
-        float c_block[8][8] = {};
-        cmem.load_block_fp32(storage_m, storage_n, c_block);
-        for (uint32_t i = 0; i < 8; ++i) {
-          for (uint32_t j = 0; j < 8; ++j) {
-            accum_fp22.at(subtile).at(i).at(j) =
-              convert_c_to_fp22(vortex::bit_cast<uint32_t>(c_block[i][j]), out_precision());
-          }
-        }
-      } else {
-        uint16_t c_block[8][8] = {};
-        cmem.load_block_fp16(storage_m, storage_n, c_block);
-        for (uint32_t i = 0; i < 8; ++i) {
-          for (uint32_t j = 0; j < 8; ++j) {
-            accum_fp22.at(subtile).at(i).at(j) = convert_c_to_fp22(c_block[i][j], out_precision());
-          }
+      uint32_t raw[8][8] = {};
+      cmem.read_subtile_fp22(subtile, raw);
+      for (uint32_t i = 0; i < 8; ++i) {
+        for (uint32_t j = 0; j < 8; ++j) {
+          accum_fp22.at(subtile).at(i).at(j) = raw[i][j];
         }
       }
     }
 
-    for (uint32_t storage_k = 0; storage_k < 2; ++storage_k) {
+    for (uint32_t tile_id = 0; tile_id < 2; ++tile_id) {
       for (uint32_t storage_m = 0; storage_m < 2; ++storage_m) {
         for (uint32_t storage_n = 0; storage_n < 2; ++storage_n) {
           uint16_t a_block[8][8] = {};
           uint16_t b_block[8][8] = {};
           uint32_t partial_fp22[8][8] = {};
           uint32_t subtile = storage_m * 2 + storage_n;
-          amem.read_primitive(storage_m, storage_k, a_block);
-          bmem.read_primitive(storage_k, storage_n, b_block);
+          amem.read_primitive(tile_id * 2 + storage_m, a_block);
+          bmem.read_primitive(tile_id * 2 + storage_n, b_block);
           run_open_tensorcore_primitive_fp22(a_block, b_block, partial_fp22);
           for (uint32_t i = 0; i < 8; ++i) {
             for (uint32_t j = 0; j < 8; ++j) {
@@ -487,29 +540,22 @@ struct TileHostUtils {
     }
 
     for (uint32_t subtile = 0; subtile < 4; ++subtile) {
-      uint32_t storage_m = subtile / 2;
-      uint32_t storage_n = subtile % 2;
-      if constexpr (std::is_same_v<OutputT, float>) {
-        float c_block[8][8] = {};
-        for (uint32_t i = 0; i < 8; ++i) {
-          for (uint32_t j = 0; j < 8; ++j) {
-            c_block[i][j] = vortex::bit_cast<float>(fp22_to_fp32(accum_fp22.at(subtile).at(i).at(j)));
-          }
+      uint32_t raw[8][8] = {};
+      for (uint32_t i = 0; i < 8; ++i) {
+        for (uint32_t j = 0; j < 8; ++j) {
+          raw[i][j] = accum_fp22.at(subtile).at(i).at(j);
         }
-        cmem.store_block_fp32(storage_m, storage_n, c_block);
-      } else {
-        uint16_t c_block[8][8] = {};
-        for (uint32_t i = 0; i < 8; ++i) {
-          for (uint32_t j = 0; j < 8; ++j) {
-            c_block[i][j] = fp22_to_fp16(accum_fp22.at(subtile).at(i).at(j));
-          }
-        }
-        cmem.store_block_fp16(storage_m, storage_n, c_block);
       }
+      cmem.write_subtile_fp22(subtile, raw);
     }
 
     std::vector<CMem::packet_t> out_packets;
-    cmem.dump_tile(output_fmt(), &out_packets);
+    // 逐 subtile dump，拼接成完整 tile 的 packets
+    for (uint32_t st = 0; st < CMem::kDepth; ++st) {
+      std::vector<CMem::packet_t> sub_pkts;
+      cmem.dump_subtile_packets(output_fmt(), st, &sub_pkts);
+      out_packets.insert(out_packets.end(), sub_pkts.begin(), sub_pkts.end());
+    }
     std::vector<uint8_t> tile_bytes(kCBytes, 0);
     for (size_t i = 0; i < out_packets.size(); ++i) {
       std::copy_n(out_packets[i].begin(), 64, tile_bytes.begin() + i * 64);

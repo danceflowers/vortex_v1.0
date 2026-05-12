@@ -68,7 +68,7 @@ typedef struct __attribute__((packed)) {
   uint32_t fmt_b;
   uint32_t fmt_c;
   uint32_t fmt_d;
-  uint8_t ws;
+  uint8_t output_resident;
   uint8_t sp;
   uint8_t sparse_mode;
   uint8_t transpose_a;

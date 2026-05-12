@@ -42,12 +42,13 @@ static constexpr uint32_t kTileK   = TILE_K;
 static constexpr uint32_t kMatM    = MATRIX_M;
 static constexpr uint32_t kMatN    = MATRIX_N;
 static constexpr uint32_t kMatK    = MATRIX_K;
-static constexpr uint32_t kColSpan = 32;  // 双缓冲: 2 alloc × 32 cols = 64 (TMEM 总量)
+// fp8/fp8/fp8/fp8 的 A/B/C/D 四窗各占 32 lines；双 handle 双缓冲时每个 allocation 用 32 logical cols。
+static constexpr uint32_t kColSpan = 32;
 
 // Window 数据大小
 static constexpr uint32_t kAWinBytes = kWinM * kWinK * sizeof(input_a_t);  // 1024
 static constexpr uint32_t kBWinBytes = kWinK * kWinN * sizeof(input_b_t);  // 1024
-static constexpr uint32_t kCWinBytes = kWinM * kWinN * sizeof(output_t);   // 2048
+static constexpr uint32_t kCWinBytes = kWinM * kWinN * sizeof(output_t);   // 1024 for fp8 output
 
 static constexpr uint8_t kRoleA = 1, kRoleB = 2, kRoleC = 3, kRoleD = 4;
 
@@ -141,8 +142,8 @@ static void compute_tile_ref(float out[kTileM][kTileN],
         for (uint32_t sn = 0; sn < 2; ++sn) {
           uint16_t a_blk[8][8]={}, b_blk[8][8]={};
           uint32_t part[8][8]={};
-          amem.read_primitive(0, sm, a_blk);
-          bmem.read_primitive(0, sn, b_blk);
+          amem.read_primitive(sm, a_blk);
+          bmem.read_primitive(sn, b_blk);
           host_utils::run_open_tensorcore_primitive_fp22(a_blk, b_blk, part);
           uint32_t sub = sm * 2 + sn;
           for (uint32_t i = 0; i < 8; ++i)
@@ -152,19 +153,19 @@ static void compute_tile_ref(float out[kTileM][kTileN],
     }
   }
 
-  // fp22 → fp16
+  // fp22 -> output_t
   CMem cmem;
   for (uint32_t sub = 0; sub < 4; ++sub) {
-    uint16_t blk[8][8]={};
+    uint32_t blk[8][8] = {};
     for (uint32_t i = 0; i < 8; ++i)
       for (uint32_t j = 0; j < 8; ++j)
-        blk[i][j] = fp22_to_fp16(acc[sub][i][j]);
-    cmem.store_block_fp16(sub / 2, sub % 2, blk);
+        blk[i][j] = acc[sub][i][j];
+    cmem.write_subtile_fp22(sub, blk);
   }
   std::vector<CMem::packet_t> opkt;
-  for (uint32_t st = 0; st < CMem::kRowsPerSlot; ++st) {
+  for (uint32_t st = 0; st < CMem::kDepth; ++st) {
     std::vector<CMem::packet_t> sp;
-    cmem.dump_subtile_packets(0, host_utils::output_fmt(), st, &sp);
+    cmem.dump_subtile_packets(host_utils::output_fmt(), st, &sp);
     opkt.insert(opkt.end(), sp.begin(), sp.end());
   }
   uint32_t out_tile_bytes = kTileM * kTileN * sizeof(output_t);
@@ -180,9 +181,10 @@ static void compute_tile_ref(float out[kTileM][kTileN],
 
 // ---------------------------------------------------------------------------
 int main() {
-  std::cout << "512x512x512 dense GEMM (fp8 x fp8 -> fp16)" << std::endl;
-  std::cout << "window: 32x32 (m32n32k32), col_span=" << kColSpan
-            << ", output-resident (ws=1)" << std::endl;
+  std::cout << kMatM << "x" << kMatN << "x" << kMatK
+            << " dense GEMM (fp8 x fp8 -> fp8)" << std::endl;
+  std::cout << "window: m32n32k32, col_span=" << kColSpan
+            << ", output-resident (output_resident=1)" << std::endl;
 
   RT_CHECK(vx_dev_open(&device));
   uint64_t isa_flags = 0;
@@ -226,7 +228,7 @@ int main() {
           h_b[off + r * kWinN + c] = mat_b[(kp * kWinK + r) * kMatN + ng * kWinN + c];
     }
 
-  // C zero buffer (32×32 fp16)
+  // C zero buffer (32x32 fp8)
   std::vector<uint8_t> h_c(kCWinBytes, 0);
 
   // ---- 分配设备内存 ----
@@ -273,13 +275,13 @@ int main() {
       d.tile_role = kRoleD;
     }
 
-  // ---- MMA descriptor: m32n32k32, ws=1 ----
+  // ---- MMA descriptor: m32n32k32, output_resident=1 ----
   std::vector<mma_descriptor_t> mma(1, mma_descriptor_t{});
   mma[0].fmt_a = vt::ATYPE::id;
   mma[0].fmt_b = vt::BTYPE::id;
   mma[0].fmt_c = vt::OTYPE::id;
   mma[0].fmt_d = vt::OTYPE::id;
-  mma[0].ws = 1;
+  mma[0].output_resident = 1;
   mma[0].a_rows = kWinM; mma[0].a_cols = kWinK;
   mma[0].b_rows = kWinK; mma[0].b_cols = kWinN;
   mma[0].c_rows = kWinM; mma[0].c_cols = kWinN;
@@ -322,7 +324,7 @@ int main() {
 
   float max_err = 0.0f;
   int errors = 0;
-  constexpr float tol = 1e-2f;
+  constexpr float tol = 0.5f;
   uint32_t m_tiles_total = kMatM / kTileM;  // 32
   uint32_t n_tiles_total = kMatN / kTileN;  // 32
 
@@ -338,7 +340,7 @@ int main() {
       uint32_t n_blk = nt % (kWinN / kTileN);
       const uint8_t* block_base = h_out.data() + (mg * kNGroups + ng) * kCWinBytes;
 
-      // 从 32×32 fp16 output block 中提取 16×16 tile
+      // 从 32x32 fp8 output block 中提取 16x16 tile
       for (uint32_t i = 0; i < kTileM; ++i)
         for (uint32_t j = 0; j < kTileN; ++j) {
           uint32_t row = m_blk * kTileM + i;

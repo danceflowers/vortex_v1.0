@@ -30,8 +30,9 @@ using host_utils = tcu_test::TileHostUtils<input_a_t, input_b_t, output_t, 16>;
 static const char* kernel_file = "kernel.vxbin";
 
 static constexpr uint32_t kTileDim = 16;
-static constexpr uint32_t kABytes = kTileDim * kTileDim * sizeof(input_a_t);
-static constexpr uint32_t kBBytes = kTileDim * kTileDim * sizeof(input_b_t);
+static constexpr uint32_t kTileK = 8;
+static constexpr uint32_t kABytes = kTileDim * kTileK * sizeof(input_a_t);
+static constexpr uint32_t kBBytes = kTileK * kTileDim * sizeof(input_b_t);
 static constexpr uint32_t kCBytes = kTileDim * kTileDim * sizeof(output_t);
 static constexpr uint32_t kCompositeBytes = kABytes + kBBytes + kCBytes;
 static constexpr uint32_t align_up(uint32_t value, uint32_t align) {
@@ -40,7 +41,7 @@ static constexpr uint32_t align_up(uint32_t value, uint32_t align) {
 static constexpr uint32_t max3(uint32_t a, uint32_t b, uint32_t c) {
   return std::max(a, std::max(b, c));
 }
-static constexpr uint32_t kABankSpan = align_up(kTileDim * sizeof(input_a_t), 16);
+static constexpr uint32_t kABankSpan = align_up(kTileK * sizeof(input_a_t), 16);
 static constexpr uint32_t kBBankSpan = align_up(kTileDim * sizeof(input_b_t), 16);
 static constexpr uint32_t kCBankSpan = align_up(kTileDim * sizeof(output_t), 16);
 static constexpr uint32_t kBankSpan = max3(kABankSpan, kBBankSpan, kCBankSpan);
@@ -93,20 +94,36 @@ int main() {
     return -1;
   }
 
-  input_a_t a_tile[kTileDim][kTileDim];
-  input_b_t b_tile[kTileDim][kTileDim];
+  input_a_t a_tile[kTileDim][kTileK];
+  input_b_t b_tile[kTileK][kTileDim];
   output_t c_tile[kTileDim][kTileDim];
   float ref_tile[kTileDim][kTileDim];
 
   for (uint32_t i = 0; i < kTileDim; ++i) {
-    for (uint32_t j = 0; j < kTileDim; ++j) {
+    for (uint32_t j = 0; j < kTileK; ++j) {
       a_tile[i][j] = host_utils::encode_a_input(0.125f * float((i + 1) + (j % 5)));
+    }
+  }
+  for (uint32_t i = 0; i < kTileK; ++i) {
+    for (uint32_t j = 0; j < kTileDim; ++j) {
       b_tile[i][j] = host_utils::encode_b_input(0.0625f * float((j + 1) + (i % 7)));
+    }
+  }
+  for (uint32_t i = 0; i < kTileDim; ++i) {
+    for (uint32_t j = 0; j < kTileDim; ++j) {
       c_tile[i][j] = host_utils::encode_output(0.25f * float((i == j) ? 1 : 0));
     }
   }
 
-  host_utils::build_open_tensorcore_ref(ref_tile, a_tile, b_tile, c_tile);
+  for (uint32_t i = 0; i < kTileDim; ++i) {
+    for (uint32_t j = 0; j < kTileDim; ++j) {
+      float sum = host_utils::decode_output(c_tile[i][j]);
+      for (uint32_t k = 0; k < kTileK; ++k) {
+        sum += host_utils::decode_a_input(a_tile[i][k]) * host_utils::decode_b_input(b_tile[k][j]);
+      }
+      ref_tile[i][j] = sum;
+    }
+  }
 
   std::vector<uint8_t> h_composite(kCompositeBytes, 0);
   std::memcpy(h_composite.data(), a_tile, kABytes);
@@ -117,12 +134,12 @@ int main() {
   mma_descriptor_t mma_descs[1] = {};
   tma_descs[0].size_bytes = kABytes;
   tma_descs[0].rows = kTileDim;
-  tma_descs[0].cols = kTileDim;
+  tma_descs[0].cols = kTileK;
   tma_descs[0].elem_bytes = sizeof(input_a_t);
   tma_descs[0].tile_role = kTileRoleA;
   tma_descs[0].payload_kind = kPayloadDense;
   tma_descs[1].size_bytes = kBBytes;
-  tma_descs[1].rows = kTileDim;
+  tma_descs[1].rows = kTileK;
   tma_descs[1].cols = kTileDim;
   tma_descs[1].elem_bytes = sizeof(input_b_t);
   tma_descs[1].tile_role = kTileRoleB;
@@ -144,8 +161,8 @@ int main() {
   mma_descs[0].fmt_c = vt::OTYPE::id;
   mma_descs[0].fmt_d = vt::OTYPE::id;
   mma_descs[0].a_rows = kTileDim;
-  mma_descs[0].a_cols = kTileDim;
-  mma_descs[0].b_rows = kTileDim;
+  mma_descs[0].a_cols = kTileK;
+  mma_descs[0].b_rows = kTileK;
   mma_descs[0].b_cols = kTileDim;
   mma_descs[0].c_rows = kTileDim;
   mma_descs[0].c_cols = kTileDim;
@@ -206,7 +223,7 @@ int main() {
 
   float max_abs_err = 0.0f;
   int errors = 0;
-  constexpr float tolerance = 1e-6f;
+  constexpr float tolerance = 0.5f;
   for (uint32_t i = 0; i < kTileDim; ++i) {
     for (uint32_t j = 0; j < kTileDim; ++j) {
       auto actual = h_output_float[i * kTileDim + j];

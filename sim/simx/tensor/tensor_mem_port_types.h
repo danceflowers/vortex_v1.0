@@ -19,17 +19,16 @@
 namespace vortex {
 
 // ============================================================================
-// TensorUnit（执行侧）与 TmemSystem（存储侧）之间的端口级消息定义
+// TMEM clients（TensorUnit / Core-side LMEM->TMEM transfer engine）与 TmemSystem
+// 之间的端口级消息定义
 //
-// TensorUnit 内部的 TMEM↔SRAM 传输管线通过 SimPort<TensorMemPortReq/Rsp>
-// 向 TmemSystem 发出逐包读写请求；TmemSystem 完成 TMEM 访问后返回响应。
+// 每个客户端通过 SimPort<TensorMemPortReq/Rsp> 向 TmemSystem 发出逐包
+// 读写请求；TmemSystem 把所有客户端请求汇入同一个 TMEM packet 仲裁器，
+// 完成 TMEM 访问后再返回响应。
 // 每条请求/响应恰好对应 1 个 64B TMEM 数据包事务。
 //
-// TensorAsyncOpCompletion 在异步宏操作（mma_load / mma_store / wmma）的
+// TensorAsyncOpCompletion 在异步宏操作（tcgen05.mma / tcgen05.shift）的
 // 所有微操作全部完成后由 TensorUnit 发出，通知 Core 解除等待。
-//
-// TmaRefillChunkReq/Rsp 由 TMEM_SHIFT 重填逻辑发出，经由 TMA 前端从外部
-// DRAM 获取单个 64B 行块。
 // ============================================================================
 
 // 端口级请求：跨 TensorExecuteSystem ↔ TensorMemSystem 模块边界
@@ -59,22 +58,6 @@ struct TensorMemPortRsp {
 // 以唤醒等待的 warp（TMA_WAIT / TC_FENCE）。
 struct TensorAsyncOpCompletion {
   uint32_t async_id = 0;            // 对应的异步操作 ID
-};
-
-// TMEM_SHIFT 重填请求：由 TMEM 滑窗逻辑发出，经由 TMA 前端从外部行主序
-// 存储器获取恰好 1 个 64B 行块。
-struct TmaRefillChunkReq {
-  uint64_t request_id = 0;          // 全局唯一请求 ID
-  uint32_t descriptor_id = 0;       // TMA 描述符 ID（确定数据源地址布局）
-  uint32_t chunk_idx = 0;           // 行块索引
-  uint32_t row_bytes = 0;           // 行宽字节数
-};
-
-// TMEM_SHIFT 重填响应
-struct TmaRefillChunkRsp {
-  uint64_t request_id = 0;          // 对应请求的 ID
-  bool success = false;             // 是否成功
-  TmemPacket packet = {};           // 获取到的 64B 数据包
 };
 
 } // namespace vortex

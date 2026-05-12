@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "tensor_cfg.h"
+#include "tc_add_pipe.h"
 #include "fp22_to_fp16.h"
 #include "fp_types.h"
 
@@ -91,6 +92,21 @@ public:
     for (uint32_t i = 0; i < kPrimitiveDim; ++i) {
       for (uint32_t j = 0; j < kPrimitiveDim; ++j) {
         out[i][j] = load_elem(row, i * kPrimitiveDim + j);
+      }
+    }
+  }
+
+  void accumulate_subtile_fp22(uint32_t subtile_id,
+                               const uint32_t in[kPrimitiveDim][kPrimitiveDim]) {
+    if (subtile_id >= kDepth || !row_valid_.at(subtile_id)) {
+      std::abort();
+    }
+    auto& row = rows_.at(subtile_id);
+    for (uint32_t i = 0; i < kPrimitiveDim; ++i) {
+      for (uint32_t j = 0; j < kPrimitiveDim; ++j) {
+        auto elem_idx = i * kPrimitiveDim + j;
+        auto current = load_elem(row, elem_idx);
+        store_elem(row, elem_idx, fp22_add_bits(current, in[i][j], g_cfg.rm));
       }
     }
   }

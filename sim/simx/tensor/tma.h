@@ -14,168 +14,98 @@
 #pragma once
 
 #include <cstdint>
-#include <functional>
+#include <iosfwd>
+#include <unordered_map>
 #include <vector>
-#include "tmem.h"
+#include <simobject.h>
+#include "tensor_mem_port_types.h"
 #include "types.h"
-#include "i_descriptor.h"
 
 namespace vortex {
 
-// Software-visible TMA transfer descriptor.
-//
-// The descriptor describes one external-memory matrix window and the logical
-// TMEM destination/source footprint used by the Core-side TMA engine.
-struct TmaDescriptor {
-  uint64_t addr = 0;
-  uint32_t size_bytes = 0;
-  uint32_t stride_bytes = 0;
-  uint16_t rows = 0;
-  uint16_t cols = 0;
-  uint16_t elem_bytes = 0;
-  uint16_t flags = 0;
-  uint64_t meta_addr = 0;
-  uint32_t meta_size_bytes = 0;
-  uint16_t tmem_base = 0;
-  uint16_t meta_tmem_base = 0;
-  // Legacy field name retained for ABI compatibility. In the current model it
-  // denotes the allocation span in logical TMEM columns, not physical banks.
-  uint16_t bank_span = 0;
-  uint16_t meta_col_span = 0;
-  uint8_t tile_role = static_cast<uint8_t>(TcuTarget::None);
-  uint8_t payload_kind = static_cast<uint8_t>(TcuPayloadKind::Dense);
-  uint8_t transpose = 0;     // TMA 以转置寻址模式从 DRAM 读取
-  uint8_t reserved = 0;
-} __attribute__((packed));
+class Core;
 
-// IDescriptor is the legacy software descriptor-table entry used by TMA/TMEM
-// setup paths. Do not confuse it with idescriptor_t, the 32-bit tcgen05.mma
-// instruction descriptor carried directly by each TCU_MMA instruction.
+struct TmaCpAsyncBulkResult {
+  uint32_t payload_size_bytes = 0;
+  uint64_t tx_bound_mbar = 0;
+  uint32_t tx_bytes = 0;
+};
 
-// Front-end TMA timing/descriptor helper.
+// Tensor Memory Accelerator front-end.
 //
 // Hardware view:
-// - fetch descriptor tables from device memory
-// - estimate launch/setup latency for a TMA transaction
-// - marshal row-major payload / metadata bytes between device memory and the
-//   packet-sized reorder buffers that feed TMEM ingress
-//
-// Per-cycle TMEM packet progression happens later in Core once an
-// AsyncTensorOp has been issued.
-class TmaModel {
+// - owns the TMA-facing data movement helpers that were previously embedded in
+//   Core
+// - talks to TMEM through packet-level SimPorts
+// - keeps the existing functional DRAM/LMEM behavior by using Core's memory
+//   callbacks; CacheReqOut/CacheRspIn are exposed for future cache-timing
+//   wiring without changing the current data path semantics
+class Tma : public SimObject<Tma> {
 public:
-  using ReadCallback = std::function<void(void*, uint64_t, uint32_t)>;
-  using WriteCallback = std::function<void(const void*, uint64_t, uint32_t)>;
+  SimPort<TensorMemPortReq> TmemReqOut;
+  SimPort<TensorMemPortRsp> TmemRspIn;
+  SimPort<TensorAsyncOpCompletion> AsyncOpCompletionOut;
+  std::vector<SimPort<MemReq>> CacheReqOut;
+  std::vector<SimPort<MemRsp>> CacheRspIn;
 
-  static constexpr uint32_t kLoadBaseLatency = 12;   // descriptor fetch + addr xlat + pipeline setup
-  static constexpr uint32_t kLoadBytesPerCycle = 64;
-  static constexpr uint32_t kStoreBaseLatency = 12;
-  static constexpr uint32_t kStoreBytesPerCycle = 64;
-  static constexpr uint32_t kTransposePenalty = 8;
-
-  explicit TmaModel(bool realistic_load = true);
+  Tma(const SimContext& ctx, const char* name, Core* core);
 
   void reset();
+  void tick();
 
-  bool read_tma_descriptor(uint64_t startup_arg,
-                           uint32_t desc_id,
-                           TmaDescriptor* out,
-                           const ReadCallback& dcache_read);
+  static bool is_lmem_addr(uint64_t addr);
+  static uint32_t element_type_bytes(uint8_t element_type);
 
-  bool read_idescriptor(uint64_t startup_arg,
-                           uint32_t desc_id,
-                           IDescriptor* out,
-                           const ReadCallback& dcache_read);
+  TmaCpAsyncBulkResult cpabulk_tensor_load(uint64_t tensor_map_addr,
+                                           uint64_t args_lmem_ptr,
+                                           bool complete_tx);
 
-  uint32_t estimate_load_latency(const TmaDescriptor& desc) const;
-  uint32_t payload_size_bytes(const TmaDescriptor& desc) const;
-  uint32_t payload_packet_count(const TmaDescriptor& desc) const;
-  uint32_t meta_packet_count(const TmaDescriptor& desc) const;
+  TmaCpAsyncBulkResult cpabulk_tensor_store(uint64_t tensor_map_addr,
+                                            uint64_t args_lmem_ptr);
 
-  bool load_linear_packet(uint64_t base_addr,
-                          uint32_t size_bytes,
-                          uint32_t packet_idx,
-                          TmemPacket* out,
-                          const ReadCallback& dcache_read) const;
+  bool issue_lmem_to_tmem_copy(uint32_t async_id,
+                               uint32_t wid,
+                               uint32_t wgid,
+                               uint32_t col_base,
+                               uint32_t col_span,
+                               uint64_t lmem_addr,
+                               uint32_t byte_offset,
+                               uint32_t total_bytes);
 
-  void store_linear_packet(uint64_t base_addr,
-                           uint32_t size_bytes,
-                           uint32_t packet_idx,
-                           const TmemPacket& packet,
-                           const WriteCallback& dcache_write) const;
-
-  bool load_math_packet(uint64_t base_addr,
-                        uint32_t row_stride_bytes,
-                        uint32_t rows,
-                        uint32_t cols,
-                        uint32_t elem_bytes,
-                        const TmemWindowPlan& window,
-                        uint32_t packet_idx,
-                        TmemPacket* out,
-                        const ReadCallback& dcache_read,
-                        bool transpose = false) const;
-
-  void store_math_packet(uint64_t base_addr,
-                         uint32_t row_stride_bytes,
-                         uint32_t rows,
-                         uint32_t cols,
-                         uint32_t elem_bytes,
-                         const TmemWindowPlan& window,
-                         uint32_t packet_idx,
-                         const TmemPacket& packet,
-                         const WriteCallback& dcache_write) const;
-
-  bool load_payload_packet(const TmaDescriptor& desc,
-                           uint32_t payload_size_bytes,
-                           const TmemWindowPlan* payload_window,
-                           uint32_t packet_idx,
-                           TmemPacket* out,
-                           const ReadCallback& dcache_read) const;
-
-  void store_payload_packet(const TmaDescriptor& desc,
-                            uint32_t payload_size_bytes,
-                            const TmemWindowPlan* payload_window,
-                            uint32_t packet_idx,
-                            const TmemPacket& packet,
-                            const WriteCallback& dcache_write) const;
-
-  bool load_meta_packet(const TmaDescriptor& desc,
-                        uint32_t meta_size_bytes,
-                        const TmemWindowPlan* meta_window,
-                        uint32_t packet_idx,
-                        TmemPacket* out,
-                        const ReadCallback& dcache_read) const;
-
-  bool load_row_chunk_packet(uint64_t base_addr,
-                             uint32_t row_stride_bytes,
-                             uint32_t row_idx,
-                             uint32_t chunk_idx,
-                             uint32_t row_bytes,
-                             TmemPacket* out,
-                             const ReadCallback& dcache_read) const;
-
-  bool load_payload(const TmaDescriptor& desc,
-                    uint32_t capacity,
-                    std::vector<uint8_t>* out,
-                    const ReadCallback& dcache_read) const;
-
-  bool load_meta(const TmaDescriptor& desc,
-                 uint32_t capacity,
-                 std::vector<uint8_t>* out,
-                 const ReadCallback& dcache_read) const;
-
-  void store_payload(const TmaDescriptor& desc,
-                     const uint8_t* data,
-                     uint32_t size_bytes,
-                     const WriteCallback& dcache_write) const;
+  void dump_debug_state(std::ostream& os) const;
 
 private:
-  bool ensure_descriptor_tables_loaded(uint64_t startup_arg, const ReadCallback& dcache_read);
+  enum class LmemToTmemCopyStage : uint8_t {
+    Ready = 0,
+    WaitRead,
+    WaitWrite,
+  };
 
-  bool descriptor_tables_loaded_;
-  bool realistic_load_;
-  std::vector<TmaDescriptor> tma_desc_table_;
-  std::vector<IDescriptor> mma_desc_table_;
+  struct PendingLmemToTmemCopyOp {
+    uint32_t async_id = 0;
+    uint32_t wid = 0;
+    uint32_t wgid = 0;
+    uint32_t col_base = 0;
+    uint32_t col_span = 0;
+    uint64_t lmem_addr = 0;
+    uint32_t byte_offset = 0;
+    uint32_t total_bytes = 0;
+    uint32_t cursor = 0;
+    LmemToTmemCopyStage stage = LmemToTmemCopyStage::Ready;
+    uint64_t request_id = 0;
+    uint32_t packet_idx = 0;
+    uint32_t packet_offset = 0;
+    uint32_t packet_bytes = 0;
+    TmemPacket packet = {};
+  };
+
+  Core* core_;
+  std::unordered_map<uint32_t, PendingLmemToTmemCopyOp> pending_lmem_to_tmem_copy_ops_;
+  std::unordered_map<uint64_t, TensorMemPortRsp> completed_lmem_to_tmem_transfer_responses_;
+  uint64_t next_lmem_to_tmem_request_id_;
+
+  void drain_tmem_responses();
+  void advance_lmem_to_tmem_copy_ops();
 };
 
 } // namespace vortex

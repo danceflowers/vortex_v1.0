@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include "config_register.h"
-#include "sparse_select.h"
 #include "tc_mul_add.h"
 #include "fp_types.h"
 
@@ -27,10 +26,10 @@ struct TensorCoreRetire {
 };
 
 // =============================================================================
-//  TensorCoreTop — 8x8 脉动阵列顶层模块
+//  TensorCoreTop — 8x8 顶层模块
 // =============================================================================
 //
-//  m16n16k8 基本计算粒度，4 个 8x8 subtile per WMMA。
+//  m16n16k16 基本计算粒度，4 个 8x8 subtile per WMMA。
 //
 //  C 操作数双路供给：
 //    - 非输出驻留模式：c_in[M][N] 从发射时注入，沿管线透传到 final_add
@@ -186,13 +185,13 @@ struct TensorCoreTop {
         input_loaded = true;
     }
 
-    // 输出驻留模式简化版（不传 C，C 由 FIFO 提供）
-    void push_uop(const uint16_t a[M][K],
-                  const uint16_t b[K][N],
-                  const TensorCoreMeta& meta) {
-        uint32_t zero_c[M][N] = {};
-        push_uop(a, b, zero_c, meta);
-    }
+    // // 输出驻留模式简化版（不传 C，C 由 FIFO 提供）
+    // void push_uop(const uint16_t a[M][K],
+    //               const uint16_t b[K][N],
+    //               const TensorCoreMeta& meta) {
+    //     uint32_t zero_c[M][N] = {};
+    //     push_uop(a, b, zero_c, meta);
+    // }
 
     bool pop_retired(TensorCoreRetire* out) {
         if (!retired.valid) return false;
@@ -206,28 +205,12 @@ struct TensorCoreTop {
         cycle_count++;
         retired.valid = false;
 
-        uint16_t routed_a[M][K] = {};
-        uint16_t routed_b[K][N] = {};
-        const uint16_t (*a_src)[K] = a_in;
-        const uint16_t (*b_src)[N] = b_in;
-
-        if (staged_valid
-         && vortex::sparse::route_sparse_primitive(staged_meta.sparse_mode,
-                                                   staged_meta.sparse_meta,
-                                                   a_in,
-                                                   b_in,
-                                                   routed_a,
-                                                   routed_b)) {
-            a_src = routed_a;
-            b_src = routed_b;
-        }
-
         // 阶段 1: 广播输入到 64 个计算单元
         for (int i = 0; i < M; ++i) {
             for (int j = 0; j < N; ++j) {
                 for (int k = 0; k < K; ++k) {
-                    tc_dot_product[i][j].mul_add_input.a_in[k] = a_src[i][k];
-                    tc_dot_product[i][j].mul_add_input.b_in[k] = b_src[k][j];
+                    tc_dot_product[i][j].mul_add_input.a_in[k] = a_in[i][k];
+                    tc_dot_product[i][j].mul_add_input.b_in[k] = b_in[k][j];
                 }
                 tc_dot_product[i][j].mul_add_input.c_in = c_in[i][j];
                 tc_dot_product[i][j].mul_add_input.prec =

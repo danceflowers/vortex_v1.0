@@ -14,87 +14,29 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
-#include <cstdlib>
-#include <numeric>
 #include <sstream>
 #include <vector>
 #include "tensor_cfg.h"
 #include "tmem.h"
+#include "tmem_utils.h"
 
 using namespace vortex;
 
 namespace {
 
-// Tmem.cpp implements the back half of the tensor-memory path:
-// - logical TMEM allocations and planned windows
+// Tmem.cpp implements the back half of the PTX tensor-memory path:
+// - logical TMEM allocations addressed by TADDR lane base
 // - logical (column, line) to physical (bank, row, byte) mapping
 // - per-cycle ingress/egress arbitration
-// - logical-line and math-row shift helpers used by TMEM_SHIFT
-
-uint32_t configured_tmem_bank_count() {
-  constexpr uint32_t kDefault = Tmem::kDefaultPhysicalBanks;
-  auto value = std::getenv("VORTEX_SIMX_TMEM_BANKS");
-  if (nullptr == value || '\0' == value[0]) {
-    return kDefault;
-  }
-  char* end = nullptr;
-  auto parsed = std::strtoul(value, &end, 0);
-  if (end == value
-   || *end != '\0'
-   || parsed < Tmem::kPacketLanes
-   || parsed > 256) {
-    return kDefault;
-  }
-  return static_cast<uint32_t>(parsed);
-}
-
-uint32_t choose_coprime_stride(uint32_t count, uint32_t preferred) {
-  if (count <= 1) {
-    return 1;
-  }
-
-  preferred = std::min<uint32_t>(std::max<uint32_t>(1, preferred), count - 1);
-
-  for (uint32_t candidate = preferred; candidate >= 1; --candidate) {
-    if (std::gcd(candidate, count) == 1) {
-      return candidate;
-    }
-    if (candidate == 1) {
-      break;
-    }
-  }
-
-  for (uint32_t candidate = preferred + 1; candidate < count; ++candidate) {
-    if (std::gcd(candidate, count) == 1) {
-      return candidate;
-    }
-  }
-
-  return 1;
-}
-
-uint32_t fmt_bytes(uint32_t fmt) {
-  switch (fmt) {
-  case vortex::tensor::fp8::id:
-  case vortex::tensor::uint8::id:
-    return 1;
-  case vortex::tensor::fp16::id:
-  case vortex::tensor::bf16::id:
-    return 2;
-  case vortex::tensor::fp32::id:
-    return 4;
-  default:
-    return 0;
-  }
-}
+// - logical-line shift used by tcgen05.shift
 
 } // namespace
 
 Tmem::Tmem()
-  : num_physical_banks_(configured_tmem_bank_count())
+  : num_physical_banks_(tmem_functional::configured_physical_bank_count(kDefaultPhysicalBanks, kPacketLanes))
   , bank_slice_bytes_(kPhysicalBankBytes)
-  , bank_swizzle_base_stride_(choose_coprime_stride(num_physical_banks_, (num_physical_banks_ / 4) + 1))
-  , bank_swizzle_lane_stride_(choose_coprime_stride(num_physical_banks_, (num_physical_banks_ / 2) - 1))
+  , bank_swizzle_base_stride_(tmem_functional::choose_coprime_stride(num_physical_banks_, (num_physical_banks_ / 4) + 1))
+  , bank_swizzle_lane_stride_(tmem_functional::choose_coprime_stride(num_physical_banks_, (num_physical_banks_ / 2) - 1))
   , allocator_sealed_(false)
   , next_handle_(1)
   , port_cycle_(std::numeric_limits<uint64_t>::max())
@@ -107,26 +49,17 @@ Tmem::Tmem()
 }
 
 uint32_t Tmem::ceil_div(uint32_t value, uint32_t divisor) {
-  return (value + divisor - 1) / divisor;
+  return tmem_functional::ceil_div(value, divisor);
 }
 
 void Tmem::resize_storage() {
-  banks_.assign(num_physical_banks_, std::vector<PhysicalRow>(kPhysicalRows));
-  for (auto& bank : banks_) {
-    for (auto& row : bank) {
-      row.assign(bank_slice_bytes_, 0);
-    }
-  }
+  tmem_functional::resize_storage(&banks_, num_physical_banks_, kPhysicalRows, bank_slice_bytes_);
   read_bank_budgets_.assign(num_physical_banks_, 0);
   write_bank_budgets_.assign(num_physical_banks_, 0);
 }
 
 void Tmem::reset() {
-  for (auto& bank : banks_) {
-    for (auto& row : bank) {
-      std::fill(row.begin(), row.end(), 0);
-    }
-  }
+  tmem_functional::reset_storage(&banks_);
   payload_col_allocs_.fill(false);
   allocations_.clear();
   allocator_sealed_ = false;
@@ -148,13 +81,8 @@ void Tmem::reset() {
 bool Tmem::port_request_is_write(PortRequestKind kind) const {
   switch (kind) {
   case PortRequestKind::RegionWrite:
-  case PortRequestKind::WindowWrite:
-  case PortRequestKind::WindowLinearWrite:
-  case PortRequestKind::WindowLineWrite:
     return true;
   case PortRequestKind::RegionRead:
-  case PortRequestKind::WindowRead:
-  case PortRequestKind::WindowLinearRead:
     return false;
   default:
     std::abort();
@@ -188,13 +116,9 @@ uint64_t Tmem::enqueue_port_request(uint64_t cycle, const PortRequestDesc& desc)
   request.age = desc.age;
   request.submit_cycle = cycle;
   request.kind = desc.kind;
-  request.handle = desc.handle;
-  request.window_id = desc.window_id;
   request.packet_idx = desc.packet_idx;
   request.col_base = desc.col_base;
   request.col_span = desc.col_span;
-  request.line_idx = desc.line_idx;
-  request.chunk_idx = desc.chunk_idx;
   auto tag = request.tag;
   pending_requests_.emplace(tag, request);
   insert_pending_request(tag, port_request_is_write(desc.kind));
@@ -215,18 +139,6 @@ bool Tmem::try_grant_request(const PortRequest& request, uint64_t cycle) {
     return try_acquire_region_packet(cycle, request.col_base, request.col_span, request.packet_idx, false);
   case PortRequestKind::RegionWrite:
     return try_acquire_region_packet(cycle, request.col_base, request.col_span, request.packet_idx, true);
-  case PortRequestKind::WindowRead:
-    return try_acquire_window_packet(cycle, request.handle, request.window_id, request.packet_idx, false);
-  case PortRequestKind::WindowWrite:
-    return try_acquire_window_packet(cycle, request.handle, request.window_id, request.packet_idx, true);
-  case PortRequestKind::WindowLinearRead:
-    return try_acquire_window_linear_packet(cycle, request.handle, request.window_id, request.packet_idx, false);
-  case PortRequestKind::WindowLinearWrite:
-    return try_acquire_window_linear_packet(cycle, request.handle, request.window_id, request.packet_idx, true);
-  case PortRequestKind::WindowLineRead:
-    return try_acquire_window_line_chunk(cycle, request.handle, request.window_id, request.line_idx, request.chunk_idx, false);
-  case PortRequestKind::WindowLineWrite:
-    return try_acquire_window_line_chunk(cycle, request.handle, request.window_id, request.line_idx, request.chunk_idx, true);
   default:
     std::abort();
   }
@@ -300,13 +212,7 @@ bool Tmem::find_allocation_by_lane(uint32_t lane, uint32_t* col_base) const {
 }
 
 bool Tmem::region_query(uint32_t col_base, uint32_t col_span, uint32_t* size_bytes) const {
-  if (col_span == 0 || col_base >= kNumCols || (col_base + col_span) > kNumCols) {
-    return false;
-  }
-  if (size_bytes) {
-    *size_bytes = col_span * kColBytes;
-  }
-  return true;
+  return tmem_functional::region_query(col_base, col_span, kNumCols, kColBytes, size_bytes);
 }
 
 bool Tmem::query(uint32_t handle, uint32_t* col_span, uint32_t* size_bytes) const {
@@ -321,17 +227,24 @@ bool Tmem::query(uint32_t handle, uint32_t* col_span, uint32_t* size_bytes) cons
 }
 
 uint32_t Tmem::line_chunk_bank(uint32_t logical_line, uint32_t chunk_idx) const {
-  auto physical_row = logical_line / 2;
-  auto line_slot = logical_line % 2;
-  auto base = (physical_row * bank_swizzle_base_stride_) % num_physical_banks_;
-  return (base + line_slot * kPacketLanes + chunk_idx) % num_physical_banks_;
+  return tmem_functional::line_chunk_bank(logical_line,
+                                          chunk_idx,
+                                          num_physical_banks_,
+                                          bank_swizzle_base_stride_,
+                                          kPacketLanes);
 }
 
 uint32_t Tmem::packet_lane_bank(uint32_t logical_col,
                                 uint32_t packet_in_col,
                                 uint32_t lane) const {
-  auto logical_line = packet_in_col * kPacketLanes + lane;
-  return line_chunk_bank(logical_line % kLogicalLines, logical_col / kPhysicalBankBytes);
+  return tmem_functional::packet_lane_bank(logical_col,
+                                           packet_in_col,
+                                           lane,
+                                           num_physical_banks_,
+                                           kPhysicalBankBytes,
+                                           kLogicalLines,
+                                           bank_swizzle_base_stride_,
+                                           kPacketLanes);
 }
 
 void Tmem::logical_byte_to_physical(uint32_t logical_col,
@@ -339,16 +252,15 @@ void Tmem::logical_byte_to_physical(uint32_t logical_col,
                                     uint32_t* bank,
                                     uint32_t* row,
                                     uint32_t* bank_byte) const {
-  auto chunk_idx = logical_col / kPhysicalBankBytes;
-  if (bank) {
-    *bank = line_chunk_bank(logical_line, chunk_idx);
-  }
-  if (row) {
-    *row = logical_line / 2;
-  }
-  if (bank_byte) {
-    *bank_byte = logical_col % kPhysicalBankBytes;
-  }
+  tmem_functional::logical_byte_to_physical(logical_col,
+                                            logical_line,
+                                            num_physical_banks_,
+                                            kPhysicalBankBytes,
+                                            bank_swizzle_base_stride_,
+                                            kPacketLanes,
+                                            bank,
+                                            row,
+                                            bank_byte);
 }
 
 uint8_t Tmem::read_logical_byte(uint32_t logical_col, uint32_t logical_line) const {
@@ -471,18 +383,13 @@ bool Tmem::region_packet_location(uint32_t col_base,
                                   uint32_t col_span,
                                   uint32_t packet_idx,
                                   uint32_t* logical_col) {
-  if (col_span == 0 || col_base >= kNumCols || (col_base + col_span) > kNumCols) {
-    return false;
-  }
-  uint32_t size_bytes = col_span * kColBytes;
-  uint32_t offset = packet_idx * kPacketBytes;
-  if (offset + kPacketBytes > size_bytes) {
-    return false;
-  }
-  if (logical_col) {
-    *logical_col = col_base + (offset / kColBytes);
-  }
-  return true;
+  return tmem_functional::region_packet_location(col_base,
+                                                 col_span,
+                                                 packet_idx,
+                                                 kNumCols,
+                                                 kColBytes,
+                                                 kPacketBytes,
+                                                 logical_col);
 }
 
 bool Tmem::region_write_packet(uint32_t col_base, uint32_t col_span, uint32_t packet_idx, const TmemPacket& in) {
@@ -557,18 +464,14 @@ uint32_t Tmem::alloc(uint32_t col_span) {
   // the chosen col_base (lane base) directly. allocations_ is now keyed by
   // col_base instead of an opaque handle counter.
   // Failure sentinel: kInvalidTaddr (0xFFFFFFFFu) — col_base 0 is a valid taddr.
-  auto granularity = TmemWindowPlanner::kMinAllocationCols;
+  constexpr uint32_t granularity = 16;
   if (col_span == 0) {
-    fprintf(stderr, "[TMEM_ALLOC_DBG] col_span==0, returning invalid\n");
     return kInvalidTaddr;
   }
   col_span = ceil_div(col_span, granularity) * granularity;
   if (allocator_sealed_ || col_span > kPayloadCols) {
-    fprintf(stderr, "[TMEM_ALLOC_DBG] sealed=%d col_span=%u kPayloadCols=%u, invalid\n",
-            (int)allocator_sealed_, col_span, kPayloadCols);
     return kInvalidTaddr;
   }
-  fprintf(stderr, "[TMEM_ALLOC_DBG] entering scan loop col_span=%u\n", col_span);
 
   for (uint32_t start_col = 0; start_col + col_span <= kPayloadCols; ++start_col) {
     bool available = true;
@@ -595,21 +498,13 @@ uint32_t Tmem::alloc(uint32_t col_span) {
     allocation.payload_col_base = start_col;
     allocation.col_span = col_span;
     allocation.row_bytes = col_span;
-    allocation.visible_layout_epoch = allocation.layout_epoch;
     allocation.visible_payload_ready = allocation.payload_ready;
     allocation.visible_meta_ready = allocation.meta_ready;
     allocations_[taddr] = allocation;
-    fprintf(stderr, "[TMEM_ALLOC_DBG] success: taddr=%u col_span=%u (allocations_.size=%zu)\n",
-            taddr, col_span, allocations_.size());
     assert_valid();
     return taddr;
   }
 
-  fprintf(stderr, "[TMEM_ALLOC_DBG] no free range found for col_span=%u\n", col_span);
-  for (uint32_t i = 0; i < kPayloadCols; ++i) {
-    fprintf(stderr, "%c", payload_col_allocs_[i] ? '1' : '0');
-  }
-  fprintf(stderr, "\n");
   return kInvalidTaddr;
 }
 
@@ -636,577 +531,6 @@ bool Tmem::allocator_sealed() const {
   return allocator_sealed_;
 }
 
-uint32_t Tmem::resolve_window_col_base(const TmemAllocation& allocation,
-                                       const TmemWindowPlan& window) const {
-  if ((window.logical_col_base + window.logical_col_span) <= allocation.col_span) {
-    return allocation.payload_col_base + window.logical_col_base;
-  }
-  return window.logical_col_base;
-}
-
-bool Tmem::window_packet_location(uint32_t handle,
-                                  uint32_t window_id,
-                                  uint32_t packet_idx,
-                                  uint32_t* logical_col_base,
-                                  uint32_t* logical_line_base,
-                                  uint32_t* logical_col_span,
-                                  uint32_t* logical_line_span) const {
-  const TmemAllocation* allocation = nullptr;
-  const TmemWindowPlan* window = nullptr;
-  if (!lookup_allocation(handle, &allocation)
-   || !lookup_window(handle, window_id, &window)
-   || window->logical_packet_col_span == 0
-   || window->logical_packet_line_span == 0) {
-    return false;
-  }
-
-  auto packets_per_row = ceil_div(window->logical_col_span, window->logical_packet_col_span);
-  auto packets_per_col = ceil_div(window->logical_line_span, window->logical_packet_line_span);
-  auto packet_count = packets_per_row * packets_per_col;
-  if (packet_idx >= packet_count) {
-    return false;
-  }
-
-  auto packet_row = packet_idx / packets_per_row;
-  auto packet_col = packet_idx % packets_per_row;
-  auto line_offset = packet_row * window->logical_packet_line_span;
-  auto col_offset = packet_col * window->logical_packet_col_span;
-  auto abs_col_base = resolve_window_col_base(*allocation, *window);
-  auto abs_line_base = window->logical_line_base + line_offset;
-  auto abs_col_span = std::min(window->logical_packet_col_span, window->logical_col_span - col_offset);
-  auto abs_line_span = std::min(window->logical_packet_line_span, window->logical_line_span - line_offset);
-  if ((abs_col_base + col_offset + abs_col_span) > kNumCols
-   || (abs_line_base + abs_line_span) > kLogicalLines) {
-    return false;
-  }
-
-  if (logical_col_base) {
-    *logical_col_base = abs_col_base + col_offset;
-  }
-  if (logical_line_base) {
-    *logical_line_base = abs_line_base;
-  }
-  if (logical_col_span) {
-    *logical_col_span = abs_col_span;
-  }
-  if (logical_line_span) {
-    *logical_line_span = abs_line_span;
-  }
-  return true;
-}
-
-// Resolve one logical line chunk within a planned window into an absolute
-// logical TMEM region. This is used by top-line refill traffic, which is
-// expressed as line chunks rather than generic tile packets.
-bool Tmem::resolve_window_line_chunk_region(uint32_t handle,
-                                            uint32_t window_id,
-                                            uint32_t line_idx,
-                                            uint32_t chunk_idx,
-                                            uint32_t* logical_col_base,
-                                            uint32_t* logical_line_base,
-                                            uint32_t* logical_col_span) const {
-  const TmemAllocation* allocation = nullptr;
-  const TmemWindowPlan* window = nullptr;
-  if (!lookup_allocation(handle, &allocation)
-   || !lookup_window(handle, window_id, &window)
-   || window->logical_col_span == 0
-   || window->logical_line_span == 0
-   || line_idx >= window->logical_line_span) {
-    return false;
-  }
-
-  auto chunks_per_line = ceil_div(window->logical_col_span, kPacketBytes);
-  if (chunk_idx >= chunks_per_line) {
-    return false;
-  }
-
-  auto col_offset = chunk_idx * kPacketBytes;
-  auto abs_col_base = resolve_window_col_base(*allocation, *window);
-  auto abs_line_base = window->logical_line_base + line_idx;
-  auto abs_col_span = std::min(kPacketBytes, window->logical_col_span - col_offset);
-  if ((abs_col_base + col_offset + abs_col_span) > kNumCols
-   || abs_line_base >= kLogicalLines) {
-    return false;
-  }
-
-  if (logical_col_base) {
-    *logical_col_base = abs_col_base + col_offset;
-  }
-  if (logical_line_base) {
-    *logical_line_base = abs_line_base;
-  }
-  if (logical_col_span) {
-    *logical_col_span = abs_col_span;
-  }
-  return true;
-}
-
-// Resolve one packet in the window-linear view used by legacy traffic and
-// line-oriented refill helpers. The returned byte_offset/valid_bytes describe
-// where this packet falls inside the window's logical rectangle.
-bool Tmem::resolve_window_linear_packet_region(uint32_t handle,
-                                               uint32_t window_id,
-                                               uint32_t packet_idx,
-                                               uint32_t* logical_col_base,
-                                               uint32_t* logical_line_base,
-                                               uint32_t* logical_col_span,
-                                               uint32_t* byte_offset,
-                                               uint32_t* valid_bytes) const {
-  const TmemAllocation* allocation = nullptr;
-  const TmemWindowPlan* window = nullptr;
-  if (!lookup_allocation(handle, &allocation)
-   || !lookup_window(handle, window_id, &window)
-   || window->logical_col_span == 0
-   || window->logical_line_span == 0) {
-    return false;
-  }
-
-  uint32_t total_bytes = window->logical_col_span * window->logical_line_span;
-  uint32_t offset = packet_idx * kPacketBytes;
-  if (offset >= total_bytes) {
-    return false;
-  }
-
-  if (logical_col_base) {
-    *logical_col_base = resolve_window_col_base(*allocation, *window);
-  }
-  if (logical_line_base) {
-    *logical_line_base = window->logical_line_base;
-  }
-  if (logical_col_span) {
-    *logical_col_span = window->logical_col_span;
-  }
-  if (byte_offset) {
-    *byte_offset = offset;
-  }
-  if (valid_bytes) {
-    *valid_bytes = std::min<uint32_t>(kPacketBytes, total_bytes - offset);
-  }
-  return true;
-}
-
-bool Tmem::read_window_packet(uint32_t handle, uint32_t window_id, uint32_t packet_idx, TmemPacket* out) const {
-  if (nullptr == out) {
-    return false;
-  }
-  uint32_t col_base = 0;
-  uint32_t line_base = 0;
-  uint32_t col_span = 0;
-  uint32_t line_span = 0;
-  if (!window_packet_location(handle, window_id, packet_idx, &col_base, &line_base, &col_span, &line_span)) {
-    return false;
-  }
-  out->bytes.fill(0);
-  uint32_t offset = 0;
-  for (uint32_t line = 0; line < line_span; ++line) {
-    for (uint32_t col = 0; col < col_span; ++col) {
-      out->bytes.at(offset++) = read_logical_byte(col_base + col, line_base + line);
-    }
-  }
-  return true;
-}
-
-bool Tmem::write_window_packet(uint32_t handle, uint32_t window_id, uint32_t packet_idx, const TmemPacket& in) {
-  uint32_t col_base = 0;
-  uint32_t line_base = 0;
-  uint32_t col_span = 0;
-  uint32_t line_span = 0;
-  if (!window_packet_location(handle, window_id, packet_idx, &col_base, &line_base, &col_span, &line_span)) {
-    return false;
-  }
-  uint32_t offset = 0;
-  for (uint32_t line = 0; line < line_span; ++line) {
-    for (uint32_t col = 0; col < col_span; ++col) {
-      write_logical_byte(col_base + col, line_base + line, in.bytes.at(offset++));
-    }
-  }
-  assert_valid();
-  return true;
-}
-
-bool Tmem::read_window_linear_packet(uint32_t handle, uint32_t window_id, uint32_t packet_idx, TmemPacket* out) const {
-  if (nullptr == out) {
-    return false;
-  }
-  uint32_t col_base = 0;
-  uint32_t line_base = 0;
-  uint32_t col_span = 0;
-  uint32_t byte_offset = 0;
-  uint32_t valid_bytes = 0;
-  if (!resolve_window_linear_packet_region(handle, window_id, packet_idx,
-                                 &col_base, &line_base, &col_span,
-                                 &byte_offset, &valid_bytes)) {
-    return false;
-  }
-  out->bytes.fill(0);
-  for (uint32_t i = 0; i < valid_bytes; ++i) {
-    auto local_offset = byte_offset + i;
-    auto logical_line = line_base + (local_offset / col_span);
-    auto logical_col = col_base + (local_offset % col_span);
-    out->bytes.at(i) = read_logical_byte(logical_col, logical_line);
-  }
-  return true;
-}
-
-bool Tmem::write_window_linear_packet(uint32_t handle, uint32_t window_id, uint32_t packet_idx, const TmemPacket& in) {
-  uint32_t col_base = 0;
-  uint32_t line_base = 0;
-  uint32_t col_span = 0;
-  uint32_t byte_offset = 0;
-  uint32_t valid_bytes = 0;
-  if (!resolve_window_linear_packet_region(handle, window_id, packet_idx,
-                                 &col_base, &line_base, &col_span,
-                                 &byte_offset, &valid_bytes)) {
-    return false;
-  }
-  for (uint32_t i = 0; i < valid_bytes; ++i) {
-    auto local_offset = byte_offset + i;
-    auto logical_line = line_base + (local_offset / col_span);
-    auto logical_col = col_base + (local_offset % col_span);
-    write_logical_byte(logical_col, logical_line, in.bytes.at(i));
-  }
-  assert_valid();
-  return true;
-}
-
-bool Tmem::window_packet_count(uint32_t handle, uint32_t window_id, uint32_t* count) const {
-  if (nullptr == count) {
-    return false;
-  }
-  const TmemAllocation* allocation = nullptr;
-  const TmemWindowPlan* window = nullptr;
-  if (!lookup_allocation(handle, &allocation)
-   || !lookup_window(handle, window_id, &window)
-   || window->logical_packet_col_span == 0
-   || window->logical_packet_line_span == 0) {
-    return false;
-  }
-  auto packets_per_row = ceil_div(window->logical_col_span, window->logical_packet_col_span);
-  auto packets_per_col = ceil_div(window->logical_line_span, window->logical_packet_line_span);
-  *count = packets_per_row * packets_per_col;
-  return true;
-}
-
-bool Tmem::window_line_chunk_count(uint32_t handle, uint32_t window_id, uint32_t* count) const {
-  if (nullptr == count) {
-    return false;
-  }
-  const TmemAllocation* allocation = nullptr;
-  const TmemWindowPlan* window = nullptr;
-  if (!lookup_allocation(handle, &allocation)
-   || !lookup_window(handle, window_id, &window)
-   || window->logical_col_span == 0) {
-    return false;
-  }
-  *count = ceil_div(window->logical_col_span, kPacketBytes);
-  return true;
-}
-
-bool Tmem::read_window_line_chunk(uint32_t handle,
-                                  uint32_t window_id,
-                                  uint32_t line_idx,
-                                  uint32_t chunk_idx,
-                                  TmemPacket* out) const {
-  if (nullptr == out) {
-    return false;
-  }
-  uint32_t col_base = 0;
-  uint32_t line_base = 0;
-  uint32_t col_span = 0;
-  if (!resolve_window_line_chunk_region(handle, window_id, line_idx, chunk_idx, &col_base, &line_base, &col_span)) {
-    return false;
-  }
-  out->bytes.fill(0);
-  for (uint32_t col = 0; col < col_span; ++col) {
-    out->bytes.at(col) = read_logical_byte(col_base + col, line_base);
-  }
-  return true;
-}
-
-bool Tmem::write_window_line_chunk(uint32_t handle,
-                                   uint32_t window_id,
-                                   uint32_t line_idx,
-                                   uint32_t chunk_idx,
-                                   const TmemPacket& in) {
-  uint32_t col_base = 0;
-  uint32_t line_base = 0;
-  uint32_t col_span = 0;
-  if (!resolve_window_line_chunk_region(handle, window_id, line_idx, chunk_idx, &col_base, &line_base, &col_span)) {
-    return false;
-  }
-  for (uint32_t col = 0; col < col_span; ++col) {
-    write_logical_byte(col_base + col, line_base, in.bytes.at(col));
-  }
-  assert_valid();
-  return true;
-}
-
-bool Tmem::read_window_math_row(uint32_t handle,
-                                uint32_t window_id,
-                                uint32_t math_row,
-                                uint8_t* out_row,
-                                uint32_t row_bytes) const {
-  if (nullptr == out_row || row_bytes == 0) {
-    return false;
-  }
-  const TmemWindowPlan* window = nullptr;
-  if (!lookup_window(handle, window_id, &window) || !TmemWindowPlanner::uses_math_packet_adapter(*window)) {
-    return false;
-  }
-  auto elem_bytes = fmt_bytes(window->fmt);
-  auto cols = window->elem_shape.cols;
-  if (row_bytes != cols * elem_bytes) {
-    return false;
-  }
-  std::fill_n(out_row, row_bytes, 0);
-  auto packet_count = window->tile_count * window->packets_per_tile;
-  for (uint32_t packet_idx = 0; packet_idx < packet_count; ++packet_idx) {
-    TmemMathPacketRegion region{};
-    if (!TmemWindowPlanner::packet_math_region(*window, packet_idx, &region)) {
-      return false;
-    }
-    if (math_row < region.math_row_base || math_row >= (region.math_row_base + region.packet_rows)) {
-      continue;
-    }
-    TmemPacket packet{};
-    if (!read_window_packet(handle, window_id, packet_idx, &packet)) {
-      return false;
-    }
-    auto packet_row = math_row - region.math_row_base;
-    auto packet_row_byte_offset = packet_row * region.packet_cols * elem_bytes;
-    auto valid_cols = (region.math_col_base < cols)
-                    ? std::min<uint32_t>(region.packet_cols, cols - region.math_col_base)
-                    : 0;
-    auto valid_bytes = valid_cols * elem_bytes;
-    if (valid_bytes != 0) {
-      std::copy_n(packet.bytes.data() + packet_row_byte_offset,
-                  valid_bytes,
-                  out_row + region.math_col_base * elem_bytes);
-    }
-  }
-  return true;
-}
-
-bool Tmem::write_window_math_row(uint32_t handle,
-                                 uint32_t window_id,
-                                 uint32_t math_row,
-                                 const uint8_t* row_bytes,
-                                 uint32_t row_size_bytes) {
-  if (nullptr == row_bytes || row_size_bytes == 0) {
-    return false;
-  }
-  const TmemWindowPlan* window = nullptr;
-  if (!lookup_window(handle, window_id, &window) || !TmemWindowPlanner::uses_math_packet_adapter(*window)) {
-    return false;
-  }
-  auto elem_bytes = fmt_bytes(window->fmt);
-  auto cols = window->elem_shape.cols;
-  if (row_size_bytes != cols * elem_bytes) {
-    return false;
-  }
-  auto packet_count = window->tile_count * window->packets_per_tile;
-  for (uint32_t packet_idx = 0; packet_idx < packet_count; ++packet_idx) {
-    TmemMathPacketRegion region{};
-    if (!TmemWindowPlanner::packet_math_region(*window, packet_idx, &region)) {
-      return false;
-    }
-    if (math_row < region.math_row_base || math_row >= (region.math_row_base + region.packet_rows)) {
-      continue;
-    }
-    TmemPacket packet{};
-    if (!read_window_packet(handle, window_id, packet_idx, &packet)) {
-      return false;
-    }
-    auto packet_row = math_row - region.math_row_base;
-    auto packet_row_byte_offset = packet_row * region.packet_cols * elem_bytes;
-    auto valid_cols = (region.math_col_base < cols)
-                    ? std::min<uint32_t>(region.packet_cols, cols - region.math_col_base)
-                    : 0;
-    auto valid_bytes = valid_cols * elem_bytes;
-    if (valid_bytes != 0) {
-      std::copy_n(row_bytes + region.math_col_base * elem_bytes,
-                  valid_bytes,
-                  packet.bytes.data() + packet_row_byte_offset);
-    }
-    if (!write_window_packet(handle, window_id, packet_idx, packet)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-// Shift the raw logical TMEM lines inside one window down by one line. This
-// helper is only correct for windows whose external semantics already match
-// logical TMEM lines.
-bool Tmem::shift_window_logical_lines_down(uint32_t handle, uint32_t window_id) {
-  const TmemAllocation* allocation = nullptr;
-  const TmemWindowPlan* window = nullptr;
-  if (!lookup_allocation(handle, &allocation) || !lookup_window(handle, window_id, &window)) {
-    return false;
-  }
-  auto col_base = resolve_window_col_base(*allocation, *window);
-  auto line_base = window->logical_line_base;
-  auto col_span = window->logical_col_span;
-  auto line_span = window->logical_line_span;
-  if (col_span == 0 || line_span == 0
-   || (col_base + col_span) > kNumCols
-   || (line_base + line_span) > kLogicalLines) {
-    return false;
-  }
-  for (uint32_t line = line_base + line_span - 1; line > line_base; --line) {
-    for (uint32_t col = 0; col < col_span; ++col) {
-      auto value = read_logical_byte(col_base + col, line - 1);
-      write_logical_byte(col_base + col, line, value);
-    }
-  }
-  for (uint32_t col = 0; col < col_span; ++col) {
-    write_logical_byte(col_base + col, line_base, 0);
-  }
-  assert_valid();
-  return true;
-}
-
-// Shift one window down by one mathematical matrix row. When the window uses a
-// math-packet adapter, TMEM reconstructs the mathematical image, performs the
-// row shift, optionally writes a refill top row, then repacks packets back into
-// the TMEM window layout.
-bool Tmem::shift_window_math_rows_down(uint32_t handle,
-                                       uint32_t window_id,
-                                       const uint8_t* refill_math_row,
-                                       uint32_t refill_math_row_bytes) {
-  const TmemAllocation* allocation = nullptr;
-  const TmemWindowPlan* window = nullptr;
-  if (!lookup_allocation(handle, &allocation) || !lookup_window(handle, window_id, &window)) {
-    return false;
-  }
-
-  auto elem_bytes = fmt_bytes(window->fmt);
-  if (0 == elem_bytes || window->elem_shape.empty() || !TmemWindowPlanner::uses_math_packet_adapter(*window)) {
-    if (!shift_window_logical_lines_down(handle, window_id)) {
-      return false;
-    }
-    if (refill_math_row != nullptr && refill_math_row_bytes != 0) {
-      auto col_base = resolve_window_col_base(*allocation, *window);
-      auto top_line = window->logical_line_base;
-      auto copy_bytes = std::min<uint32_t>(window->logical_col_span, refill_math_row_bytes);
-      for (uint32_t i = 0; i < copy_bytes; ++i) {
-        write_logical_byte(col_base + i, top_line, refill_math_row[i]);
-      }
-    }
-    assert_valid();
-    return true;
-  }
-
-  auto rows = std::max<uint32_t>(1, window->elem_shape.rows);
-  auto cols = std::max<uint32_t>(1, window->elem_shape.cols);
-  auto row_bytes = cols * elem_bytes;
-  std::vector<uint8_t> math_row_buffer(row_bytes, 0);
-  for (uint32_t math_row = rows - 1; math_row > 0; --math_row) {
-    if (!read_window_math_row(handle, window_id, math_row - 1, math_row_buffer.data(), row_bytes)) {
-      return false;
-    }
-    if (!write_window_math_row(handle, window_id, math_row, math_row_buffer.data(), row_bytes)) {
-      return false;
-    }
-  }
-  std::fill(math_row_buffer.begin(), math_row_buffer.end(), 0);
-  if (refill_math_row != nullptr && refill_math_row_bytes != 0) {
-    std::copy_n(refill_math_row,
-                std::min<uint32_t>(row_bytes, refill_math_row_bytes),
-                math_row_buffer.data());
-  }
-  if (!write_window_math_row(handle, window_id, 0, math_row_buffer.data(), row_bytes)) {
-    return false;
-  }
-
-  assert_valid();
-  return true;
-}
-
-bool Tmem::bind_layout(uint32_t handle, const TmemLayoutPlan& layout) {
-  TmemAllocation* allocation = nullptr;
-  if (!lookup_allocation(handle, &allocation) || !layout.valid || layout.required_col_span > allocation->col_span) {
-    return false;
-  }
-  allocation->layout_valid = true;
-  allocation->layout_epoch = layout.epoch;
-  allocation->windows = layout.windows;
-  return true;
-}
-
-bool Tmem::upsert_window(uint32_t handle, const TmemWindowPlan& window) {
-  TmemAllocation* allocation = nullptr;
-  if (!lookup_allocation(handle, &allocation)) {
-    return false;
-  }
-  auto it = std::find_if(allocation->windows.begin(), allocation->windows.end(),
-                         [&window](const TmemWindowPlan& existing) {
-                           return existing.window_id == window.window_id;
-                         });
-  if (it == allocation->windows.end()) {
-    allocation->windows.push_back(window);
-  } else {
-    *it = window;
-  }
-  allocation->layout_valid = !allocation->windows.empty();
-  return true;
-}
-
-bool Tmem::lookup_window(uint32_t handle, uint32_t window_id, const TmemWindowPlan** out) const {
-  const TmemAllocation* allocation = nullptr;
-  if (!lookup_allocation(handle, &allocation) || !allocation->layout_valid) {
-    return false;
-  }
-  auto it = std::find_if(allocation->windows.begin(), allocation->windows.end(),
-                         [window_id](const TmemWindowPlan& window) {
-                           return window.window_id == window_id;
-                         });
-  if (it == allocation->windows.end()) {
-    return false;
-  }
-  if (out) {
-    *out = &(*it);
-  }
-  return true;
-}
-
-bool Tmem::lookup_window(uint32_t handle, uint32_t window_id, TmemWindowPlan** out) {
-  TmemAllocation* allocation = nullptr;
-  if (!lookup_allocation(handle, &allocation) || !allocation->layout_valid) {
-    return false;
-  }
-  auto it = std::find_if(allocation->windows.begin(), allocation->windows.end(),
-                         [window_id](const TmemWindowPlan& window) {
-                           return window.window_id == window_id;
-                         });
-  if (it == allocation->windows.end()) {
-    return false;
-  }
-  if (out) {
-    *out = &(*it);
-  }
-  return true;
-}
-
-bool Tmem::window_epoch(uint32_t handle, uint32_t* epoch) const {
-  const TmemAllocation* allocation = nullptr;
-  if (!lookup_allocation(handle, &allocation) || !allocation->layout_valid || nullptr == epoch) {
-    return false;
-  }
-  *epoch = allocation->visible_layout_epoch;
-  return true;
-}
-
-bool Tmem::bump_window_epoch(uint32_t handle) {
-  TmemAllocation* allocation = nullptr;
-  if (!lookup_allocation(handle, &allocation)) {
-    return false;
-  }
-  ++allocation->layout_epoch;
-  allocation->layout_valid = !allocation->windows.empty();
-  return true;
-}
-
 void Tmem::set_payload_ready(uint32_t handle, bool ready) {
   if (TmemAllocation* allocation = nullptr; lookup_allocation(handle, &allocation)) {
     allocation->payload_ready = ready;
@@ -1222,7 +546,6 @@ void Tmem::set_meta_ready(uint32_t handle, bool ready) {
 void Tmem::publish_visible_state() {
   for (auto& entry : allocations_) {
     auto& allocation = entry.second;
-    allocation.visible_layout_epoch = allocation.layout_epoch;
     allocation.visible_payload_ready = allocation.payload_ready;
     allocation.visible_meta_ready = allocation.meta_ready;
   }
@@ -1260,10 +583,14 @@ bool Tmem::row_bytes(uint32_t handle, uint32_t* row_bytes) const {
 
 void Tmem::reset_port_budgets(uint64_t cycle) {
   port_cycle_ = cycle;
-  read_packet_budget_ = kReadPacketsPerCycle;
-  write_packet_budget_ = kWritePacketsPerCycle;
-  std::fill(read_bank_budgets_.begin(), read_bank_budgets_.end(), kReadPortsPerBank);
-  std::fill(write_bank_budgets_.begin(), write_bank_budgets_.end(), kWritePortsPerBank);
+  tmem_timing::reset_port_budgets(kReadPacketsPerCycle,
+                                  kWritePacketsPerCycle,
+                                  kReadPortsPerBank,
+                                  kWritePortsPerBank,
+                                  &read_packet_budget_,
+                                  &write_packet_budget_,
+                                  &read_bank_budgets_,
+                                  &write_bank_budgets_);
 }
 
 void Tmem::ensure_port_budgets(uint64_t cycle) {
@@ -1283,30 +610,18 @@ bool Tmem::try_acquire_region_packet(uint64_t cycle,
     return false;
   }
 
-  auto& packet_budget = write ? write_packet_budget_ : read_packet_budget_;
-  if (0 == packet_budget) {
-    return false;
-  }
-
-  auto& budgets = write ? write_bank_budgets_ : read_bank_budgets_;
   std::vector<bool> touched(num_physical_banks_, false);
   for (uint32_t line = 0; line < kLogicalLines; ++line) {
     uint32_t bank = 0;
     logical_byte_to_physical(logical_col, line, &bank, nullptr, nullptr);
     touched.at(bank) = true;
   }
-  for (uint32_t bank = 0; bank < touched.size(); ++bank) {
-    if (touched.at(bank) && 0 == budgets.at(bank)) {
-      return false;
-    }
-  }
-  --packet_budget;
-  for (uint32_t bank = 0; bank < touched.size(); ++bank) {
-    if (touched.at(bank)) {
-      --budgets.at(bank);
-    }
-  }
-  return true;
+  return tmem_timing::consume_packet_ports(touched,
+                                           write,
+                                           &read_packet_budget_,
+                                           &write_packet_budget_,
+                                           &read_bank_budgets_,
+                                           &write_bank_budgets_);
 }
 
 void Tmem::refund_region_packet(uint64_t cycle,
@@ -1319,255 +634,22 @@ void Tmem::refund_region_packet(uint64_t cycle,
   if (!region_packet_location(col_base, col_span, packet_idx, &logical_col)) {
     return;
   }
-  auto& packet_budget = write ? write_packet_budget_ : read_packet_budget_;
-  auto max_packet_budget = write ? kWritePacketsPerCycle : kReadPacketsPerCycle;
-  packet_budget = std::min<uint32_t>(packet_budget + 1, max_packet_budget);
-
-  auto& budgets = write ? write_bank_budgets_ : read_bank_budgets_;
-  auto max_budget = write ? kWritePortsPerBank : kReadPortsPerBank;
   std::vector<bool> touched(num_physical_banks_, false);
   for (uint32_t line = 0; line < kLogicalLines; ++line) {
     uint32_t bank = 0;
     logical_byte_to_physical(logical_col, line, &bank, nullptr, nullptr);
     touched.at(bank) = true;
   }
-  for (uint32_t bank = 0; bank < touched.size(); ++bank) {
-    if (touched.at(bank)) {
-      budgets.at(bank) = std::min<uint32_t>(budgets.at(bank) + 1, max_budget);
-    }
-  }
-}
-
-bool Tmem::try_acquire_window_packet(uint64_t cycle,
-                                     uint32_t handle,
-                                     uint32_t window_id,
-                                     uint32_t packet_idx,
-                                     bool write) {
-  ensure_port_budgets(cycle);
-  uint32_t col_base = 0;
-  uint32_t line_base = 0;
-  uint32_t col_span = 0;
-  uint32_t line_span = 0;
-  if (!window_packet_location(handle, window_id, packet_idx, &col_base, &line_base, &col_span, &line_span)) {
-    return false;
-  }
-
-  auto& packet_budget = write ? write_packet_budget_ : read_packet_budget_;
-  if (0 == packet_budget) {
-    return false;
-  }
-
-  auto& budgets = write ? write_bank_budgets_ : read_bank_budgets_;
-  std::vector<bool> touched(num_physical_banks_, false);
-  for (uint32_t line = 0; line < line_span; ++line) {
-    for (uint32_t col = 0; col < col_span; ++col) {
-      uint32_t bank = 0;
-      logical_byte_to_physical(col_base + col, line_base + line, &bank, nullptr, nullptr);
-      touched.at(bank) = true;
-    }
-  }
-  for (uint32_t bank = 0; bank < touched.size(); ++bank) {
-    if (touched.at(bank) && 0 == budgets.at(bank)) {
-      return false;
-    }
-  }
-  --packet_budget;
-  for (uint32_t bank = 0; bank < touched.size(); ++bank) {
-    if (touched.at(bank)) {
-      --budgets.at(bank);
-    }
-  }
-  return true;
-}
-
-bool Tmem::try_acquire_window_linear_packet(uint64_t cycle,
-                                            uint32_t handle,
-                                            uint32_t window_id,
-                                            uint32_t packet_idx,
-                                            bool write) {
-  ensure_port_budgets(cycle);
-  uint32_t col_base = 0;
-  uint32_t line_base = 0;
-  uint32_t col_span = 0;
-  uint32_t byte_offset = 0;
-  uint32_t valid_bytes = 0;
-  if (!resolve_window_linear_packet_region(handle, window_id, packet_idx,
-                                 &col_base, &line_base, &col_span,
-                                 &byte_offset, &valid_bytes)) {
-    return false;
-  }
-
-  auto& packet_budget = write ? write_packet_budget_ : read_packet_budget_;
-  if (0 == packet_budget) {
-    return false;
-  }
-
-  auto& budgets = write ? write_bank_budgets_ : read_bank_budgets_;
-  std::vector<bool> touched(num_physical_banks_, false);
-  for (uint32_t i = 0; i < valid_bytes; ++i) {
-    auto local_offset = byte_offset + i;
-    auto logical_line = line_base + (local_offset / col_span);
-    auto logical_col = col_base + (local_offset % col_span);
-    uint32_t bank = 0;
-    logical_byte_to_physical(logical_col, logical_line, &bank, nullptr, nullptr);
-    touched.at(bank) = true;
-  }
-  for (uint32_t bank = 0; bank < touched.size(); ++bank) {
-    if (touched.at(bank) && 0 == budgets.at(bank)) {
-      return false;
-    }
-  }
-  --packet_budget;
-  for (uint32_t bank = 0; bank < touched.size(); ++bank) {
-    if (touched.at(bank)) {
-      --budgets.at(bank);
-    }
-  }
-  return true;
-}
-
-bool Tmem::try_acquire_window_line_chunk(uint64_t cycle,
-                                         uint32_t handle,
-                                         uint32_t window_id,
-                                         uint32_t line_idx,
-                                         uint32_t chunk_idx,
-                                         bool write) {
-  ensure_port_budgets(cycle);
-  uint32_t col_base = 0;
-  uint32_t line_base = 0;
-  uint32_t col_span = 0;
-  if (!resolve_window_line_chunk_region(handle, window_id, line_idx, chunk_idx, &col_base, &line_base, &col_span)) {
-    return false;
-  }
-
-  auto& packet_budget = write ? write_packet_budget_ : read_packet_budget_;
-  if (0 == packet_budget) {
-    return false;
-  }
-
-  auto& budgets = write ? write_bank_budgets_ : read_bank_budgets_;
-  std::vector<bool> touched(num_physical_banks_, false);
-  for (uint32_t col = 0; col < col_span; ++col) {
-    uint32_t bank = 0;
-    logical_byte_to_physical(col_base + col, line_base, &bank, nullptr, nullptr);
-    touched.at(bank) = true;
-  }
-  for (uint32_t bank = 0; bank < touched.size(); ++bank) {
-    if (touched.at(bank) && 0 == budgets.at(bank)) {
-      return false;
-    }
-  }
-  --packet_budget;
-  for (uint32_t bank = 0; bank < touched.size(); ++bank) {
-    if (touched.at(bank)) {
-      --budgets.at(bank);
-    }
-  }
-  return true;
-}
-
-void Tmem::refund_window_packet(uint64_t cycle,
-                                uint32_t handle,
-                                uint32_t window_id,
-                                uint32_t packet_idx,
-                                bool write) {
-  ensure_port_budgets(cycle);
-  uint32_t col_base = 0;
-  uint32_t line_base = 0;
-  uint32_t col_span = 0;
-  uint32_t line_span = 0;
-  if (!window_packet_location(handle, window_id, packet_idx, &col_base, &line_base, &col_span, &line_span)) {
-    return;
-  }
-  auto& packet_budget = write ? write_packet_budget_ : read_packet_budget_;
-  auto max_packet_budget = write ? kWritePacketsPerCycle : kReadPacketsPerCycle;
-  packet_budget = std::min<uint32_t>(packet_budget + 1, max_packet_budget);
-
-  auto& budgets = write ? write_bank_budgets_ : read_bank_budgets_;
-  auto max_budget = write ? kWritePortsPerBank : kReadPortsPerBank;
-  std::vector<bool> touched(num_physical_banks_, false);
-  for (uint32_t line = 0; line < line_span; ++line) {
-    for (uint32_t col = 0; col < col_span; ++col) {
-      uint32_t bank = 0;
-      logical_byte_to_physical(col_base + col, line_base + line, &bank, nullptr, nullptr);
-      touched.at(bank) = true;
-    }
-  }
-  for (uint32_t bank = 0; bank < touched.size(); ++bank) {
-    if (touched.at(bank)) {
-      budgets.at(bank) = std::min<uint32_t>(budgets.at(bank) + 1, max_budget);
-    }
-  }
-}
-
-void Tmem::refund_window_linear_packet(uint64_t cycle,
-                                       uint32_t handle,
-                                       uint32_t window_id,
-                                       uint32_t packet_idx,
-                                       bool write) {
-  ensure_port_budgets(cycle);
-  uint32_t col_base = 0;
-  uint32_t line_base = 0;
-  uint32_t col_span = 0;
-  uint32_t byte_offset = 0;
-  uint32_t valid_bytes = 0;
-  if (!resolve_window_linear_packet_region(handle, window_id, packet_idx,
-                                 &col_base, &line_base, &col_span,
-                                 &byte_offset, &valid_bytes)) {
-    return;
-  }
-  auto& packet_budget = write ? write_packet_budget_ : read_packet_budget_;
-  auto max_packet_budget = write ? kWritePacketsPerCycle : kReadPacketsPerCycle;
-  packet_budget = std::min<uint32_t>(packet_budget + 1, max_packet_budget);
-
-  auto& budgets = write ? write_bank_budgets_ : read_bank_budgets_;
-  auto max_budget = write ? kWritePortsPerBank : kReadPortsPerBank;
-  std::vector<bool> touched(num_physical_banks_, false);
-  for (uint32_t i = 0; i < valid_bytes; ++i) {
-    auto local_offset = byte_offset + i;
-    auto logical_line = line_base + (local_offset / col_span);
-    auto logical_col = col_base + (local_offset % col_span);
-    uint32_t bank = 0;
-    logical_byte_to_physical(logical_col, logical_line, &bank, nullptr, nullptr);
-    touched.at(bank) = true;
-  }
-  for (uint32_t bank = 0; bank < touched.size(); ++bank) {
-    if (touched.at(bank)) {
-      budgets.at(bank) = std::min<uint32_t>(budgets.at(bank) + 1, max_budget);
-    }
-  }
-}
-
-void Tmem::refund_window_line_chunk(uint64_t cycle,
-                                    uint32_t handle,
-                                    uint32_t window_id,
-                                    uint32_t line_idx,
-                                    uint32_t chunk_idx,
-                                    bool write) {
-  ensure_port_budgets(cycle);
-  uint32_t col_base = 0;
-  uint32_t line_base = 0;
-  uint32_t col_span = 0;
-  if (!resolve_window_line_chunk_region(handle, window_id, line_idx, chunk_idx, &col_base, &line_base, &col_span)) {
-    return;
-  }
-  auto& packet_budget = write ? write_packet_budget_ : read_packet_budget_;
-  auto max_packet_budget = write ? kWritePacketsPerCycle : kReadPacketsPerCycle;
-  packet_budget = std::min<uint32_t>(packet_budget + 1, max_packet_budget);
-
-  auto& budgets = write ? write_bank_budgets_ : read_bank_budgets_;
-  auto max_budget = write ? kWritePortsPerBank : kReadPortsPerBank;
-  std::vector<bool> touched(num_physical_banks_, false);
-  for (uint32_t col = 0; col < col_span; ++col) {
-    uint32_t bank = 0;
-    logical_byte_to_physical(col_base + col, line_base, &bank, nullptr, nullptr);
-    touched.at(bank) = true;
-  }
-  for (uint32_t bank = 0; bank < touched.size(); ++bank) {
-    if (touched.at(bank)) {
-      budgets.at(bank) = std::min<uint32_t>(budgets.at(bank) + 1, max_budget);
-    }
-  }
+  tmem_timing::refund_packet_ports(touched,
+                                   write,
+                                   kReadPacketsPerCycle,
+                                   kWritePacketsPerCycle,
+                                   kReadPortsPerBank,
+                                   kWritePortsPerBank,
+                                   &read_packet_budget_,
+                                   &write_packet_budget_,
+                                   &read_bank_budgets_,
+                                   &write_bank_budgets_);
 }
 
 bool Tmem::try_acquire_region_read_packet(uint64_t cycle, uint32_t col_base, uint32_t col_span, uint32_t packet_idx) {
@@ -1578,60 +660,12 @@ bool Tmem::try_acquire_region_write_packet(uint64_t cycle, uint32_t col_base, ui
   return try_acquire_region_packet(cycle, col_base, col_span, packet_idx, true);
 }
 
-bool Tmem::try_acquire_window_read_packet(uint64_t cycle, uint32_t handle, uint32_t window_id, uint32_t packet_idx) {
-  return try_acquire_window_packet(cycle, handle, window_id, packet_idx, false);
-}
-
-bool Tmem::try_acquire_window_write_packet(uint64_t cycle, uint32_t handle, uint32_t window_id, uint32_t packet_idx) {
-  return try_acquire_window_packet(cycle, handle, window_id, packet_idx, true);
-}
-
-bool Tmem::try_acquire_window_linear_read_packet(uint64_t cycle, uint32_t handle, uint32_t window_id, uint32_t packet_idx) {
-  return try_acquire_window_linear_packet(cycle, handle, window_id, packet_idx, false);
-}
-
-bool Tmem::try_acquire_window_linear_write_packet(uint64_t cycle, uint32_t handle, uint32_t window_id, uint32_t packet_idx) {
-  return try_acquire_window_linear_packet(cycle, handle, window_id, packet_idx, true);
-}
-
-bool Tmem::try_acquire_window_line_write_packet(uint64_t cycle,
-                                                uint32_t handle,
-                                                uint32_t window_id,
-                                                uint32_t line_idx,
-                                                uint32_t chunk_idx) {
-  return try_acquire_window_line_chunk(cycle, handle, window_id, line_idx, chunk_idx, true);
-}
-
 void Tmem::refund_region_read_packet(uint64_t cycle, uint32_t col_base, uint32_t col_span, uint32_t packet_idx) {
   refund_region_packet(cycle, col_base, col_span, packet_idx, false);
 }
 
 void Tmem::refund_region_write_packet(uint64_t cycle, uint32_t col_base, uint32_t col_span, uint32_t packet_idx) {
   refund_region_packet(cycle, col_base, col_span, packet_idx, true);
-}
-
-void Tmem::refund_window_read_packet(uint64_t cycle, uint32_t handle, uint32_t window_id, uint32_t packet_idx) {
-  refund_window_packet(cycle, handle, window_id, packet_idx, false);
-}
-
-void Tmem::refund_window_write_packet(uint64_t cycle, uint32_t handle, uint32_t window_id, uint32_t packet_idx) {
-  refund_window_packet(cycle, handle, window_id, packet_idx, true);
-}
-
-void Tmem::refund_window_linear_read_packet(uint64_t cycle, uint32_t handle, uint32_t window_id, uint32_t packet_idx) {
-  refund_window_linear_packet(cycle, handle, window_id, packet_idx, false);
-}
-
-void Tmem::refund_window_linear_write_packet(uint64_t cycle, uint32_t handle, uint32_t window_id, uint32_t packet_idx) {
-  refund_window_linear_packet(cycle, handle, window_id, packet_idx, true);
-}
-
-void Tmem::refund_window_line_write_packet(uint64_t cycle,
-                                           uint32_t handle,
-                                           uint32_t window_id,
-                                           uint32_t line_idx,
-                                           uint32_t chunk_idx) {
-  refund_window_line_chunk(cycle, handle, window_id, line_idx, chunk_idx, true);
 }
 
 bool Tmem::validate(std::string* reason) const {
