@@ -1485,9 +1485,9 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         core_->tmem_rel_permit();
       } break;
       case TcuType::TMEM_SHIFT: {
-        auto handle = rs1_data.at(thread_start).u32;
+        auto taddr = rs1_data.at(thread_start).u32;
         auto tmem_control_word = rs2_data.at(thread_start).u32;
-        auto async_id = core_->tmem_shift(wid, handle, tmem_control_word);
+        auto async_id = core_->tmem_shift(wid, taddr, tmem_control_word);
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t))
             continue;
@@ -1527,8 +1527,8 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       // ============================================================
       case TcuType::TMEM_DEALLOC: {
         // tcgen05.dealloc.
-        auto handle = rs1_data.at(thread_start).u32;
-        core_->tmem_dealloc(handle);
+        auto taddr = rs1_data.at(thread_start).u32;
+        core_->tmem_dealloc(taddr);
       } break;
       case TcuType::TMEM_CP: {
         // tcgen05.cp (PTX §9.7.16.5.3): shared->TMEM copy.

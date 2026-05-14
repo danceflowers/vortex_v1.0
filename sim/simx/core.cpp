@@ -268,7 +268,7 @@ void Core::reset() {
 
 void Core::tick() {
 #ifdef EXT_TCU_ENABLE
-  execute_cycle_tmem_shift_reserved_handles_.clear();
+  execute_cycle_tmem_shift_reserved_taddrs_.clear();
   drain_tensor_execute_completion_notices();
   drain_tma_completion_notices();
   advance_tcgen05_ldst_async_ops();
@@ -339,7 +339,7 @@ void Core::dump_tensor_debug_state(std::ostream& os) const {
     os << "  async_id=" << op.async_id
        << " type=" << static_cast<uint32_t>(op.type)
        << " wid=" << op.wid
-       << " handle=" << op.handle
+       << " taddr=" << op.taddr
        << " completed=" << op.completed
        << " committed=" << op.committed
        << " barrier=" << op.barrier_id
@@ -648,8 +648,8 @@ bool Core::lookup_tmem_allocation(uint32_t taddr, TmemAllocation** allocation) {
   return tmem_system_->lookup_allocation(taddr, allocation);
 }
 
-bool Core::lookup_tmem_allocation(uint32_t handle, const TmemAllocation** allocation) const {
-  return tmem_system_->lookup_allocation(handle, allocation);
+bool Core::lookup_tmem_allocation(uint32_t taddr, const TmemAllocation** allocation) const {
+  return tmem_system_->lookup_allocation(taddr, allocation);
 }
 
 WarpMask Core::warpgroup_mask(uint32_t wgid) const {
@@ -745,17 +745,17 @@ bool Core::tmem_region_query(uint32_t col_base, uint32_t col_span, uint32_t* siz
   return tmem_system_->region_query(col_base, col_span, size_bytes);
 }
 
-bool Core::tmem_query(uint32_t handle, uint32_t* col_span, uint32_t* size_bytes) const {
-  return tmem_system_->query(handle, col_span, size_bytes);
+bool Core::tmem_query(uint32_t taddr, uint32_t* col_span, uint32_t* size_bytes) const {
+  return tmem_system_->query(taddr, col_span, size_bytes);
 }
 
-bool Core::tmem_lookup_allocation(uint32_t handle, const TmemAllocation** allocation) const {
-  return lookup_tmem_allocation(handle, allocation);
+bool Core::tmem_lookup_allocation(uint32_t taddr, const TmemAllocation** allocation) const {
+  return lookup_tmem_allocation(taddr, allocation);
 }
 
-bool Core::tmem_transfer_region(uint32_t handle, uint32_t* col_base, uint32_t* col_span) const {
+bool Core::tmem_transfer_region(uint32_t taddr, uint32_t* col_base, uint32_t* col_span) const {
   const TmemAllocation* allocation = nullptr;
-  if (!lookup_tmem_allocation(handle, &allocation) || nullptr == allocation) {
+  if (!lookup_tmem_allocation(taddr, &allocation) || nullptr == allocation) {
     return false;
   }
   if (col_base) {
@@ -779,78 +779,78 @@ void Core::consume_tmem_request_grant(uint64_t tag) {
   tmem_system_->consume_request_grant(tag);
 }
 
-void Core::tmem_set_payload_ready(uint32_t handle, bool ready) {
-  tmem_system_->set_payload_ready(handle, ready);
+void Core::tmem_set_payload_ready(uint32_t taddr, bool ready) {
+  tmem_system_->set_payload_ready(taddr, ready);
 }
 
-void Core::tmem_set_meta_ready(uint32_t handle, bool ready) {
-  tmem_system_->set_meta_ready(handle, ready);
+void Core::tmem_set_meta_ready(uint32_t taddr, bool ready) {
+  tmem_system_->set_meta_ready(taddr, ready);
 }
 
-void Core::tmem_set_meta_region(uint32_t handle, uint32_t meta_col_base, uint32_t meta_col_span) {
-  tmem_system_->set_meta_region(handle, meta_col_base, meta_col_span);
+void Core::tmem_set_meta_region(uint32_t taddr, uint32_t meta_col_base, uint32_t meta_col_span) {
+  tmem_system_->set_meta_region(taddr, meta_col_base, meta_col_span);
 }
 
-bool Core::tmem_set_row_bytes(uint32_t handle, uint32_t row_bytes) {
-  return tmem_system_->set_row_bytes(handle, row_bytes);
+bool Core::tmem_set_row_bytes(uint32_t taddr, uint32_t row_bytes) {
+  return tmem_system_->set_row_bytes(taddr, row_bytes);
 }
 
-bool Core::tmem_handle_busy(uint32_t handle) const {
-  return tmem_system_->visible_shift_busy(handle);
+bool Core::tmem_taddr_busy(uint32_t taddr) const {
+  return tmem_system_->visible_shift_busy(taddr);
 }
 
-bool Core::tmem_handle_ready_for_mma_load(uint32_t handle, TcuTarget target, uint32_t sparse_mode) const {
-  return TmemHandleBlockReason::None == tmem_handle_load_block_reason(handle, target, sparse_mode);
+bool Core::tmem_taddr_ready_for_mma_load(uint32_t taddr, TcuTarget target, uint32_t sparse_mode) const {
+  return TmemTaddrBlockReason::None == tmem_taddr_load_block_reason(taddr, target, sparse_mode);
 }
 
-bool Core::tmem_handle_ready_for_mma_store(uint32_t handle) const {
-  return TmemHandleBlockReason::None == tmem_handle_store_block_reason(handle);
+bool Core::tmem_taddr_ready_for_mma_store(uint32_t taddr) const {
+  return TmemTaddrBlockReason::None == tmem_taddr_store_block_reason(taddr);
 }
 
-Core::TmemHandleBlockReason Core::tmem_handle_load_block_reason(uint32_t handle, TcuTarget target, uint32_t sparse_mode) const {
+Core::TmemTaddrBlockReason Core::tmem_taddr_load_block_reason(uint32_t taddr, TcuTarget target, uint32_t sparse_mode) const {
   const TmemAllocation* allocation = nullptr;
-  if (!lookup_tmem_allocation(handle, &allocation)) {
-    return TmemHandleBlockReason::Invalid;
+  if (!lookup_tmem_allocation(taddr, &allocation)) {
+    return TmemTaddrBlockReason::Invalid;
   }
-  if (execute_cycle_tmem_shift_reserved_handles_.count(handle) != 0) {
-    return TmemHandleBlockReason::BusyTmemShift;
+  if (execute_cycle_tmem_shift_reserved_taddrs_.count(taddr) != 0) {
+    return TmemTaddrBlockReason::BusyTmemShift;
   }
-  if (tmem_system_->visible_shift_busy(handle)) {
-    return TmemHandleBlockReason::BusyTmemShift;
+  if (tmem_system_->visible_shift_busy(taddr)) {
+    return TmemTaddrBlockReason::BusyTmemShift;
   }
-  bool payload_ready = tmem_system_->visible_payload_ready(handle);
+  bool payload_ready = tmem_system_->visible_payload_ready(taddr);
   if (!payload_ready) {
-    return TmemHandleBlockReason::PayloadNotReady;
+    return TmemTaddrBlockReason::PayloadNotReady;
   }
   bool needs_meta = (target == TcuTarget::A || target == TcuTarget::None)
                  && (sparse_mode != vortex::tensor::sparse_none);
-  bool meta_ready = tmem_system_->visible_meta_ready(handle);
+  bool meta_ready = tmem_system_->visible_meta_ready(taddr);
   if (needs_meta && !meta_ready) {
-    return TmemHandleBlockReason::MetaNotReady;
+    return TmemTaddrBlockReason::MetaNotReady;
   }
-  return TmemHandleBlockReason::None;
+  return TmemTaddrBlockReason::None;
 }
 
-Core::TmemHandleBlockReason Core::tmem_handle_store_block_reason(uint32_t handle) const {
+Core::TmemTaddrBlockReason Core::tmem_taddr_store_block_reason(uint32_t taddr) const {
   const TmemAllocation* allocation = nullptr;
-  if (!lookup_tmem_allocation(handle, &allocation)) {
-    return TmemHandleBlockReason::Invalid;
+  if (!lookup_tmem_allocation(taddr, &allocation)) {
+    return TmemTaddrBlockReason::Invalid;
   }
-  if (execute_cycle_tmem_shift_reserved_handles_.count(handle) != 0) {
-    return TmemHandleBlockReason::BusyTmemShift;
+  if (execute_cycle_tmem_shift_reserved_taddrs_.count(taddr) != 0) {
+    return TmemTaddrBlockReason::BusyTmemShift;
   }
-  if (tmem_system_->visible_shift_busy(handle)) {
-    return TmemHandleBlockReason::BusyTmemShift;
+  if (tmem_system_->visible_shift_busy(taddr)) {
+    return TmemTaddrBlockReason::BusyTmemShift;
   }
-  bool payload_ready = tmem_system_->visible_payload_ready(handle);
+  bool payload_ready = tmem_system_->visible_payload_ready(taddr);
   if (!payload_ready) {
-    return TmemHandleBlockReason::PayloadNotReady;
+    return TmemTaddrBlockReason::PayloadNotReady;
   }
-  return TmemHandleBlockReason::None;
+  return TmemTaddrBlockReason::None;
 }
 
 // ============================================================================
-// LMEM mirror helper: encode the in-Core MBarrierEntry into the 8 B
+// LMEM mirror helper: encode the in-Core mbarrier_runtime_state_t into the 8 B
 // mbarrier_state_t bit layout and write it through to the kernel-visible
 // LMEM location at mbar_addr. Called after every state transition.
 // PTX §7.6.1 mbarrier object format: 64-bit packed value
@@ -859,12 +859,12 @@ Core::TmemHandleBlockReason Core::tmem_handle_store_block_reason(uint32_t handle
 //   bits[31:20]   pending_tx_count      (12 bits, byte units per §7.6.4)
 //   bits[19:0]    expected_arrival_count (20 bits)
 // ============================================================================
-void Core::mirror_mbarrier_to_lmem(uint64_t mbar_addr, const MBarrierEntry& b) {
+void Core::mirror_mbarrier_to_lmem(uint64_t mbar_addr, const mbarrier_runtime_state_t& state) {
   uint64_t encoded = 0;
-  encoded |= (uint64_t)(b.expected_arrival_count & 0xFFFFFu) << 0;
-  encoded |= (uint64_t)(b.pending_tx_count       & 0xFFFu)   << 20;
-  encoded |= (uint64_t)(b.pending_arrival_count  & 0x3FFFFFFFu) << 32;
-  encoded |= (uint64_t)(b.phase                  & 0x3u)     << 62;
+  encoded |= (uint64_t)(state.expected_arrival_count & 0xFFFFFu) << 0;
+  encoded |= (uint64_t)(state.pending_tx_count       & 0xFFFu)   << 20;
+  encoded |= (uint64_t)(state.pending_arrival_count  & 0x3FFFFFFFu) << 32;
+  encoded |= (uint64_t)(state.phase                  & 0x3u)     << 62;
   this->lmem_write(&encoded, mbar_addr, sizeof(encoded));
 }
 
@@ -993,7 +993,7 @@ uint32_t Core::launch_lmem_to_tmem_copy(uint32_t wid,
   async_op.type = AsyncTensorOpType::TmemCopy;
   async_op.wid = wid;
   async_op.wgid = wgid;
-  async_op.handle = col_base;
+  async_op.taddr = col_base;
   async_op.issue_cycle = perf_stats_.cycles;
   async_op.payload_size_bytes = total_bytes;
   async_tensor_ops_[async_id] = async_op;
@@ -1033,16 +1033,16 @@ uint32_t Core::tmem_alloc(uint32_t col_span, uint32_t reserved_operand) {
   return tmem_system_->alloc(col_span);
 }
 
-bool Core::tmem_dealloc(uint32_t handle) {
+bool Core::tmem_dealloc(uint32_t taddr) {
   advance_async_tensor_engine();
-  return tmem_system_->free(handle);
+  return tmem_system_->free(taddr);
 }
 
 void Core::tmem_rel_permit() {
   tmem_system_->seal_allocator();
 }
 
-uint32_t Core::tmem_shift(uint32_t wid, uint32_t handle, uint32_t control_word) {
+uint32_t Core::tmem_shift(uint32_t wid, uint32_t taddr, uint32_t control_word) {
   advance_async_tensor_engine();
   if (control_word != kTcuTmemOpControlPtxOnly) {
     throw std::runtime_error(
@@ -1050,25 +1050,25 @@ uint32_t Core::tmem_shift(uint32_t wid, uint32_t handle, uint32_t control_word) 
   }
   auto wgid = arch_.warpgroup_id(wid);
   TmemAllocation* allocation = nullptr;
-  if (!lookup_tmem_allocation(handle, &allocation)) {
+  if (!lookup_tmem_allocation(taddr, &allocation)) {
     return 0;
   }
-  tmem_system_->set_payload_ready(handle, false);
+  tmem_system_->set_payload_ready(taddr, false);
   auto async_id = next_async_id_++;
   AsyncTensorOp op{};
   op.async_id = async_id;
   op.type = AsyncTensorOpType::TmemShift;
   op.wid = wid;
   op.wgid = wgid;
-  op.handle = handle;
+  op.taddr = taddr;
   op.issue_cycle = perf_stats_.cycles;
   async_tensor_ops_[async_id] = std::move(op);
-  execute_cycle_tmem_shift_reserved_handles_.insert(handle);
-  (void)tmem_system_->issue_shift(async_id, wid, wgid, handle, perf_stats_.cycles);
+  execute_cycle_tmem_shift_reserved_taddrs_.insert(taddr);
+  (void)tmem_system_->issue_shift(async_id, wid, wgid, taddr, perf_stats_.cycles);
   return async_id;
 }
 
-uint32_t Core::mma_load_async_issue(uint32_t wid, uint32_t handle, uint32_t idesc) {
+uint32_t Core::mma_load_async_issue(uint32_t wid, uint32_t taddr, uint32_t idesc) {
   advance_async_tensor_engine();
   auto wgid = arch_.warpgroup_id(wid);
   auto async_id = next_async_id_++;
@@ -1077,14 +1077,14 @@ uint32_t Core::mma_load_async_issue(uint32_t wid, uint32_t handle, uint32_t ides
   op.type = AsyncTensorOpType::MmaLoad;
   op.wid = wid;
   op.wgid = wgid;
-  op.handle = handle;
+  op.taddr = taddr;
   op.idesc = idesc;
   op.issue_cycle = perf_stats_.cycles;
   async_tensor_ops_[async_id] = std::move(op);
   return async_id;
 }
 
-uint32_t Core::mma_store_async_issue(uint32_t wid, uint32_t handle, uint32_t idesc) {
+uint32_t Core::mma_store_async_issue(uint32_t wid, uint32_t taddr, uint32_t idesc) {
   advance_async_tensor_engine();
   auto wgid = arch_.warpgroup_id(wid);
   auto async_id = next_async_id_++;
@@ -1093,7 +1093,7 @@ uint32_t Core::mma_store_async_issue(uint32_t wid, uint32_t handle, uint32_t ide
   op.type = AsyncTensorOpType::MmaStore;
   op.wid = wid;
   op.wgid = wgid;
-  op.handle = handle;
+  op.taddr = taddr;
   op.idesc = idesc;
   op.issue_cycle = perf_stats_.cycles;
   async_tensor_ops_[async_id] = std::move(op);
@@ -1317,13 +1317,13 @@ void Core::advance_tcgen05_ldst_async_ops() {
           static_cast<uint8_t>((value >> 16) & 0xff),
           static_cast<uint8_t>((value >> 24) & 0xff),
         };
-        (void)tmem_region_write_bytes(access.col_base,
+        (void)tmem_taddr_write_bytes(access.col_base,
                                       access.byte_offset,
                                       buf,
                                       sizeof(buf));
       } else {
         uint8_t buf[4] = {0, 0, 0, 0};
-        (void)tmem_region_read_bytes(access.col_base,
+        (void)tmem_taddr_read_bytes(access.col_base,
                                      access.byte_offset,
                                      buf,
                                      sizeof(buf));
@@ -1556,7 +1556,7 @@ uint32_t Core::cpabulk_tensor_load(uint32_t wid,
   op.type = AsyncTensorOpType::TmaLoad;
   op.wid = wid;
   op.wgid = wgid;
-  op.handle = 0;
+  op.taddr = 0;
   op.issue_cycle = perf_stats_.cycles;
   op.completed = true;        // direct copy completes synchronously for now
   op.payload_size_bytes = result.payload_size_bytes;
@@ -1602,12 +1602,12 @@ uint32_t Core::cpabulk_tensor_store(uint32_t wid,
 }
 
 // Phase-3.3.1 GAP-4: TMEM byte-range R/W backing tcgen05.ld / tcgen05.st.
-bool Core::tmem_region_read_bytes(uint32_t handle, uint32_t byte_offset, uint8_t* dst, uint32_t bytes) {
-  return tmem_system_->handle_region_read_bytes(handle, byte_offset, dst, bytes);
+bool Core::tmem_taddr_read_bytes(uint32_t taddr, uint32_t byte_offset, uint8_t* dst, uint32_t bytes) {
+  return tmem_system_->taddr_read_bytes(taddr, byte_offset, dst, bytes);
 }
 
-bool Core::tmem_region_write_bytes(uint32_t handle, uint32_t byte_offset, const uint8_t* src, uint32_t bytes) {
-  return tmem_system_->handle_region_write_bytes(handle, byte_offset, src, bytes);
+bool Core::tmem_taddr_write_bytes(uint32_t taddr, uint32_t byte_offset, const uint8_t* src, uint32_t bytes) {
+  return tmem_system_->taddr_write_bytes(taddr, byte_offset, src, bytes);
 }
 
 bool Core::tmem_find_allocation_by_lane(uint32_t lane, uint32_t* col_base) const {

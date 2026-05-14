@@ -1,6 +1,6 @@
 // tensor_async_frontend.cpp
 //
-// 张量异步操作分发前端实现
+// Async tensor-operation dispatch frontend implementation.
 
 #include "open_tensorcore/tensor_control/tensor_async_frontend.h"
 
@@ -37,11 +37,9 @@ bool use_open_tensorcore(uint32_t fmt_a, uint32_t fmt_b, uint32_t fmt_c) {
 // enqueue_async_mma_load
 // ============================================================================
 //
-// MMA_LOAD(A/B): 拆 4 个 MemUop，每个填一行（line_idx 0..3）
-// MMA_LOAD(C)  : 拆 4 个 MemUop，每个填一个 subtile（subtile_id 0..3）
-//
-// WS 快路径：MMA_LOAD(B) 发现 BMem 已 ws_locked 且 descriptor 匹配时，直接跳过
-// fill，不生成 MemUop（数据复用）。
+// MMA_LOAD(A/B) creates four MemUops, one per AMem/BMem line.
+// MMA_LOAD(C) creates four MemUops, one per CMem subtile.
+// The weight-stationary B fast path reuses locked BMem data and skips fill.
 // ============================================================================
 void tcissue_unit::issue_mma_load(
     Core* core,
@@ -76,8 +74,8 @@ void tcissue_unit::issue_mma_load(
   (void)arch; (void)wid;
 
   
-  // // --- 检查 TMEM taddr 是否已就绪 ---
-  // if (!core->tmem_handle_ready_for_mma_load(taddr, args.target, args.a_sparse_mode)) {
+  // // Check whether the TMEM TADDR is ready for MMA load.
+  // if (!core->tmem_taddr_ready_for_mma_load(taddr, args.target, args.a_sparse_mode)) {
   //   if (trace_data) { trace_data->retry = true; }
   //   return;
   // }
@@ -89,7 +87,7 @@ void tcissue_unit::issue_mma_load(
 
   
 
-  // --- Mem 状态检查 + 描述符绑定 ---
+  // Check local-memory state and bind the descriptor.
   switch (args.target) {
   case TcuTarget::A: {
     if (!TensorMemManager::is_a_ready(*amem_state)) {
@@ -100,14 +98,12 @@ void tcissue_unit::issue_mma_load(
     TensorMemManager::mark_a_pending(amem_state);
   } break;
   case TcuTarget::B: {
-    // WS 快路径：已 ws_locked 且 descriptor 匹配 → 复用，无需 fill
+    // Weight-stationary fast path: reuse locked BMem without a new fill.
     if (bmem_state->ws && (bmem_state->use || bmem_state->lastuse)) {
-      // 数据已在 BMem，无需新 fill。发起一个 async_id 并立即完成。
+      // Data is already resident in BMem; issue an async ID with no MemUops.
       auto async_id = core->mma_load_async_issue(wid, taddr, args.descriptor);
-      (*pending_mem_ops)[async_id] = 0;  // 无挂起 uop
-      // 立即发 completion
-      // 注意：completion 由 pipeline 发送；这里简化为不发，软件 fence 不会因此
-      // 阻塞。若后续需要严格 fence 语义，可在此发送。
+      (*pending_mem_ops)[async_id] = 0;  // No pending uops.
+      // Completion is intentionally elided in this legacy path.
       return;
     }
     if (!TensorMemManager::is_b_ready(*bmem_state)) {
@@ -124,7 +120,7 @@ void tcissue_unit::issue_mma_load(
     }
     TensorMemManager::bind_c_descriptor(cmem_state, args, cmem);
     TensorMemManager::mark_c_pending(cmem_state);
-    // C fill 同时为 DMem 绑定描述符（尚未产生数据）
+    // C fill also binds DMem's descriptor, though D has no data yet.
     TensorMemManager::bind_d_descriptor(dmem_state, args, dmem);
   } break;
   default:
@@ -132,8 +128,8 @@ void tcissue_unit::issue_mma_load(
     return;
   }
 
-  // --- 创建 MemUop 并入队 ---
-  auto async_id = core->mma_load_async_issue(wid, handle, args.descriptor);
+  // Create MemUops and enqueue them.
+  auto async_id = core->mma_load_async_issue(wid, taddr, args.descriptor);
   uint32_t num_uops = 0;
 
   switch (args.target) {
@@ -144,21 +140,20 @@ void tcissue_unit::issue_mma_load(
       op.kind = tud::MemUop::Kind::FillA;
       op.wgid = arch.warpgroup_id(wid);
       op.line_idx = line;
-      op.handle = handle;
+      op.taddr = taddr;
       op.window_id = args.window_id;
       op.payload_fmt = source_payload_fmt;
       op.tile_idx = args.tile_id;
       op.async_id = async_id;
-      op.separate_handle = true;
+      op.separate_taddr = true;
       op.remaining_tmem_read_packets = AMem::packets_per_fill_line(fmt);
       op.remaining_amem_fill_lines = 1;
-      // 稀疏元数据仅附加到 line 0 的 MemUop
+      // Sparse metadata is attached only to line 0's MemUop.
       if (line == 0 && amem_state->a_sparse_mode != vt::sparse_none) {
         op.remaining_tmem_read_packets += tud::meta_packet_count(amem_state->a_sparse_mode);
         op.remaining_metamem_fill_packets = MetaMem::fill_packets();
       }
       mem_ops->push_back(op);
-      perf_stats->mem_queue_max = std::max<uint64_t>(perf_stats->mem_queue_max, mem_ops->size());
       ++num_uops;
     }
   } break;
@@ -169,16 +164,15 @@ void tcissue_unit::issue_mma_load(
       op.kind = tud::MemUop::Kind::FillB;
       op.wgid = arch.warpgroup_id(wid);
       op.line_idx = line;
-      op.handle = handle;
+      op.taddr = taddr;
       op.window_id = args.window_id;
       op.payload_fmt = source_payload_fmt;
       op.tile_idx = args.tile_id;
       op.async_id = async_id;
-      op.separate_handle = true;
+      op.separate_taddr = true;
       op.remaining_tmem_read_packets = BMem::packets_per_fill_line(fmt);
       op.remaining_bmem_fill_lines = 1;
       mem_ops->push_back(op);
-      perf_stats->mem_queue_max = std::max<uint64_t>(perf_stats->mem_queue_max, mem_ops->size());
       ++num_uops;
     }
   } break;
@@ -190,16 +184,15 @@ void tcissue_unit::issue_mma_load(
       op.kind = tud::MemUop::Kind::FillC;
       op.wgid = arch.warpgroup_id(wid);
       op.line_idx = sub;
-      op.handle = handle;
+      op.taddr = taddr;
       op.window_id = args.window_id;
       op.payload_fmt = source_payload_fmt;
       op.tile_idx = args.tile_id;
       op.async_id = async_id;
-      op.separate_handle = true;
+      op.separate_taddr = true;
       op.remaining_tmem_read_packets = packets_per_sub;
       op.remaining_cmem_fill_subtiles = 1;
       mem_ops->push_back(op);
-      perf_stats->mem_queue_max = std::max<uint64_t>(perf_stats->mem_queue_max, mem_ops->size());
       ++num_uops;
     }
   } break;
@@ -214,14 +207,14 @@ void tcissue_unit::issue_mma_load(
 // enqueue_async_mma_store
 // ============================================================================
 //
-// MMA_STORE 从 DMem 读出最终结果，精度转换后写回 TMEM。
-// 条件：DMem 数据已 valid 且没有其他 store / 在飞 WMMA 占用。
+// MMA_STORE dumps DMem, converts to the target precision, and writes TMEM.
+// It can issue only when DMem is valid and no store/WMMA owns it.
 // ============================================================================
 void tcissue_unit::issue_mma_store(
     Core* core,
     const Arch& arch,
     uint32_t wid,
-    uint32_t handle,
+    uint32_t taddr,
     const IntrTcuArgs& args,
     tud::CMemState* cmem_state,
     tud::DMemState* dmem_state,
@@ -238,12 +231,12 @@ void tcissue_unit::issue_mma_store(
     return;
   }
 
-  if (!core->tmem_handle_ready_for_mma_store(handle)) {
+  if (!core->tmem_taddr_ready_for_mma_store(taddr)) {
     if (trace_data) { trace_data->retry = true; }
     return;
   }
 
-  // --- DMem 状态验证 ---
+  // Validate DMem state before scheduling the store.
   if (dmem_state->descriptor != args.descriptor
    || dmem_state->d_store_pending
    || dmem_state->d_wmma_inflight != 0) {
@@ -255,33 +248,32 @@ void tcissue_unit::issue_mma_store(
     return;
   }
 
-  // --- 创建 StoreC MemUop ---
+  // Create the StoreC MemUop.
   dmem_state->d_store_pending = true;
-  dmem_state->store_async_id = core->mma_store_async_issue(wid, handle, args.descriptor);
+  dmem_state->store_async_id = core->mma_store_async_issue(wid, taddr, args.descriptor);
 
   tud::MemUop op{};
   op.kind = tud::MemUop::Kind::StoreC;
   op.wgid = arch.warpgroup_id(wid);
   op.line_idx = 0;
-  op.handle = handle;
+  op.taddr = taddr;
   op.window_id = args.window_id;
   op.tile_idx = args.tile_id;
   op.async_id = dmem_state->store_async_id;
-  op.separate_handle = use_window;
+  op.separate_taddr = use_window;
   op.store_from_dmem = true;
   op.remaining_cmem_dump_subtiles = DMem::dump_subtiles(dmem_state->fmt_d);
   op.remaining_tmem_write_packets = tud::d_store_packet_count(dmem_state->fmt_d);
   mem_ops->push_back(op);
-  perf_stats->mem_queue_max = std::max<uint64_t>(perf_stats->mem_queue_max, mem_ops->size());
 }
 
 // ============================================================================
 // enqueue_async_wmma
 // ============================================================================
 //
-// 发射门控（单实例）:
-//   - AMem.a_valid && BMem.b_valid 同时成立
-//   - 如果是累加序列的第一条（或 OR=0 单次模式），还要 CMem.c_valid
+// Legacy WMMA issue gate:
+//   - AMem and BMem must both be valid.
+//   - The first accumulation step also requires valid CMem data.
 //
 // ============================================================================
 // void TensorAsyncFrontend::enqueue_async_wmma(
@@ -320,11 +312,11 @@ void tcissue_unit::issue_mma_store(
 //     return;
 //   }
 
-//   // 累加序列第一条识别
+//   // Identify the first step in an accumulation sequence.
 //   bool or_bit = (args.output_resident != 0);
 //   bool is_first = !or_bit || !(*prev_or);
 
-//   // 发射门控
+//   // Issue gating.
 //   if (amem_state->descriptor != args.descriptor || !amem_state->a_valid || amem_state->a_wmma_pending) {
 //     if (trace_data) { trace_data->retry = true; }
 //     return;
@@ -342,14 +334,14 @@ void tcissue_unit::issue_mma_store(
 //       return;
 //     }
 //   } else {
-//     // middle/tail：需要 DMem 有上一轮结果
+//     // Middle/tail steps need the previous DMem result.
 //     if (!dmem_state->d_valid) {
 //       if (trace_data) { trace_data->retry = true; }
 //       return;
 //     }
 //   }
 
-//   // 标记状态
+//   // Mark local-memory ownership state.
 //   amem_state->a_wmma_pending = true;
 //   bmem_state->b_wmma_pending = true;
 //   if (is_first) {
@@ -377,7 +369,7 @@ void tcissue_unit::issue_mma_store(
 //   wmma_job.next_uop = 0;
 //   pending_wmma_jobs->push_back(wmma_job);
 
-//   // 更新 prev_or（下一条 WMMA 会据此判定是否 middle/tail）
+//   // Update prev_or so the next WMMA can identify middle/tail steps.
 //   *prev_or = or_bit;
 
 //   ++perf_stats->issued_macro_wmma;
@@ -548,7 +540,7 @@ void tcissue_unit::issue_tcu_mma_uop(
     return;
   }
 
-  // --- TensorCore 管线就绪性 ---
+  // TensorCore pipeline readiness.
 
   if (!tensorcore->ready(true)) {
     //if (has_work) {
@@ -557,13 +549,13 @@ void tcissue_unit::issue_tcu_mma_uop(
     return;
   }
 
-  // --- 计算当前原语坐标 ---
+  // Compute the current primitive coordinates.
   uint32_t k_phase = active_wmma_job.next_uop / tud::kPrimitivesPerKPhase;
   uint32_t c_subtile_id = active_wmma_job.next_uop % tud::kPrimitivesPerKPhase;
   uint32_t storage_m = c_subtile_id / 2;
   uint32_t storage_n = c_subtile_id % 2;
 
-  // --- 读取 SRAM 数据 ---
+  // Read local SRAM operands.
   uint16_t a_block[tud::kPrimitiveDim][tud::kPrimitiveDim] = {0};
   uint16_t b_block[tud::kPrimitiveDim][tud::kPrimitiveDim] = {0};
   uint32_t c_bypass[tud::kPrimitiveDim][tud::kPrimitiveDim] = {0};
@@ -581,7 +573,7 @@ void tcissue_unit::issue_tcu_mma_uop(
   }
 
 
-  // --- 构建 meta 并下发 ---
+  // Build metadata and issue to TensorCore.
   TensorCoreMeta meta{};
   meta.wgid = job.wgid;
   meta.async_id = job.async_id;
@@ -594,12 +586,11 @@ void tcissue_unit::issue_tcu_mma_uop(
 
   auto cycle = core->current_cycle();
   ++perf_stats->issued_primitive_tiles;
-  if (perf_stats->first_tc_issue_cycle == 0) {
-    perf_stats->first_tc_issue_cycle = cycle;
+  if (perf_stats->setup_end_cycle == 0) {
+    perf_stats->setup_end_cycle = cycle;
   }
-  perf_stats->last_tc_issue_cycle = cycle;
 
-  // --- 推进 job 状态 ---
+  // Advance the active WMMA job state.
   ++job.next_uop;
 
 

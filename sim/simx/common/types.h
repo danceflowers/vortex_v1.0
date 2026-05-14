@@ -781,9 +781,9 @@ struct IntrTcuArgs {
   uint32_t fmt_d = 0;
   uint32_t a_sparse_mode = 0;
 
-  // Async tracking / handle indirection.
+  // Async tracking / taddr indirection.
   uint32_t async_id = 0;
-  uint32_t runtime_handle = 0;
+  uint32_t runtime_taddr = 0;
 
   // ---- New tcgen05 ISA qualifier-decoded flags (modifier bits from funct7) ----
   uint8_t cta_group = 0;          // qualifier[0] for most TMEM ops; qualifier[3] for TCU_MMA

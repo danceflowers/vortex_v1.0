@@ -9,7 +9,7 @@
 
 namespace tensor_mem_test_utils {
 
-// AMem 参考验证：一次性写入全部 4 行
+// Reference helper: fill all AMem lines from a complete packet sequence.
 inline bool bulk_fill_tile_for_reference(AMem* amem,
                                          uint32_t fmt_a,
                                          const std::vector<AMem::packet_t>& packets) {
@@ -35,7 +35,7 @@ inline bool bulk_fill_tile_for_reference(AMem* amem,
   return true;
 }
 
-// BMem 参考验证
+// Reference helper: fill all BMem lines from a complete packet sequence.
 inline bool bulk_fill_tile_for_reference(BMem* bmem,
                                          uint32_t fmt_b,
                                          const std::vector<BMem::packet_t>& packets,
@@ -62,7 +62,7 @@ inline bool bulk_fill_tile_for_reference(BMem* bmem,
   return true;
 }
 
-// CMem 参考验证
+// Reference helper: fill all CMem subtiles from a complete packet sequence.
 inline bool bulk_fill_tile_for_reference(CMem* cmem,
                                          uint32_t fmt_c,
                                          const std::vector<CMem::packet_t>& packets) {
@@ -89,7 +89,7 @@ inline bool bulk_fill_tile_for_reference(CMem* cmem,
   return true;
 }
 
-// CMem 参考 dump
+// Reference helper: dump all CMem subtiles into a complete packet sequence.
 inline bool bulk_dump_tile_for_reference(const CMem* cmem,
                                          uint32_t fmt_c,
                                          std::vector<CMem::packet_t>* packets) {
@@ -112,7 +112,7 @@ inline bool bulk_dump_tile_for_reference(const CMem* cmem,
   return true;
 }
 
-// MetaMem 参考验证
+// Reference helper: fill MetaMem from its single metadata packet.
 inline bool bulk_fill_tile_for_reference(MetaMem* metamem,
                                          const std::vector<MetaMem::packet_t>& packets) {
   if (nullptr == metamem || packets.size() < MetaMem::packet_count()) {

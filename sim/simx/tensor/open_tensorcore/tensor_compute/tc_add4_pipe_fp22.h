@@ -30,6 +30,7 @@ struct unpacked_t {
   bool is_nan = false;
 };
 
+// Split an FP22 value into sign/exponent/mantissa plus special-case flags.
 inline unpacked_t unpack(uint32_t fp) {
   unpacked_t out{};
   out.sign = (fp >> (kInFpLen - 1)) & 1;
@@ -49,6 +50,7 @@ inline uint32_t mask_width(int width) {
   return (1u << width) - 1u;
 }
 
+// Right shift with sticky-bit reporting for IEEE-style alignment.
 inline uint32_t shift_right_jam(uint32_t in, uint32_t shamt, bool* sticky) {
   if (sticky) {
     *sticky = false;
@@ -70,6 +72,7 @@ inline uint32_t shift_right_jam(uint32_t in, uint32_t shamt, bool* sticky) {
   return in >> shamt;
 }
 
+// Align one signed operand to the maximum exponent used by the 4-input add.
 inline int32_t align_operand(const unpacked_t& in, uint32_t exp_max) {
   uint32_t exp_diff = exp_max - in.exp;
   uint32_t man_ext = (in.man << (kOutManWidth - kInManWidth + kGrsWidth)) & mask_width(kAccManWidth);
@@ -106,6 +109,7 @@ inline int leading_zeros_u32(uint32_t value, int width) {
   return count;
 }
 
+// Combinational reference model for the 4-input FP22 adder pipeline.
 inline uint32_t add4_reference(uint32_t in0,
                                uint32_t in1,
                                uint32_t in2,
@@ -165,6 +169,7 @@ inline uint32_t add4_reference(uint32_t in0,
 
 } // namespace add4_fp22_rtl
 
+// Four-stage valid/ready pipeline that sums four FP22 operands per lane.
 struct add4_pipe_fp22 {
   struct {
     std::array<uint32_t, 4> in = {};
@@ -243,6 +248,7 @@ struct add4_pipe_fp22 {
     return r4.meta;
   }
 
+  // Advance all four stages while preserving backpressure from the consumer.
   void tick(bool out_ready, const Config& g_cfg, uint32_t passthrough) {
     using namespace add4_fp22_rtl;
 

@@ -4,6 +4,8 @@
 
 namespace tensor_core_test_utils {
 
+// Load one primitive into TensorCoreTop using the current standalone test
+// configuration for precision metadata.
 inline void load_inputs(TensorCoreTop* sim,
                         const uint16_t a[TensorCoreTop::M][TensorCoreTop::K],
                         const uint16_t b[TensorCoreTop::K][TensorCoreTop::N],
@@ -26,6 +28,7 @@ inline void load_inputs(TensorCoreTop* sim,
   sim->push_uop(a, b, fp22_c, meta);
 }
 
+// Clear staged input without disturbing internal pipeline state.
 inline void load_invalid(TensorCoreTop* sim) {
   if (nullptr == sim) {
     return;
@@ -35,6 +38,7 @@ inline void load_invalid(TensorCoreTop* sim) {
   sim->staged_meta = {};
 }
 
+// Tick once and report whether the primitive retired this cycle.
 inline bool run(TensorCoreTop* sim) {
   if (nullptr == sim) {
     return false;
@@ -43,6 +47,7 @@ inline bool run(TensorCoreTop* sim) {
   return sim->retired.valid;
 }
 
+// Double-precision reference for one 8x8 primitive dot product plus C.
 inline void reference_matmul(const uint16_t a_fp9[8][8],
                              const uint16_t b_fp9[8][8],
                              const uint32_t c_fp22[8][8],

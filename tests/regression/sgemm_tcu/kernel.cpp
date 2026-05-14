@@ -24,7 +24,7 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
 
   uint32_t handle = vt::tmem_alloc(/*col_span=*/64);
 
-  uint32_t idesc = vt::make_idescriptor<vt::ITYPE, vt::ITYPE, vt::OTYPE, vt::OTYPE>(
+  uint32_t idesc = vt::make_i_descriptor<vt::ITYPE, vt::ITYPE, vt::OTYPE, vt::OTYPE>(
       static_cast<uint16_t>(M), static_cast<uint16_t>(N));
 
   // Naive K-loop: each iteration accumulates a tcu_mma into d_taddr (R-M-W).

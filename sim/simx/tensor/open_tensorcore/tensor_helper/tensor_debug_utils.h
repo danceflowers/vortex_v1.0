@@ -1,8 +1,6 @@
 #pragma once
 
-// ============================================================================
-// tensor_debug_utils.h —— TensorUnit 调试与日志（单实例简化版）
-// ============================================================================
+// TensorUnit debug and log-formatting helpers.
 
 #include <iosfwd>
 

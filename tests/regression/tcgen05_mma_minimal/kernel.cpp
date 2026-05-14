@@ -46,7 +46,7 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   auto* op_block = reinterpret_cast<vt::operand_block_t*>(lmem + kOpBlockOff);
   *op_block = vt::make_operand_block(a_taddr, b_sdesc, 0);
 
-  uint32_t idesc = vt::make_idescriptor<vt::fp16, vt::fp16, vt::fp32, vt::fp32>(
+  uint32_t idesc = vt::make_i_descriptor<vt::fp16, vt::fp16, vt::fp32, vt::fp32>(
       M_DIM, N_DIM);
   uint32_t mbar_addr = reinterpret_cast<uint32_t>(lmem + kMbarOff);
   vt::mbarrier_init(mbar_addr, 1);

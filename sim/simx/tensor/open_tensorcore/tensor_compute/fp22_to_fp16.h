@@ -1,6 +1,9 @@
 #pragma once
 #include <cstdint>
 
+// Convert the TensorCore internal FP22 accumulator format to IEEE FP16.
+// FP22 is encoded as sign:1, exponent:8, mantissa:13; this helper preserves
+// NaN/Inf, handles subnormal FP16 output, and rounds to nearest-even.
 inline uint16_t fp22_to_fp16(uint32_t fp22) {
   uint32_t s = (fp22 >> 21) & 0x1;
   int32_t e = (fp22 >> 13) & 0xFF;

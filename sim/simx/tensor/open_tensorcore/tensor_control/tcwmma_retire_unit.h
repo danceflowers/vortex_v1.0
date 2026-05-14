@@ -1,11 +1,10 @@
 // tensor_wmma_retire_unit.h
 //
-// WMMA 原语退休单元（单实例简化版）
+// Legacy single-instance WMMA primitive retire unit.
 //
-// 所有退休结果统一写入 DMem[c_subtile_id]。8 个 primitive 全部退休后:
-//   - pending_wmma_uops[async_id] 计数归零
-//   - d_wmma_inflight-- , 最后一个完成时 d_valid = true
-//   - 发送异步完成通知
+// Retired primitive results are written to DMem[c_subtile_id]. When all
+// primitives for an async_id retire, the unit updates DMem visibility and emits
+// an async completion notification.
 
 #pragma once
 

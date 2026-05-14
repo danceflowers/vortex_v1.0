@@ -59,6 +59,7 @@ uint32_t cmem_packets_per_subtile(uint32_t fmt) {
   }
 }
 
+// Map packet_idx to a math-tile rectangle for the selected native layout.
 bool packet_math_region_impl(const TmemMathPacketLayout& layout,
                              uint32_t packet_idx,
                              uint32_t* math_row_base,
@@ -156,6 +157,7 @@ bool packet_math_region_impl(const TmemMathPacketLayout& layout,
 
 } // namespace
 
+// Decide whether the caller must use the math-packet adapter for this layout.
 bool uses_math_packet_adapter(const TmemMathPacketLayout& layout) {
   return !layout.elem_shape.empty()
       && layout.packets_per_tile != 0
@@ -166,6 +168,7 @@ bool uses_math_packet_adapter(const TmemMathPacketLayout& layout) {
        || layout.layout_kind == TmemMathPacketLayoutKind::CSubtileNative);
 }
 
+// Public wrapper that exposes the packet's logical math-coordinate span.
 bool packet_math_region(const TmemMathPacketLayout& layout,
                         uint32_t packet_idx,
                         TmemMathPacketRegion* out) {
@@ -180,6 +183,7 @@ bool packet_math_region(const TmemMathPacketLayout& layout,
                                  &out->packet_cols);
 }
 
+// Gather bytes from the logical payload into the selected packet shape.
 bool pack_math_packet(const TmemMathPacketLayout& layout,
                       const std::vector<uint8_t>& payload,
                       uint32_t packet_idx,
@@ -223,6 +227,7 @@ bool pack_math_packet(const TmemMathPacketLayout& layout,
   return true;
 }
 
+// Scatter packet bytes back into their logical math-tile payload offsets.
 bool unpack_math_packet(const TmemMathPacketLayout& layout,
                         uint32_t packet_idx,
                         const std::array<uint8_t, kPacketBytes>& packet,

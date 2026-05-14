@@ -16,6 +16,7 @@ namespace tmem_math_packet {
 
 static constexpr uint32_t kPacketBytes = 64;
 
+// Describes how a logical math tile is laid out across 64 B TMEM packets.
 enum class TmemMathPacketLayoutKind : uint8_t {
   LinearPacketStream = 0,
   MathRowMajor,
@@ -51,18 +52,22 @@ struct TmemMathPacketRegion {
   uint32_t packet_cols = 0;
 };
 
+// True when a layout needs math-coordinate packet packing instead of linear copy.
 bool uses_math_packet_adapter(const TmemMathPacketLayout& layout);
 
+// Return the logical math rows/cols covered by one packet index.
 bool packet_math_region(const TmemMathPacketLayout& layout,
                         uint32_t packet_idx,
                         TmemMathPacketRegion* out);
 
+// Pack a rectangular math tile payload into one physical TMEM packet.
 bool pack_math_packet(const TmemMathPacketLayout& layout,
                       const std::vector<uint8_t>& payload,
                       uint32_t packet_idx,
                       std::array<uint8_t, kPacketBytes>* out,
                       bool transpose = false);
 
+// Unpack one TMEM packet back into the logical math tile payload buffer.
 bool unpack_math_packet(const TmemMathPacketLayout& layout,
                         uint32_t packet_idx,
                         const std::array<uint8_t, kPacketBytes>& packet,

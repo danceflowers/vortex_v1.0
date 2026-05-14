@@ -49,7 +49,7 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   wait_tensor_async(kBarLoad);
 
   vt::operand_block_t op = vt::make_operand_block(handle, /*b_sdesc=*/0);
-  uint32_t idesc = vt::make_idescriptor<vt::ATYPE, vt::BTYPE, vt::OTYPE, vt::OTYPE>(0, 0);
+  uint32_t idesc = vt::make_i_descriptor<vt::ATYPE, vt::BTYPE, vt::OTYPE, vt::OTYPE>(0, 0);
   vt::mbarrier_init(kBarWmma, 1);
   vt::tcu_mma(/*d_taddr=*/handle, idesc, &op);
   wait_tensor_async(kBarWmma);

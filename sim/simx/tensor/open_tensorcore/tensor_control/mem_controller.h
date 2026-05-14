@@ -1,19 +1,17 @@
 // tensor_mem_manager.h
 //
-// A/B/C/DMem 单实例状态管理器。
+// Single-instance state manager for AMem, BMem, CMem, and DMem.
 //
-// 状态语义:
-//   - *_ready    : 可接受新的 fill lifecycle（数据空闲 / 已使用完毕）
-//   - *_pending  : fill 搬运进行中
-//   - *_valid    : 数据完整有效，可供 WMMA 或 MMA_STORE 消费
-//   - *_wmma_pending (A/B) : 正被 WMMA 原语消费
-//   - b_ws_locked : weight-stationary 锁定（多个 WMMA 共享 BMem）
+// State semantics:
+//   - *_ready: the local store can accept a new fill lifecycle.
+//   - *_pending: fill traffic is in flight.
+//   - *_valid: the local store contains a complete tile for compute/store.
+//   - *_wmma_pending: the local store is currently consumed by WMMA issue.
+//   - b_ws_locked: BMem is retained for weight-stationary reuse.
 //
-// 生命周期:
-//   [ready] --(MMA_LOAD 发起)--> [pending] --(4 行 fill 完成)--> [valid]
-//   [valid] --(WMMA 发射)--> [wmma_pending] --(8 uop push 完)--> [ready]
-//
-// 对 BMem ws=1: 8 uop push 完后保持 [valid]+[ws_locked]，不回 [ready]。
+// Normal lifecycle:
+//   ready -> pending -> valid -> wmma_pending -> ready.
+// Weight-stationary BMem stays valid and locked after WMMA issue.
 
 #pragma once
 
@@ -68,7 +66,7 @@ public:
                                 const IntrTcuArgs& args,
                                 DMem* dmem);
 
-  // ---- 发布快照供调度器使用 ----
+  // Publish a scheduler-visible state snapshot.
   static void snapshot_for_scheduler(const tud::AMemState& a_state,
                                      const tud::BMemState& b_state,
                                      const tud::CMemState& c_state,

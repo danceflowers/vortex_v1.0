@@ -1,26 +1,15 @@
 #pragma once
 
 // ============================================================================
-// CMem -- C 累加器输入 SRAM (单实例版本)
+// CMem -- single-instance C accumulator-input SRAM.
 // ============================================================================
 //
-// 存储组织:
-//   - 单实例, 深度 = 4 subtile (kDepth = 4)
-//   - 一个 16×16 tile = 2×2 的 4 个 8×8 subtile:
-//       subtile 0 = 左上, subtile 1 = 右上,
-//       subtile 2 = 左下, subtile 3 = 右下
-//   - 8 个 bank，每个 bank 持有 kBankElems = 8 个元素
+// CMem stores a 16x16 tile as four 8x8 FP22 subtiles. The fill path converts
+// TMEM packet payloads from fp8/fp16/fp32 into FP22, and the TensorCore issue
+// path reads a subtile as the initial C bypass operand.
 //
-// 内部精度: fp22 (8-bit 指数 + 14-bit 尾数)
-//
-// 支持的操作:
-//   1. Fill (TMEM → CMem): write_fill_subtile / convert_fill_packets
-//   2. WMMA 读取: read_subtile_fp22(subtile_id, out) 作为累加序列 first 模式的
-//      c_bypass 输入
-//
-// 累加序列简化版:
-//   - first（OR=0 或 OR=1 且 prev_or=0）: c_bypass 从 CMem 读出，透传进阵列
-//   - middle/tail（OR=1 && prev_or=1）: c_bypass 从 DMem 读出，实现原位累加
+// Later K phases accumulate through DMem; CMem only provides the first C value
+// for a macro MMA when input D is enabled.
 // ============================================================================
 
 #include <array>
@@ -63,7 +52,7 @@ public:
     reset();
   }
 
-  /// fill 一个完整 tile 所需 TMEM 包数: fp8=4, fp16=8, fp32=16
+  /// Number of TMEM packets required to fill one C tile.
   static uint32_t packet_count(uint32_t fmt) {
     switch (fmt) {
     case vortex::tensor::fp8::id:  return 4;
@@ -105,7 +94,7 @@ public:
     }
   }
 
-  /// Fill 精度转换: 外部格式 → fp22
+  /// Convert external fill packets into internal FP22 subtile elements.
   static bool convert_fill_packets(uint32_t fmt_c,
                                    const std::vector<packet_t>& packets,
                                    uint32_t out[kPrimitiveDim][kPrimitiveDim]) {
@@ -160,7 +149,7 @@ public:
     return false;
   }
 
-  /// Dump 精度转换: fp22 → 外部格式 (按 segment 构建 64B 包)
+  /// Convert one FP22 subtile segment back into a 64B external-format packet.
   static bool build_dump_packet(uint32_t fmt_c,
                                 const uint32_t subtile[kPrimitiveDim][kPrimitiveDim],
                                 uint32_t segment_idx,
@@ -212,7 +201,7 @@ public:
     return false;
   }
 
-  /// 便捷路径: 转换 + 写入
+  /// Convert the incoming packet group and write one CMem subtile.
   bool write_fill_subtile(uint32_t fmt_c,
                           uint32_t subtile_idx,
                           const std::vector<packet_t>& packets) {
@@ -238,7 +227,7 @@ public:
     return true;
   }
 
-  /// 时序路径: 已转换好的 fp22 直接写入
+  /// Timing path helper: write already-converted FP22 data directly.
   bool write_converted_subtile(uint32_t subtile_idx,
                                const uint32_t in[kPrimitiveDim][kPrimitiveDim]) {
     if (subtile_idx >= kDepth) {
@@ -310,7 +299,7 @@ public:
     row_valid_.at(subtile_id) = true;
   }
 
-  /// 便捷路径 (参考验证用)
+  /// Reference helper: add an FP22 subtile into an existing CMem subtile.
   void accumulate_subtile(uint32_t subtile_id,
                           const uint32_t in[kPrimitiveDim][kPrimitiveDim]) {
     if (subtile_id >= kDepth || !row_valid_.at(subtile_id)) {
@@ -326,7 +315,7 @@ public:
     }
   }
 
-  // 参考验证辅助接口
+  // Reference-test helpers expose subtiles as conventional fp32/fp16 blocks.
   void load_block_fp32(uint32_t storage_m, uint32_t storage_n, float out[kPrimitiveDim][kPrimitiveDim]) const {
     uint32_t raw[kPrimitiveDim][kPrimitiveDim] = {};
     read_subtile_fp22(storage_m * 2 + storage_n, raw);

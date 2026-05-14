@@ -144,6 +144,7 @@ bool Tmem::try_grant_request(const PortRequest& request, uint64_t cycle) {
   }
 }
 
+// Grant one packet from each age-ordered FIFO when per-cycle TMEM ports allow it.
 void Tmem::arbitrate_requests(uint64_t cycle) {
   if (arbitration_cycle_ == cycle) {
     return;
@@ -173,8 +174,8 @@ void Tmem::arbitrate_requests(uint64_t cycle) {
   arbitrate_fifo(pending_write_requests_);
 }
 
-bool Tmem::lookup_allocation(uint32_t handle, TmemAllocation** allocation) {
-  auto it = allocations_.find(handle);
+bool Tmem::lookup_allocation(uint32_t taddr, TmemAllocation** allocation) {
+  auto it = allocations_.find(taddr);
   if (it == allocations_.end() || !it->second.valid) {
     return false;
   }
@@ -184,8 +185,8 @@ bool Tmem::lookup_allocation(uint32_t handle, TmemAllocation** allocation) {
   return true;
 }
 
-bool Tmem::lookup_allocation(uint32_t handle, const TmemAllocation** allocation) const {
-  auto it = allocations_.find(handle);
+bool Tmem::lookup_allocation(uint32_t taddr, const TmemAllocation** allocation) const {
+  auto it = allocations_.find(taddr);
   if (it == allocations_.end() || !it->second.valid) {
     return false;
   }
@@ -215,9 +216,9 @@ bool Tmem::region_query(uint32_t col_base, uint32_t col_span, uint32_t* size_byt
   return tmem_functional::region_query(col_base, col_span, kNumCols, kColBytes, size_bytes);
 }
 
-bool Tmem::query(uint32_t handle, uint32_t* col_span, uint32_t* size_bytes) const {
+bool Tmem::query(uint32_t taddr, uint32_t* col_span, uint32_t* size_bytes) const {
   const TmemAllocation* allocation = nullptr;
-  if (!lookup_allocation(handle, &allocation)) {
+  if (!lookup_allocation(taddr, &allocation)) {
     return false;
   }
   if (col_span) {
@@ -314,6 +315,7 @@ bool Tmem::region_copy_in(uint32_t col_base, uint32_t col_span, const uint8_t* d
   return true;
 }
 
+// Copy a logical TMEM region back into a flat byte buffer.
 bool Tmem::region_copy_out(uint32_t col_base, uint32_t col_span, uint8_t* data, uint32_t size_bytes) const {
   uint32_t capacity = 0;
   if (!region_query(col_base, col_span, &capacity) || (size_bytes != 0 && nullptr == data) || size_bytes > capacity) {
@@ -326,13 +328,13 @@ bool Tmem::region_copy_out(uint32_t col_base, uint32_t col_span, uint8_t* data, 
   return true;
 }
 
-// Phase-3.3.1 GAP-4: handle-based byte-range read/write for tcgen05.ld/st.
-// Resolves handle to (col_base, col_span), then walks bytes through the
+// Phase-3.3.1 GAP-4: taddr-based byte-range read/write for tcgen05.ld/st.
+// Resolves taddr to (col_base, col_span), then walks bytes through the
 // existing private byte API. byte_offset is within the allocation's payload
 // region [0, col_span * kColBytes).
-bool Tmem::handle_region_read_bytes(uint32_t handle, uint32_t byte_offset, uint8_t* dst, uint32_t bytes) const {
+bool Tmem::taddr_read_bytes(uint32_t taddr, uint32_t byte_offset, uint8_t* dst, uint32_t bytes) const {
   const TmemAllocation* alloc = nullptr;
-  if (!lookup_allocation(handle, &alloc) || nullptr == alloc || nullptr == dst) {
+  if (!lookup_allocation(taddr, &alloc) || nullptr == alloc || nullptr == dst) {
     return false;
   }
   uint32_t capacity = alloc->col_span * kColBytes;
@@ -345,9 +347,10 @@ bool Tmem::handle_region_read_bytes(uint32_t handle, uint32_t byte_offset, uint8
   return true;
 }
 
-bool Tmem::handle_region_write_bytes(uint32_t handle, uint32_t byte_offset, const uint8_t* src, uint32_t bytes) {
+// Resolve a TADDR allocation and write a byte range relative to its payload base.
+bool Tmem::taddr_write_bytes(uint32_t taddr, uint32_t byte_offset, const uint8_t* src, uint32_t bytes) {
   TmemAllocation* alloc = nullptr;
-  if (!lookup_allocation(handle, &alloc) || nullptr == alloc || nullptr == src) {
+  if (!lookup_allocation(taddr, &alloc) || nullptr == alloc || nullptr == src) {
     return false;
   }
   uint32_t capacity = alloc->col_span * kColBytes;
@@ -408,9 +411,9 @@ bool Tmem::region_write_packet(uint32_t col_base, uint32_t col_span, uint32_t pa
   return true;
 }
 
-bool Tmem::copy_in(uint32_t handle, const uint8_t* data, uint32_t size_bytes) {
+bool Tmem::copy_in(uint32_t taddr, const uint8_t* data, uint32_t size_bytes) {
   TmemAllocation* allocation = nullptr;
-  if (!lookup_allocation(handle, &allocation)) {
+  if (!lookup_allocation(taddr, &allocation)) {
     return false;
   }
   auto success = region_copy_in(allocation->payload_col_base, allocation->col_span, data, size_bytes);
@@ -420,9 +423,9 @@ bool Tmem::copy_in(uint32_t handle, const uint8_t* data, uint32_t size_bytes) {
   return success;
 }
 
-bool Tmem::copy_out(uint32_t handle, uint8_t* data, uint32_t size_bytes) const {
+bool Tmem::copy_out(uint32_t taddr, uint8_t* data, uint32_t size_bytes) const {
   const TmemAllocation* allocation = nullptr;
-  if (!lookup_allocation(handle, &allocation)) {
+  if (!lookup_allocation(taddr, &allocation)) {
     return false;
   }
   return region_copy_out(allocation->payload_col_base, allocation->col_span, data, size_bytes);
@@ -462,7 +465,7 @@ uint32_t Tmem::alloc(uint32_t col_span) {
   // bits[31:16]=col_byte offset (=0 for fresh alloc). Vortex maps PTX lane
   // axis to its internal logical_col axis, so the returned taddr is just
   // the chosen col_base (lane base) directly. allocations_ is now keyed by
-  // col_base instead of an opaque handle counter.
+  // col_base instead of an opaque allocation counter.
   // Failure sentinel: kInvalidTaddr (0xFFFFFFFFu) — col_base 0 is a valid taddr.
   constexpr uint32_t granularity = 16;
   if (col_span == 0) {
@@ -508,9 +511,9 @@ uint32_t Tmem::alloc(uint32_t col_span) {
   return kInvalidTaddr;
 }
 
-bool Tmem::free(uint32_t handle) {
+bool Tmem::free(uint32_t taddr) {
   TmemAllocation* allocation = nullptr;
-  if (!lookup_allocation(handle, &allocation)) {
+  if (!lookup_allocation(taddr, &allocation)) {
     return false;
   }
 
@@ -518,7 +521,7 @@ bool Tmem::free(uint32_t handle) {
   for (uint32_t i = 0; i < allocation->col_span; ++i) {
     payload_col_allocs_.at(allocation->payload_col_base + i) = false;
   }
-  allocations_.erase(handle);
+  allocations_.erase(taddr);
   assert_valid();
   return true;
 }
@@ -531,14 +534,14 @@ bool Tmem::allocator_sealed() const {
   return allocator_sealed_;
 }
 
-void Tmem::set_payload_ready(uint32_t handle, bool ready) {
-  if (TmemAllocation* allocation = nullptr; lookup_allocation(handle, &allocation)) {
+void Tmem::set_payload_ready(uint32_t taddr, bool ready) {
+  if (TmemAllocation* allocation = nullptr; lookup_allocation(taddr, &allocation)) {
     allocation->payload_ready = ready;
   }
 }
 
-void Tmem::set_meta_ready(uint32_t handle, bool ready) {
-  if (TmemAllocation* allocation = nullptr; lookup_allocation(handle, &allocation)) {
+void Tmem::set_meta_ready(uint32_t taddr, bool ready) {
+  if (TmemAllocation* allocation = nullptr; lookup_allocation(taddr, &allocation)) {
     allocation->meta_ready = ready;
   }
 }
@@ -551,16 +554,16 @@ void Tmem::publish_visible_state() {
   }
 }
 
-void Tmem::set_meta_region(uint32_t handle, uint32_t meta_col_base, uint32_t meta_col_span) {
-  if (TmemAllocation* allocation = nullptr; lookup_allocation(handle, &allocation)) {
+void Tmem::set_meta_region(uint32_t taddr, uint32_t meta_col_base, uint32_t meta_col_span) {
+  if (TmemAllocation* allocation = nullptr; lookup_allocation(taddr, &allocation)) {
     allocation->meta_col_base = meta_col_base;
     allocation->meta_col_span = meta_col_span;
   }
   assert_valid();
 }
 
-bool Tmem::set_row_bytes(uint32_t handle, uint32_t row_bytes) {
-  if (TmemAllocation* allocation = nullptr; lookup_allocation(handle, &allocation)) {
+bool Tmem::set_row_bytes(uint32_t taddr, uint32_t row_bytes) {
+  if (TmemAllocation* allocation = nullptr; lookup_allocation(taddr, &allocation)) {
     auto clamped = std::min<uint32_t>(row_bytes, allocation->col_span * kColBytes);
     if (0 == clamped) {
       return false;
@@ -572,9 +575,9 @@ bool Tmem::set_row_bytes(uint32_t handle, uint32_t row_bytes) {
   return false;
 }
 
-bool Tmem::row_bytes(uint32_t handle, uint32_t* row_bytes) const {
+bool Tmem::row_bytes(uint32_t taddr, uint32_t* row_bytes) const {
   const TmemAllocation* allocation = nullptr;
-  if (!lookup_allocation(handle, &allocation) || nullptr == row_bytes) {
+  if (!lookup_allocation(taddr, &allocation) || nullptr == row_bytes) {
     return false;
   }
   *row_bytes = allocation->row_bytes;
@@ -681,9 +684,16 @@ bool Tmem::validate(std::string* reason) const {
       return false;
     }
 
-    if (0 == entry.first) {
+    if (entry.first == kInvalidTaddr || entry.first >= 0x80000000u) {
       if (reason) {
-        *reason = "TMEM handle 0 is reserved but present in the allocation table";
+        *reason = "TMEM allocation table contains an invalid TADDR key";
+      }
+      return false;
+    }
+
+    if (entry.first != allocation.payload_col_base) {
+      if (reason) {
+        *reason = "TMEM allocation key does not match its payload column base";
       }
       return false;
     }

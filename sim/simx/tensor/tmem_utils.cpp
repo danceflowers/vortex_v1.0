@@ -14,6 +14,7 @@
 namespace vortex {
 namespace tmem_functional {
 
+// Parse VORTEX_SIMX_TMEM_BANKS while preserving a safe default on bad input.
 uint32_t configured_physical_bank_count(uint32_t default_banks,
                                         uint32_t min_banks,
                                         uint32_t max_banks) {
@@ -33,6 +34,7 @@ uint32_t configured_physical_bank_count(uint32_t default_banks,
   return static_cast<uint32_t>(parsed);
 }
 
+// Choose a bank-swizzle stride that is relatively prime to the bank count.
 uint32_t choose_coprime_stride(uint32_t count, uint32_t preferred) {
   if (count <= 1) {
     return 1;

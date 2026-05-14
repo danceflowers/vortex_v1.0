@@ -18,46 +18,38 @@
 
 namespace vortex {
 
-// ============================================================================
-// TMEM clients（TensorUnit / Core-side LMEM->TMEM transfer engine）与 TmemSystem
-// 之间的端口级消息定义
+// Packet-level messages between TMEM clients and TmemSystem.
 //
-// 每个客户端通过 SimPort<TensorMemPortReq/Rsp> 向 TmemSystem 发出逐包
-// 读写请求；TmemSystem 把所有客户端请求汇入同一个 TMEM packet 仲裁器，
-// 完成 TMEM 访问后再返回响应。
-// 每条请求/响应恰好对应 1 个 64B TMEM 数据包事务。
-//
-// TensorAsyncOpCompletion 在异步宏操作（tcgen05.mma / tcgen05.shift）的
-// 所有微操作全部完成后由 TensorUnit 发出，通知 Core 解除等待。
-// ============================================================================
+// TensorUnit and the Core-side transfer engines issue one request per 64B TMEM
+// packet. TmemSystem arbitrates all clients through the shared TMEM bank model
+// and returns one matching response per request.
 
-// 端口级请求：跨 TensorExecuteSystem ↔ TensorMemSystem 模块边界
-// 载荷描述恰好一次 TMEM 包事务，加上共享入口/出口 FIFO 的仲裁年龄
+// One packet-level request crossing the TensorUnit/Core -> TmemSystem boundary.
+// arbitration_age orders all clients inside the shared TMEM request FIFO.
 struct TensorMemPortReq {
   enum class AccessType : uint8_t {
     Read = 0,
     Write,
   };
 
-  uint64_t request_id = 0;          // 全局唯一请求 ID，用于匹配响应
-  uint64_t arbitration_age = 0;     // 仲裁年龄：(async_id << 32 | packet_ordinal)，越小越优先
-  AccessType access_type = AccessType::Read;  // 读/写类型
-  Tmem::PortRequestDesc port_request = {};    // TMEM 端口请求描述符（handle, window, packet_idx）
-  TmemPacket write_packet = {};               // 写请求载荷（仅 Write 时有效）
+  uint64_t request_id = 0;          // Globally unique request/response key.
+  uint64_t arbitration_age = 0;     // Lower values win shared-port arbitration.
+  AccessType access_type = AccessType::Read;  // Read or write transaction.
+  Tmem::PortRequestDesc port_request = {};    // TMEM packet address descriptor.
+  TmemPacket write_packet = {};               // Write payload; ignored for reads.
 };
 
-// 端口级响应：共享 TMEM FIFO 授权请求并完成实际 TMEM 包读写后返回
+// Response for one granted TMEM packet request after the SRAM access completes.
 struct TensorMemPortRsp {
-  uint64_t request_id = 0;          // 对应请求的 ID
+  uint64_t request_id = 0;          // Matching request ID.
   TensorMemPortReq::AccessType access_type = TensorMemPortReq::AccessType::Read;
-  TmemPacket read_packet = {};      // 读响应载荷（仅 Read 时有效）
+  TmemPacket read_packet = {};      // Read payload; zero for writes.
 };
 
-// 异步操作完成事件：当一条异步张量宏操作达到架构可见完成点时，由
-// TensorExecuteSystem 发出。Core 侧的 async_tensor_waiters_ 监听此事件
-// 以唤醒等待的 warp（TMA_WAIT / TC_FENCE）。
+// Completion notice for an architecture-visible async tensor macro operation.
+// Core listens to this stream to wake warps blocked on waits or fences.
 struct TensorAsyncOpCompletion {
-  uint32_t async_id = 0;            // 对应的异步操作 ID
+  uint32_t async_id = 0;            // Completed async operation ID.
 };
 
 } // namespace vortex

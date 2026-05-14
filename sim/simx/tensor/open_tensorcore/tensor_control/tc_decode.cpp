@@ -1,6 +1,6 @@
 // tc_decode.cpp
 //
-// TensorCore 协处理器指令解码实现。
+// TensorCore coprocessor instruction decode implementation.
 
 #include "open_tensorcore/tensor_control/tc_decode.h"
 #include "core.h"
@@ -18,33 +18,33 @@ namespace {
 // Returns false on unsupported kind.
 bool kind_to_fmt(uint32_t kind, uint32_t* fmt_a, uint32_t* fmt_b,
                  uint32_t* fmt_c, uint32_t* fmt_d) {
-  switch (static_cast<IDescriptorKind>(kind)) {
-  case IDescriptorKind::F16:
+  switch (static_cast<i_descriptor_kind_t>(kind)) {
+  case i_descriptor_kind_t::F16:
     *fmt_a = vt::fp16::id; *fmt_b = vt::fp16::id;
     *fmt_c = vt::fp32::id; *fmt_d = vt::fp32::id;
     return true;
-  case IDescriptorKind::BF16:
+  case i_descriptor_kind_t::BF16:
     *fmt_a = vt::bf16::id; *fmt_b = vt::bf16::id;
     *fmt_c = vt::fp32::id; *fmt_d = vt::fp32::id;
     return true;
-  case IDescriptorKind::TF32:
+  case i_descriptor_kind_t::TF32:
     *fmt_a = vt::fp32::id; *fmt_b = vt::fp32::id;
     *fmt_c = vt::fp32::id; *fmt_d = vt::fp32::id;
     return true;
-  case IDescriptorKind::F8F6F4:
-  case IDescriptorKind::MXF8F6F4:
+  case i_descriptor_kind_t::F8F6F4:
+  case i_descriptor_kind_t::MXF8F6F4:
     *fmt_a = vt::fp8::id; *fmt_b = vt::fp8::id;
     *fmt_c = vt::fp32::id; *fmt_d = vt::fp32::id;
     return true;
-  case IDescriptorKind::F8F16:
+  case i_descriptor_kind_t::F8F16:
     *fmt_a = vt::fp8::id; *fmt_b = vt::fp16::id;
     *fmt_c = vt::fp32::id; *fmt_d = vt::fp32::id;
     return true;
-  case IDescriptorKind::F16F8:
+  case i_descriptor_kind_t::F16F8:
     *fmt_a = vt::fp16::id; *fmt_b = vt::fp8::id;
     *fmt_c = vt::fp32::id; *fmt_d = vt::fp32::id;
     return true;
-  case IDescriptorKind::I8:
+  case i_descriptor_kind_t::I8:
     // Vortex CModel doesn't yet implement int8 path; placeholder.
     *fmt_a = 0; *fmt_b = 0; *fmt_c = 0; *fmt_d = 0;
     return true;
@@ -87,7 +87,7 @@ bool TcDecode::decode_tcu_mma(Core* core,
   }
 
   // Decode 32-bit idesc from rs1 (PTX §9.7.16.5.4).
-  idescriptor_t idesc;
+  i_descriptor_t idesc;
   static_assert(sizeof(idesc) == sizeof(uint32_t));
   std::memcpy(&idesc, &rs1_value, sizeof(idesc));
 

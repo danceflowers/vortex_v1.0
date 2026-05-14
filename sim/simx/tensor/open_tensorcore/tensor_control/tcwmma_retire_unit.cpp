@@ -1,6 +1,6 @@
 // tensor_wmma_retire_unit.cpp
 //
-// WMMA 原语退休单元实现（单实例简化版）。
+// Legacy single-instance WMMA primitive retire implementation.
 
 #include "open_tensorcore/tensor_control/tensor_wmma_retire_unit.h"
 
@@ -25,7 +25,7 @@ void TensorWmmaRetireUnit::advance_tensorcore_pipeline(
   }
   tensorcore->tick(true);
 
-  //这个pending_tensorcore_retires是deque，相当于FIFO
+  // pending_tensorcore_retires is used as a FIFO between pop and retire.
   TensorCoreRetire retire;
   if (tensorcore->pop_retired(&retire)) {
     pending_tensorcore_retires->push_back(retire);
@@ -47,7 +47,7 @@ void TensorWmmaRetireUnit::advance_tensorcore_pipeline(
   }
 }
 
-//处理已完成的uop，核心逻辑是完成一个primitive，对应pending_wmma_uops就要减计算，pending_wmma_uops是unordered_map，所以对应硬件是一个寄存器表
+// Retire one completed primitive and decrement the async_id's pending count.
 bool TensorWmmaRetireUnit::retire_primitive(
     Core* core,
     const TensorCoreRetire& retire,
@@ -60,7 +60,7 @@ bool TensorWmmaRetireUnit::retire_primitive(
     TensorUnit::PerfStats* perf_stats,
     SimPort<TensorAsyncOpCompletion>* async_completion_out) {
   (void)cmem_state; (void)cmem; (void)mem_arbiter;
-  //做一遍检查
+  // Validate retire input and required state pointers.
   if (!retire.valid) {
     return true;
   }
@@ -71,14 +71,11 @@ bool TensorWmmaRetireUnit::retire_primitive(
 
   auto subtile_id = retire.meta.c_subtile_id;
   auto cycle = core->current_cycle();
-  //性能计数器，统计完成的primitive tile数量
+  // Performance counters track primitive-tile retirement cycles.
   ++perf_stats->retired_primitive_tiles;
-  if (perf_stats->first_tc_retire_cycle == 0) {
-    perf_stats->first_tc_retire_cycle = cycle;
-  }
-  perf_stats->last_tc_retire_cycle = cycle;
+  perf_stats->epilogue_begin_cycle = cycle;
 
-  // 所有退休结果统一写入 DMem (原位累加 / 最终结果)
+  // All primitive results are materialized in DMem.
   dmem->write_subtile_fp22(subtile_id, retire.fp22_out);
 
   auto pending_it = pending_wmma_uops->find(retire.meta.async_id);
@@ -87,7 +84,7 @@ bool TensorWmmaRetireUnit::retire_primitive(
   }
   --pending_it->second;
 
-  // 最后一个 primitive 退休: WMMA 宏操作完成
+  // Last primitive retired: the macro WMMA operation is complete.
   if (pending_it->second == 0) {
     pending_wmma_uops->erase(pending_it);
 

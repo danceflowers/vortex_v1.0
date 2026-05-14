@@ -32,7 +32,7 @@ struct TmemPacket {
   }
 };
 
-enum class TmemHandleBlockReason : uint8_t {
+enum class TmemTaddrBlockReason : uint8_t {
   None = 0,
   Invalid,
   BusyTmemShift,
@@ -42,7 +42,7 @@ enum class TmemHandleBlockReason : uint8_t {
 
 // One software-visible PTX TMEM allocation.
 //
-// The allocation reserves a slab of logical TMEM lanes. The returned handle is
+// The allocation reserves a slab of logical TMEM lanes. The returned taddr is
 // the PTX TADDR lane base, so code can round-trip TADDRs without a descriptor
 // table or window binding.
 struct TmemAllocation {
@@ -115,13 +115,19 @@ public:
 
   void reset();
 
+  // Allocate a PTX-visible TMEM TADDR region and return its lane-base TADDR.
   uint32_t alloc(uint32_t col_span);
-  bool free(uint32_t handle);
+
+  // Free a previously allocated TADDR region and clear its payload storage.
+  bool free(uint32_t taddr);
+
+  // Seal the allocator after tcgen05.alloc permit is released.
   void seal_allocator();
   bool allocator_sealed() const;
 
-  bool lookup_allocation(uint32_t handle, TmemAllocation** allocation);
-  bool lookup_allocation(uint32_t handle, const TmemAllocation** allocation) const;
+  // Look up allocation metadata by the kernel-visible TADDR value.
+  bool lookup_allocation(uint32_t taddr, TmemAllocation** allocation);
+  bool lookup_allocation(uint32_t taddr, const TmemAllocation** allocation) const;
 
   // Phase-3.4 Stage 0: PTX TADDR lookup helper. Per-thread TCU_LD/TCU_ST
   // computes actual_lane = taddr.lane + thread_id; this scans allocations_
@@ -130,32 +136,39 @@ public:
   bool find_allocation_by_lane(uint32_t lane, uint32_t* col_base) const;
 
   bool region_query(uint32_t col_base, uint32_t col_span, uint32_t* size_bytes) const;
-  bool query(uint32_t handle, uint32_t* col_span, uint32_t* size_bytes) const;
+  bool query(uint32_t taddr, uint32_t* col_span, uint32_t* size_bytes) const;
 
   bool region_copy_in(uint32_t col_base, uint32_t col_span, const uint8_t* data, uint32_t size_bytes);
   bool region_copy_out(uint32_t col_base, uint32_t col_span, uint8_t* data, uint32_t size_bytes) const;
 
-  // Byte-range R/W via handle (Phase-3.3.1 GAP-4 path for tcu_ld/tcu_st).
+  // Byte-range R/W via taddr (Phase-3.3.1 GAP-4 path for tcu_ld/tcu_st).
   // byte_offset is relative to the allocation's payload region (0..col_span*kColBytes-1).
-  bool handle_region_read_bytes(uint32_t handle, uint32_t byte_offset, uint8_t* dst, uint32_t bytes) const;
-  bool handle_region_write_bytes(uint32_t handle, uint32_t byte_offset, const uint8_t* src, uint32_t bytes);
+  bool taddr_read_bytes(uint32_t taddr, uint32_t byte_offset, uint8_t* dst, uint32_t bytes) const;
+  bool taddr_write_bytes(uint32_t taddr, uint32_t byte_offset, const uint8_t* src, uint32_t bytes);
   bool region_read_packet(uint32_t col_base, uint32_t col_span, uint32_t packet_idx, TmemPacket* out) const;
   bool region_write_packet(uint32_t col_base, uint32_t col_span, uint32_t packet_idx, const TmemPacket& in);
-  bool copy_in(uint32_t handle, const uint8_t* data, uint32_t size_bytes);
-  bool copy_out(uint32_t handle, uint8_t* data, uint32_t size_bytes) const;
+  bool copy_in(uint32_t taddr, const uint8_t* data, uint32_t size_bytes);
+  bool copy_out(uint32_t taddr, uint8_t* data, uint32_t size_bytes) const;
+
+  // Shift a region down by one logical row; TmemSystem models the async timing.
   bool region_shift_down(uint32_t col_base, uint32_t col_span, uint32_t row_bytes);
 
-  void set_payload_ready(uint32_t handle, bool ready);
-  void set_meta_ready(uint32_t handle, bool ready);
-  void set_meta_region(uint32_t handle, uint32_t meta_col_base, uint32_t meta_col_span);
+  // Update producer/consumer readiness that becomes visible on publish_visible_state().
+  void set_payload_ready(uint32_t taddr, bool ready);
+  void set_meta_ready(uint32_t taddr, bool ready);
+  void set_meta_region(uint32_t taddr, uint32_t meta_col_base, uint32_t meta_col_span);
   void publish_visible_state();
-  bool set_row_bytes(uint32_t handle, uint32_t row_bytes);
-  bool row_bytes(uint32_t handle, uint32_t* row_bytes) const;
+  bool set_row_bytes(uint32_t taddr, uint32_t row_bytes);
+  bool row_bytes(uint32_t taddr, uint32_t* row_bytes) const;
 
   void reset_port_budgets(uint64_t cycle);
   void ensure_port_budgets(uint64_t cycle);
+
+  // Try to reserve packet/bank ports directly; used by tests and the port arbiter.
   bool try_acquire_region_read_packet(uint64_t cycle, uint32_t col_base, uint32_t col_span, uint32_t packet_idx);
   bool try_acquire_region_write_packet(uint64_t cycle, uint32_t col_base, uint32_t col_span, uint32_t packet_idx);
+
+  // Enqueue packet traffic from TMEM clients and grant it through shared budgets.
   uint64_t enqueue_port_request(uint64_t cycle, const PortRequestDesc& desc);
   void arbitrate_requests(uint64_t cycle);
   bool request_granted(uint64_t tag) const;

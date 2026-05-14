@@ -1,13 +1,12 @@
 #pragma once
 
 // ============================================================================
-// BMem -- B 操作数 SRAM (单实例版本)
+// BMem -- single-instance B operand SRAM.
 // ============================================================================
 //
-// 与 AMem 结构对称:
-//   - 单实例，深度 = 4 行
-//   - m16n16k16 tile: line 0/1 = K-phase 0 的两个 N-block
-//                     line 2/3 = K-phase 1 的两个 N-block
+// BMem mirrors AMem, but the four lines hold the two N blocks for each K
+// phase of an m16n16k16 tile. The write path converts external fp8/fp16
+// payloads to internal fp9, and the read path returns one 8x8 primitive block.
 // ============================================================================
 
 #include <array>
@@ -48,7 +47,7 @@ public:
     reset();
   }
 
-  /// fill 一个完整 m16n16k16 tile 所需 TMEM 包数
+  /// Number of TMEM packets required for one m16n16k16 B tile.
   static uint32_t packet_count(uint32_t fmt_b, uint32_t /*sparse_mode*/ = vortex::tensor::sparse_none) {
     return (fmt_b == vortex::tensor::fp16::id) ? 8 : 4;
   }
@@ -183,7 +182,7 @@ public:
     }
   }
 
-  // 稀疏 2:4 / 1:4 模式 (预留接口)
+  // Reserved sparse-source interfaces for the old standalone tests.
   void read_sparse_2_4_source(uint32_t, uint16_t[16][8]) const {
     std::abort();
   }

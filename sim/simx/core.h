@@ -224,7 +224,7 @@ public:
   using TmemPacket = vortex::TmemPacket;
   using TmemRequestDesc = vortex::Tmem::PortRequestDesc;
   using TmemRequestKind = vortex::Tmem::PortRequestKind;
-  using TmemHandleBlockReason = vortex::TmemHandleBlockReason;
+  using TmemTaddrBlockReason = vortex::TmemTaddrBlockReason;
 
   static constexpr uint32_t kTmemPayloadCols = Tmem::kPayloadCols;
   static constexpr uint32_t kTmemMetaCols = Tmem::kMetaCols;
@@ -234,9 +234,9 @@ public:
   static constexpr uint32_t kTmemWritePacketsPerCycle = Tmem::kWritePacketsPerCycle;
   uint32_t tmem_alloc(uint32_t col_span, uint32_t reserved_operand = kTmemAllocReservedOperand);
   // PTX tcgen05.dealloc.
-  bool tmem_dealloc(uint32_t handle);
+  bool tmem_dealloc(uint32_t taddr);
   void tmem_rel_permit();
-  uint32_t tmem_shift(uint32_t wid, uint32_t handle, uint32_t control_word = kTcuTmemOpControlPtxOnly);
+  uint32_t tmem_shift(uint32_t wid, uint32_t taddr, uint32_t control_word = kTcuTmemOpControlPtxOnly);
 
   // ===== tcgen05 / cp.async.bulk.tensor data-plane Core API (Phase-2) =====
   //
@@ -268,12 +268,12 @@ public:
 
   // tcgen05.ld / tcgen05.st (Phase-3.3.1 GAP-4): per-thread byte-range TMEM R/W.
   // Phase-3.4 Stage 0: PTX TADDR `[15:0]=lane, [31:16]=col_byte`. The
-  // 'handle' arg here is the col_base (= TmemAllocation key); byte_offset is
+  // 'taddr' arg here is the col_base (= TmemAllocation key); byte_offset is
   // computed from PTX taddr by callers as
   //   byte_offset = (actual_lane - col_base) * kColBytes + col_byte
   // where actual_lane = taddr.lane + thread_id (warp-collective).
-  bool tmem_region_read_bytes(uint32_t handle, uint32_t byte_offset, uint8_t* dst, uint32_t bytes);
-  bool tmem_region_write_bytes(uint32_t handle, uint32_t byte_offset, const uint8_t* src, uint32_t bytes);
+  bool tmem_taddr_read_bytes(uint32_t taddr, uint32_t byte_offset, uint8_t* dst, uint32_t bytes);
+  bool tmem_taddr_write_bytes(uint32_t taddr, uint32_t byte_offset, const uint8_t* src, uint32_t bytes);
   bool tmem_find_allocation_by_lane(uint32_t lane, uint32_t* col_base) const;
 
   // tcgen05.fence::{before,after}_thread_sync
@@ -300,14 +300,14 @@ public:
   bool tcgen05_ld_trace_ready(uint64_t trace_id) const;
   bool tcgen05_wait_ld(uint32_t wid);
   bool tcgen05_wait_st(uint32_t wid);
-  uint32_t mma_load_async_issue(uint32_t wid, uint32_t handle, uint32_t idesc);
-  uint32_t mma_store_async_issue(uint32_t wid, uint32_t handle, uint32_t idesc);
+  uint32_t mma_load_async_issue(uint32_t wid, uint32_t taddr, uint32_t idesc);
+  uint32_t mma_store_async_issue(uint32_t wid, uint32_t taddr, uint32_t idesc);
   uint32_t wmma_async_issue(uint32_t wid);
   void async_tensor_complete(uint32_t async_id);
-  bool tmem_handle_ready_for_mma_load(uint32_t handle, TcuTarget target, uint32_t sparse_mode) const;
-  bool tmem_handle_ready_for_mma_store(uint32_t handle) const;
-  TmemHandleBlockReason tmem_handle_load_block_reason(uint32_t handle, TcuTarget target, uint32_t sparse_mode) const;
-  TmemHandleBlockReason tmem_handle_store_block_reason(uint32_t handle) const;
+  bool tmem_taddr_ready_for_mma_load(uint32_t taddr, TcuTarget target, uint32_t sparse_mode) const;
+  bool tmem_taddr_ready_for_mma_store(uint32_t taddr) const;
+  TmemTaddrBlockReason tmem_taddr_load_block_reason(uint32_t taddr, TcuTarget target, uint32_t sparse_mode) const;
+  TmemTaddrBlockReason tmem_taddr_store_block_reason(uint32_t taddr) const;
   // ===== mbarrier API (LMEM-backed; full PTX §7.6 semantics) =====
   // mbar_addr is the absolute LMEM address holding the 8 B mbarrier_state_t.
   bool mbarrier_init(uint64_t mbar_addr, uint32_t count);
@@ -332,13 +332,13 @@ public:
   uint64_t enqueue_tmem_request(const TmemRequestDesc& desc);
   bool tmem_request_granted(uint64_t tag) const;
   void consume_tmem_request_grant(uint64_t tag);
-  bool tmem_query(uint32_t handle, uint32_t* col_span, uint32_t* size_bytes) const;
-  bool tmem_lookup_allocation(uint32_t handle, const TmemAllocation** allocation) const;
-  bool tmem_transfer_region(uint32_t handle, uint32_t* col_base, uint32_t* col_span) const;
-  void tmem_set_payload_ready(uint32_t handle, bool ready);
-  void tmem_set_meta_ready(uint32_t handle, bool ready);
-  void tmem_set_meta_region(uint32_t handle, uint32_t meta_col_base, uint32_t meta_col_span);
-  bool tmem_set_row_bytes(uint32_t handle, uint32_t row_bytes);
+  bool tmem_query(uint32_t taddr, uint32_t* col_span, uint32_t* size_bytes) const;
+  bool tmem_lookup_allocation(uint32_t taddr, const TmemAllocation** allocation) const;
+  bool tmem_transfer_region(uint32_t taddr, uint32_t* col_base, uint32_t* col_span) const;
+  void tmem_set_payload_ready(uint32_t taddr, bool ready);
+  void tmem_set_meta_ready(uint32_t taddr, bool ready);
+  void tmem_set_meta_region(uint32_t taddr, uint32_t meta_col_base, uint32_t meta_col_span);
+  bool tmem_set_row_bytes(uint32_t taddr, uint32_t row_bytes);
 #endif
 
 #ifdef EXT_V_ENABLE
@@ -454,7 +454,7 @@ private:
     AsyncTensorOpType type = AsyncTensorOpType::TmaLoad;
     uint32_t wid = 0;
     uint32_t wgid = 0;
-    uint32_t handle = 0;
+    uint32_t taddr = 0;
     uint32_t idesc = 0;
     uint64_t issue_cycle = 0;
     bool completed = false;
@@ -493,10 +493,10 @@ private:
     std::vector<PendingTcgen05LdStAccess> accesses;
   };
 
-  // mbarrier object state — mirror of the 8 B mbarrier_state_t residing in LMEM.
-  // PTX §7.6.1 layout aligned. Core writes through to LMEM on every transition
-  // so the kernel-side `volatile uint64_t* mbar` reads see the right state.
-  struct MBarrierEntry {
+  // Runtime mbarrier state. The LMEM-visible 8 B object remains
+  // mbarrier_state_t; this runtime state carries extra simulator bookkeeping
+  // such as waiters and expected_tx_count.
+  struct mbarrier_runtime_state_t {
     bool     valid = false;
     uint32_t expected_arrival_count = 0;  // [19:0]   reset target on phase advance
     uint32_t pending_arrival_count  = 0;  // [61:32]  decremented by mbarrier_arrive
@@ -515,17 +515,17 @@ private:
 
   std::unordered_map<uint32_t, AsyncTensorOp> async_tensor_ops_;
   std::unordered_map<uint64_t, PendingTcgen05LdStOp> pending_tcgen05_ldst_ops_;
-  // Same-Core-tick handle reservations used to serialize multiple tensor-memory
+  // Same-Core-tick taddr reservations used to serialize multiple tensor-memory
   // issue attempts within one execute phase without exposing those updates as
   // globally visible cross-module state until the next published snapshot.
-  std::unordered_set<uint32_t> execute_cycle_tmem_shift_reserved_handles_;
+  std::unordered_set<uint32_t> execute_cycle_tmem_shift_reserved_taddrs_;
   std::unordered_map<uint32_t, WarpMask> async_tensor_waiters_;
   WarpMask tcgen05_ld_waiters_;
   WarpMask tcgen05_st_waiters_;
   // mbarrier state keyed by LMEM address (PTX semantics: object lives in LMEM).
   // Each mbar_addr in [LMEM_BASE_ADDR, LMEM_BASE_ADDR+16K) maps to one entry;
   // Core mirrors the entry's LMEM-visible bits to LocalMem on every update.
-  std::unordered_map<uint64_t, MBarrierEntry> mbarriers_;
+  std::unordered_map<uint64_t, mbarrier_runtime_state_t> mbarriers_;
   // Per-warp wait targets: mbar_addr -> phase parity the warp is waiting on.
   std::vector<std::unordered_map<uint64_t, uint32_t>> mbarrier_wait_targets_;
   std::vector<FenceWaitState> fence_wait_states_;
@@ -554,11 +554,11 @@ private:
   bool has_pending_async_ops(uint32_t wid, bool committed_only) const;
   bool has_pending_local_tensor_ops(uint32_t wid) const;
   void try_complete_mbarrier(uint64_t mbar_addr);
-  void mirror_mbarrier_to_lmem(uint64_t mbar_addr, const MBarrierEntry& b);
+  void mirror_mbarrier_to_lmem(uint64_t mbar_addr, const mbarrier_runtime_state_t& state);
   bool tmem_region_query(uint32_t col_base, uint32_t col_span, uint32_t* size_bytes) const;
-  bool tmem_handle_busy(uint32_t handle) const;
-  bool lookup_tmem_allocation(uint32_t handle, TmemAllocation** allocation);
-  bool lookup_tmem_allocation(uint32_t handle, const TmemAllocation** allocation) const;
+  bool tmem_taddr_busy(uint32_t taddr) const;
+  bool lookup_tmem_allocation(uint32_t taddr, TmemAllocation** allocation);
+  bool lookup_tmem_allocation(uint32_t taddr, const TmemAllocation** allocation) const;
 #endif
 
   friend class LsuUnit;

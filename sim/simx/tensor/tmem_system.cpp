@@ -34,15 +34,17 @@ void TmemSystem::reset() {
   pending_core_transfer_requests_.clear();
   shift_transactions_.clear();
   shift_transaction_fifo_.clear();
-  live_shift_busy_handles_.clear();
-  visible_shift_busy_handles_.clear();
+  live_shift_busy_taddrs_.clear();
+  visible_shift_busy_taddrs_.clear();
 }
 
+// Publish producer-ready bits into the cross-module visible snapshot.
 void TmemSystem::publish_visible_state() {
-  visible_shift_busy_handles_ = live_shift_busy_handles_;
+  visible_shift_busy_taddrs_ = live_shift_busy_taddrs_;
   tmem_.publish_visible_state();
 }
 
+// Keep the FIFO head valid so the service loop does not revisit completed shifts.
 void TmemSystem::compact_shift_transaction_fifo() {
   std::deque<uint32_t> compacted_fifo;
   for (auto async_id : shift_transaction_fifo_) {
@@ -136,7 +138,7 @@ void TmemSystem::initialize_shift_transaction(ShiftTransaction& transaction) {
   }
 
   TmemAllocation* allocation = nullptr;
-  if (!lookup_allocation(transaction.handle, &allocation)) {
+  if (!lookup_allocation(transaction.taddr, &allocation)) {
     transaction.completed = true;
     transaction.initialized = true;
     return;
@@ -162,7 +164,7 @@ void TmemSystem::issue_shift_requests(ShiftTransaction& transaction) {
   }
 
   TmemAllocation* allocation = nullptr;
-  if (!lookup_allocation(transaction.handle, &allocation)) {
+  if (!lookup_allocation(transaction.taddr, &allocation)) {
     transaction.completed = true;
     return;
   }
@@ -221,7 +223,7 @@ void TmemSystem::complete_shift_transaction_step(ShiftTransaction& transaction) 
   }
 
   TmemAllocation* allocation = nullptr;
-  if (!lookup_allocation(transaction.handle, &allocation)) {
+  if (!lookup_allocation(transaction.taddr, &allocation)) {
     transaction.completed = true;
     return;
   }
@@ -231,7 +233,7 @@ void TmemSystem::complete_shift_transaction_step(ShiftTransaction& transaction) 
     transaction.completed = true;
     return;
   }
-  set_payload_ready(transaction.handle, true);
+  set_payload_ready(transaction.taddr, true);
   transaction.completed = true;
   AsyncOpCompletionOut.push({transaction.async_id}, 1);
 }
@@ -250,7 +252,7 @@ void TmemSystem::advance_shift_engine() {
     }
     initialize_shift_transaction(transaction);
     if (transaction.completed) {
-      live_shift_busy_handles_.erase(transaction.handle);
+      live_shift_busy_taddrs_.erase(transaction.taddr);
       AsyncOpCompletionOut.push({transaction.async_id}, 1);
       continue;
     }
@@ -274,45 +276,45 @@ void TmemSystem::tick() {
     }
     complete_shift_transaction_step(it->second);
     if (it->second.completed) {
-      live_shift_busy_handles_.erase(it->second.handle);
+      live_shift_busy_taddrs_.erase(it->second.taddr);
     }
   }
   compact_shift_transaction_fifo();
 }
 
 uint32_t TmemSystem::alloc(uint32_t col_span) { return tmem_.alloc(col_span); }
-bool TmemSystem::free(uint32_t handle) { return tmem_.free(handle); }
+bool TmemSystem::free(uint32_t taddr) { return tmem_.free(taddr); }
 void TmemSystem::seal_allocator() { tmem_.seal_allocator(); }
 bool TmemSystem::allocator_sealed() const { return tmem_.allocator_sealed(); }
-bool TmemSystem::lookup_allocation(uint32_t handle, TmemAllocation** allocation) { return tmem_.lookup_allocation(handle, allocation); }
-bool TmemSystem::lookup_allocation(uint32_t handle, const TmemAllocation** allocation) const { return tmem_.lookup_allocation(handle, allocation); }
+bool TmemSystem::lookup_allocation(uint32_t taddr, TmemAllocation** allocation) { return tmem_.lookup_allocation(taddr, allocation); }
+bool TmemSystem::lookup_allocation(uint32_t taddr, const TmemAllocation** allocation) const { return tmem_.lookup_allocation(taddr, allocation); }
 bool TmemSystem::region_query(uint32_t col_base, uint32_t col_span, uint32_t* size_bytes) const { return tmem_.region_query(col_base, col_span, size_bytes); }
-bool TmemSystem::query(uint32_t handle, uint32_t* col_span, uint32_t* size_bytes) const { return tmem_.query(handle, col_span, size_bytes); }
-bool TmemSystem::set_row_bytes(uint32_t handle, uint32_t row_bytes) { return tmem_.set_row_bytes(handle, row_bytes); }
-bool TmemSystem::row_bytes(uint32_t handle, uint32_t* row_bytes) const { return tmem_.row_bytes(handle, row_bytes); }
+bool TmemSystem::query(uint32_t taddr, uint32_t* col_span, uint32_t* size_bytes) const { return tmem_.query(taddr, col_span, size_bytes); }
+bool TmemSystem::set_row_bytes(uint32_t taddr, uint32_t row_bytes) { return tmem_.set_row_bytes(taddr, row_bytes); }
+bool TmemSystem::row_bytes(uint32_t taddr, uint32_t* row_bytes) const { return tmem_.row_bytes(taddr, row_bytes); }
 
-void TmemSystem::set_payload_ready(uint32_t handle, bool ready, bool update_visible_now) {
-  tmem_.set_payload_ready(handle, ready);
+void TmemSystem::set_payload_ready(uint32_t taddr, bool ready, bool update_visible_now) {
+  tmem_.set_payload_ready(taddr, ready);
   if (!update_visible_now) {
     return;
   }
-  if (TmemAllocation* allocation = nullptr; tmem_.lookup_allocation(handle, &allocation)) {
+  if (TmemAllocation* allocation = nullptr; tmem_.lookup_allocation(taddr, &allocation)) {
     allocation->visible_payload_ready = ready;
   }
 }
 
-void TmemSystem::set_meta_ready(uint32_t handle, bool ready, bool update_visible_now) {
-  tmem_.set_meta_ready(handle, ready);
+void TmemSystem::set_meta_ready(uint32_t taddr, bool ready, bool update_visible_now) {
+  tmem_.set_meta_ready(taddr, ready);
   if (!update_visible_now) {
     return;
   }
-  if (TmemAllocation* allocation = nullptr; tmem_.lookup_allocation(handle, &allocation)) {
+  if (TmemAllocation* allocation = nullptr; tmem_.lookup_allocation(taddr, &allocation)) {
     allocation->visible_meta_ready = ready;
   }
 }
 
-void TmemSystem::set_meta_region(uint32_t handle, uint32_t meta_col_base, uint32_t meta_col_span) {
-  tmem_.set_meta_region(handle, meta_col_base, meta_col_span);
+void TmemSystem::set_meta_region(uint32_t taddr, uint32_t meta_col_base, uint32_t meta_col_span) {
+  tmem_.set_meta_region(taddr, meta_col_base, meta_col_span);
 }
 
 uint64_t TmemSystem::enqueue_port_request(const Tmem::PortRequestDesc& desc, uint64_t arbitration_age) {
@@ -327,30 +329,30 @@ void TmemSystem::consume_request_grant(uint64_t request_tag) { tmem_.consume_req
 bool TmemSystem::issue_shift(uint32_t async_id,
                              uint32_t wid,
                              uint32_t wgid,
-                             uint32_t handle,
+                             uint32_t taddr,
                              uint64_t issue_cycle) {
   ShiftTransaction transaction{};
   transaction.async_id = async_id;
   transaction.wid = wid;
   transaction.wgid = wgid;
-  transaction.handle = handle;
+  transaction.taddr = taddr;
   transaction.issue_cycle = issue_cycle;
   transaction.first_service_cycle = SimPlatform::instance().cycles() + 1;
   shift_transactions_[async_id] = std::move(transaction);
   shift_transaction_fifo_.push_back(async_id);
-  live_shift_busy_handles_.insert(handle);
-  set_payload_ready(handle, false);
+  live_shift_busy_taddrs_.insert(taddr);
+  set_payload_ready(taddr, false);
   return true;
 }
 
-bool TmemSystem::visible_payload_ready(uint32_t handle) const {
+bool TmemSystem::visible_payload_ready(uint32_t taddr) const {
   const TmemAllocation* allocation = nullptr;
-  return tmem_.lookup_allocation(handle, &allocation) && allocation->visible_payload_ready;
+  return tmem_.lookup_allocation(taddr, &allocation) && allocation->visible_payload_ready;
 }
 
-bool TmemSystem::visible_meta_ready(uint32_t handle) const {
+bool TmemSystem::visible_meta_ready(uint32_t taddr) const {
   const TmemAllocation* allocation = nullptr;
-  return tmem_.lookup_allocation(handle, &allocation) && allocation->visible_meta_ready;
+  return tmem_.lookup_allocation(taddr, &allocation) && allocation->visible_meta_ready;
 }
 
 void TmemSystem::dump_debug_state(std::ostream& os) const {
@@ -358,12 +360,12 @@ void TmemSystem::dump_debug_state(std::ostream& os) const {
      << " core_transfer_pending=" << pending_core_transfer_requests_.size()
      << " shift_transactions=" << shift_transactions_.size()
      << " shift_fifo_depth=" << shift_transaction_fifo_.size()
-     << " live_shift_busy=" << live_shift_busy_handles_.size()
+     << " live_shift_busy=" << live_shift_busy_taddrs_.size()
      << "\n";
   for (const auto& entry : shift_transactions_) {
     const auto& transaction = entry.second;
     os << "  shift_async_id=" << transaction.async_id
-       << " handle=" << transaction.handle
+       << " taddr=" << transaction.taddr
        << " completed=" << transaction.completed
        << " initialized=" << transaction.initialized
        << " packet=" << transaction.next_packet_idx << "/" << transaction.packet_count

@@ -1,15 +1,10 @@
 // tensor_async_frontend.h
 //
-// 张量异步操作分发前端（单实例简化版）
+// Async tensor-operation dispatch frontend for the legacy TensorUnit path.
 //
-// 支持三种操作类型：
-//   - mma_load  : 从 TMEM 加载数据到本地 SRAM（AMem/BMem/CMem）
-//                 MMA_LOAD(A/B/C) 各自展开为 4 个 MemUop（每 line/subtile 一个）
-//   - mma_store : 将 DMem 中的最终结果写回 TMEM
-//   - wmma      : 发起矩阵乘累加，创建 PendingWmmaJob 入队
-//
-// 本模块不是周期精确的：所有验证和入队在一个周期内完成，失败则通过
-// trace_data->retry = true 让核心下周期重试。
+// It expands mma_load, mma_store, and wmma macro requests into MemUops and
+// PendingWmmaJob records. Validation/enqueue is modeled as one-cycle frontend
+// work; a rejected request marks trace_data->retry so the core can issue again.
 
 #pragma once
 
@@ -35,7 +30,7 @@ public:
       Core* core,
       const Arch& arch,
       uint32_t wid,
-      uint32_t handle,
+      uint32_t taddr,
       const IntrTcuArgs& args,
       tud::AMemState* amem_state,
       tud::BMemState* bmem_state,
@@ -105,7 +100,7 @@ public:
   //   (5) drain D (DMem -> TMEM at d_taddr)
   // all bound to a single async_id. Vortex TensorUnit issues these as MemUops
   // + PendingWmmaJob in the existing queues; the caller (TensorUnit::dispatch_
-  // tcu_mma) provides the decoded fmt/handles/tile_ids from the idesc +
+  // tcu_mma) provides the decoded fmt/taddrs/tile_ids from the idesc +
   // operand_block_t pair.
   //
   // The first_in_accum_seq detection (prev_or upper edge) is preserved.

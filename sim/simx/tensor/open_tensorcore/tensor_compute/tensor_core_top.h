@@ -5,9 +5,7 @@
 #include "tc_mul_add.h"
 #include "fp_types.h"
 
-// =============================================================================
-//  TensorCoreRetire — 张量核退休(输出)数据结构
-// =============================================================================
+// Retired output for one 8x8 primitive.
 struct TensorCoreRetire {
     static constexpr int M = 8;
     static constexpr int N = 8;
@@ -25,45 +23,37 @@ struct TensorCoreRetire {
     }
 };
 
-// =============================================================================
-//  TensorCoreTop — 8x8 顶层模块
-// =============================================================================
+// Top-level 8x8 TensorCore primitive array.
 //
-//  m16n16k16 基本计算粒度，4 个 8x8 subtile per WMMA。
-//
-//  C 操作数双路供给：
-//    - 非输出驻留模式：c_in[M][N] 从发射时注入，沿管线透传到 final_add
-//    - 输出驻留模式：C 通过 accum_fifo 预取，循环累加
-//
-//  push_uop 保留 c_in 参数用于非输出驻留模式的透传。
-//  输出驻留模式下 c_in 可传零（不使用），C 由 FIFO 提供。
-// =============================================================================
+// One m16n16k16 macro MMA is decomposed into four 8x8 subtiles and two K
+// phases. TensorCoreTop accepts one 8x8 A/B/C primitive, broadcasts it to 64
+// scalar tc_mul_add lanes, and retires one 8x8 FP22 subtile result.
 struct TensorCoreTop {
     static constexpr int M = 8, K = 8, N = 8;
 
-    // ---- 输入缓冲区 ----
+    // Input staging buffers.
     uint16_t a_in[M][K];
     uint16_t b_in[K][N];
-    uint32_t c_in[M][N];           // 非输出驻留模式的 C bypass 数据
+    uint32_t c_in[M][N];           // C bypass data for non-resident mode.
     uint32_t fp22_out[M][N];
 
-    // ---- 控制/状态 ----
+    // Control and progress state.
     int jobs_completed = 0;
     int set_jobs = 0;
     bool input_loaded = false;
     int cycle_count = 0;
-    bool circulating = false;       // 输出驻留循环累加模式
+    bool circulating = false;       // Output-resident circulating accumulation mode.
     bool resident_tail_to_dmem_valid = false;
     uint32_t resident_tail_to_dmem_async_id = 0;
 
-    // ---- 8x8 计算阵列 ----
+    // 8x8 compute array.
     tc_mul_add tc_dot_product[M][N];
 
-    // ---- 暂存区 ----
+    // One-cycle input metadata staging.
     TensorCoreMeta staged_meta;
     bool staged_valid = false;
 
-    // ---- 退休缓冲区 ----
+    // Retire buffer.
     TensorCoreRetire retired;
 
     // =========================================================================
@@ -128,13 +118,12 @@ struct TensorCoreTop {
         return true;
     }
 
-    // resident 回环在本拍是否真实发生了一次 FIFO -> final_add 的消费/轮转。
-    // 所有 PE 的 resident 时序保持一致，因此采样 [0][0] 即可。
+    // True when the resident feedback path consumed one FIFO value this tick.
     bool resident_turnover_pulse() const {
         return tc_dot_product[0][0].resident_turnover_pulse;
     }
 
-    // ---- FIFO 加载（输出驻留模式，CMem 预取用） ----
+    // Load the output-resident FIFO with prefetched C values.
     bool load_fifo_element(int i, int j, uint32_t fp22_val) {
         return tc_dot_product[i][j].load_fifo(fp22_val);
     }
@@ -147,7 +136,7 @@ struct TensorCoreTop {
         return true;
     }
 
-    // ---- FIFO 弹出（排空阶段，写回 CMem 用） ----
+    // Drain one output-resident FIFO element for writeback.
     bool pop_fifo_element(int i, int j, uint32_t* out) {
         auto& fifo = tc_dot_product[i][j].accum_fifo;
         if (!fifo.can_pop()) return false;
@@ -165,7 +154,7 @@ struct TensorCoreTop {
         resident_tail_to_dmem_async_id = async_id;
     }
 
-    // ---- push_uop：保留 c_in 用于非输出驻留模式透传 ----
+    // Stage one primitive input. c_in is passed through for non-resident mode.
     void push_uop(const uint16_t a[M][K],
                   const uint16_t b[K][N],
                   const uint32_t c[M][N],
@@ -185,7 +174,7 @@ struct TensorCoreTop {
         input_loaded = true;
     }
 
-    // // 输出驻留模式简化版（不传 C，C 由 FIFO 提供）
+    // // Simplified resident-mode overload: C is supplied by the FIFO.
     // void push_uop(const uint16_t a[M][K],
     //               const uint16_t b[K][N],
     //               const TensorCoreMeta& meta) {
@@ -200,12 +189,12 @@ struct TensorCoreTop {
         return true;
     }
 
-    // ---- tick ----
+    // Advance all 64 lanes by one cycle and collect a retired primitive.
     void tick(bool out_ready) {
         cycle_count++;
         retired.valid = false;
 
-        // 阶段 1: 广播输入到 64 个计算单元
+        // Stage 1: broadcast the staged primitive to all 64 lanes.
         for (int i = 0; i < M; ++i) {
             for (int j = 0; j < N; ++j) {
                 for (int k = 0; k < K; ++k) {
@@ -221,7 +210,7 @@ struct TensorCoreTop {
             }
         }
 
-        // 阶段 2: 推进 64 个单元（circulating 控制 final_add 路径选择）
+        // Stage 2: advance all lanes; circulating selects the final-add input.
         for (int i = 0; i < M; i++)
             for (int j = 0; j < N; j++)
                 tc_dot_product[i][j].tick(out_ready,
@@ -230,20 +219,16 @@ struct TensorCoreTop {
                                           resident_tail_to_dmem_valid,
                                           resident_tail_to_dmem_async_id);
 
-        // 阶段 3: 清除暂存区
+        // Stage 3: clear the one-cycle staging registers.
         staged_valid = false;
         input_loaded = false;
         staged_meta = {};
 
-        // 阶段 4: 完成检测
+        // Stage 4: retire once every lane produced a valid result.
         //
-        // 非输出驻留模式:
-        //   - retire 表示结果已经 materialize 为一个可写回 CMem/DMem 的 subtile
-        //
-        // 输出驻留模式:
-        //   - retire 表示一个 primitive 的结果已经成功进入 circulating accum state
-        //   - 这时可将该 primitive 记为 completed, 但不能把 C slot 标成
-        //     cmem_final_valid; 最终结果仍要等待 FIFO drain 回写到 CMem
+        // Non-resident mode retires a materialized subtile. Resident mode only
+        // means the primitive has entered the circulating accumulator state;
+        // final C visibility still waits for FIFO drain.
         bool all_done = true;
         for (int i = 0; i < M && all_done; i++)
             for (int j = 0; j < N && all_done; j++)

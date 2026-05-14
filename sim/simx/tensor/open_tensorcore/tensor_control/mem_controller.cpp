@@ -1,6 +1,6 @@
 // tensor_mem_manager.cpp
 //
-// A/B/C/DMem 单实例状态管理器实现。
+// Single-instance state manager implementation for AMem/BMem/CMem/DMem.
 
 #include "tensor_mem_manager.h"
 
@@ -167,7 +167,7 @@ void TensorMemManager::set_dmemstate(tud::DMemState* s,
 }
 
 // ============================================================================
-// 快照发布
+// Scheduler snapshot
 // ============================================================================
 
 void TensorMemManager::snapshot_for_scheduler(const tud::AMemState& a_state,

@@ -3,7 +3,7 @@
 // PTX-aligned tcgen05 / cp.async.bulk.tensor / mbarrier descriptor types.
 //
 // Naming aligns with NVIDIA PTX 8.7 / sm_100a:
-//   - idescriptor_t       (32-bit) -- tcgen05.mma "instruction descriptor" idesc
+//   - i_descriptor_t      (32-bit) -- tcgen05.mma "instruction descriptor" idesc
 //                                    (PTX §9.7.16.5.4)
 //   - operand_block_t     (32 B in shared memory) -- Vortex-private; carries the
 //                                    tcgen05.mma operands that do not fit in one
@@ -32,11 +32,11 @@
 namespace vortex {
 
 // ============================================================================
-// idescriptor_t -- 32-bit tcgen05.mma instruction descriptor
+// i_descriptor_t -- 32-bit tcgen05.mma instruction descriptor
 // PTX 8.7 §9.7.16.5.4 "Instruction descriptor for tcgen05.mma"
 // ============================================================================
 
-struct idescriptor_t {
+struct i_descriptor_t {
   uint32_t sparsity_meta_sel : 2;  // [1:0]   sparse_meta_taddr offset (.sp variant)
   uint32_t sparsity_kind     : 1;  // [2]     sparsity{2:4 / 1:4} encoding
   uint32_t reserved_3        : 1;  // [3]     reserved
@@ -50,10 +50,10 @@ struct idescriptor_t {
   uint32_t transpose_a       : 1;  // [30]    A transpose
   uint32_t transpose_b       : 1;  // [31]    B transpose
 } __attribute__((packed));
-static_assert(sizeof(idescriptor_t) == 4, "idescriptor_t must be 32 bits");
+static_assert(sizeof(i_descriptor_t) == 4, "i_descriptor_t must be 32 bits");
 
 // kind selector (matches PTX §9.7.16.5.4 .kind encoding)
-enum class IDescriptorKind : uint8_t {
+enum class i_descriptor_kind_t : uint8_t {
   F16        = 0,  // .kind::f16
   TF32       = 1,  // .kind::tf32
   BF16       = 2,  // .kind::bf16

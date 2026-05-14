@@ -1,18 +1,12 @@
 #pragma once
 
 // ============================================================================
-// MetaMem -- 稀疏元数据存储 (单实例版本)
+// MetaMem -- single-packet sparse metadata store.
 // ============================================================================
 //
-// 存储组织:
-//   - 单实例, 保存 1 个 64B packet
-//   - 64B 被逻辑上划分为 4 条 16B line (kTileLines = 4)
-//
-// Fill 路径:
-//   FillA 在传输 A 数据包之后，额外传输 1 个元数据包。
-//
-// Read 路径:
-//   read_line(step_m, step_k, out) 读出 16B 元数据。
+// A sparse MMA carries one 64B metadata packet next to the A payload. MetaMem
+// splits it into four 16B lines indexed by (step_m, step_k); each primitive
+// uses one line to expand the compressed A payload and mask B.
 // ============================================================================
 
 #include <algorithm>
@@ -60,6 +54,7 @@ public:
     return valid_;
   }
 
+  /// Read the 16B sparse metadata line for one primitive issue.
   void read_line(uint32_t step_m, uint32_t step_k, uint8_t out[kLineBytes]) const {
     if (!valid_) {
       std::abort();

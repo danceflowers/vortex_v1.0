@@ -144,3 +144,5 @@ int vx_dump_perf(vx_device_h hdevice, FILE* stream);
 #endif
 
 #endif // __VX_VORTEX_H__
+
+

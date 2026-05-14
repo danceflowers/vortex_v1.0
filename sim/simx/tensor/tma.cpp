@@ -16,6 +16,7 @@
 #include <ostream>
 #include "tma.h"
 #include "core.h"
+#include "idescriptor.h"
 #include "tmem.h"
 #include "VX_config.h"
 
@@ -23,38 +24,13 @@ using namespace vortex;
 
 namespace {
 
-struct CpAsyncBulkTransferArgs {
-  uint32_t smem_addr;
-  uint32_t mbar_addr;
-  int32_t  coords[5];
-  uint32_t reserved;
-} __attribute__((packed));
-
-struct TensorMap {
-  uint64_t global_address;
-  uint64_t box_size[5];
-  uint64_t global_stride[5];
-  uint32_t element_strides[5];
-  uint8_t  element_type;
-  uint8_t  interleave;
-  uint8_t  swizzle;
-  uint8_t  l2_promotion;
-  uint8_t  oob_fill;
-  uint8_t  rank;
-  uint8_t  reserved0[2];
-  uint32_t reserved1[3];
-} __attribute__((packed));
-
-static_assert(sizeof(CpAsyncBulkTransferArgs) == 32,
-              "cpabulk_transfer_args_t must be 32 B");
-static_assert(sizeof(TensorMap) == 128,
-              "tensor_map_t must be 128 B");
-
-uint32_t tensor_map_rank(const TensorMap& tmap) {
+// Clamp invalid tensor-map ranks into the supported 1D..5D range.
+uint32_t tensor_map_rank(const tensor_map_t& tmap) {
   return tmap.rank == 0 ? 1u : (tmap.rank > 5 ? 5u : tmap.rank);
 }
 
-uint32_t tensor_map_total_bytes(const TensorMap& tmap) {
+// Compute the contiguous byte span described by the tensor map box.
+uint32_t tensor_map_total_bytes(const tensor_map_t& tmap) {
   auto rank = tensor_map_rank(tmap);
   auto elem_bytes = Tma::element_type_bytes(tmap.element_type);
   if (elem_bytes == 0) {
@@ -72,8 +48,9 @@ uint32_t tensor_map_total_bytes(const TensorMap& tmap) {
   return static_cast<uint32_t>(total_elems * elem_bytes);
 }
 
-uint64_t tensor_map_address(const TensorMap& tmap,
-                            const CpAsyncBulkTransferArgs& args) {
+// Resolve the global byte address for the requested tensor coordinates.
+uint64_t tensor_map_address(const tensor_map_t& tmap,
+                            const cpabulk_transfer_args_t& args) {
   auto rank = tensor_map_rank(tmap);
   auto elem_bytes = Tma::element_type_bytes(tmap.element_type);
   if (elem_bytes == 0) {
@@ -106,8 +83,8 @@ Tma::Tma(const SimContext& ctx, const char* name, Core* core)
 }
 
 void Tma::reset() {
-  pending_lmem_to_tmem_copy_ops_.clear();
-  completed_lmem_to_tmem_transfer_responses_.clear();
+  pending_lmem_to_tmem_copies_.clear();
+  completed_lmem_to_tmem_responses_.clear();
   next_lmem_to_tmem_request_id_ = 1;
 }
 
@@ -145,19 +122,19 @@ uint32_t Tma::element_type_bytes(uint8_t element_type) {
   }
 }
 
-TmaCpAsyncBulkResult Tma::cpabulk_tensor_load(uint64_t tensor_map_addr,
-                                              uint64_t args_lmem_ptr,
-                                              bool complete_tx) {
+cpabulk_transfer_result_t Tma::cpabulk_tensor_load(uint64_t tensor_map_addr,
+                                                   uint64_t args_lmem_ptr,
+                                                   bool complete_tx) {
   if (!is_lmem_addr(args_lmem_ptr)) {
     throw std::runtime_error(
       "cp.async.bulk.tensor.load requires args_lmem_ptr to point to LMEM; "
       "raw window operands are not part of the PTX path");
   }
 
-  CpAsyncBulkTransferArgs args = {};
+  cpabulk_transfer_args_t args = {};
   core_->lmem_read(&args, args_lmem_ptr, sizeof(args));
 
-  TensorMap tmap = {};
+  tensor_map_t tmap = {};
   core_->dcache_read(&tmap, tensor_map_addr, sizeof(tmap));
 
   auto total_bytes = tensor_map_total_bytes(tmap);
@@ -174,7 +151,7 @@ TmaCpAsyncBulkResult Tma::cpabulk_tensor_load(uint64_t tensor_map_addr,
     copied += take;
   }
 
-  TmaCpAsyncBulkResult result{};
+  cpabulk_transfer_result_t result{};
   result.payload_size_bytes = total_bytes;
   if (complete_tx && args.mbar_addr != 0) {
     result.tx_bound_mbar = static_cast<uint64_t>(args.mbar_addr);
@@ -183,18 +160,18 @@ TmaCpAsyncBulkResult Tma::cpabulk_tensor_load(uint64_t tensor_map_addr,
   return result;
 }
 
-TmaCpAsyncBulkResult Tma::cpabulk_tensor_store(uint64_t tensor_map_addr,
-                                               uint64_t args_lmem_ptr) {
+cpabulk_transfer_result_t Tma::cpabulk_tensor_store(uint64_t tensor_map_addr,
+                                                    uint64_t args_lmem_ptr) {
   if (!is_lmem_addr(args_lmem_ptr)) {
     throw std::runtime_error(
       "cp.async.bulk.tensor.store requires args_lmem_ptr to point to LMEM; "
       "raw window operands are not part of the PTX path");
   }
 
-  CpAsyncBulkTransferArgs args = {};
+  cpabulk_transfer_args_t args = {};
   core_->lmem_read(&args, args_lmem_ptr, sizeof(args));
 
-  TensorMap tmap = {};
+  tensor_map_t tmap = {};
   core_->dcache_read(&tmap, tensor_map_addr, sizeof(tmap));
 
   auto total_bytes = tensor_map_total_bytes(tmap);
@@ -211,7 +188,7 @@ TmaCpAsyncBulkResult Tma::cpabulk_tensor_store(uint64_t tensor_map_addr,
     copied += take;
   }
 
-  TmaCpAsyncBulkResult result{};
+  cpabulk_transfer_result_t result{};
   result.payload_size_bytes = total_bytes;
   return result;
 }
@@ -228,7 +205,7 @@ bool Tma::issue_lmem_to_tmem_copy(uint32_t async_id,
     return false;
   }
 
-  PendingLmemToTmemCopyOp op{};
+  pending_lmem_to_tmem_copy_t op{};
   op.async_id = async_id;
   op.wid = wid;
   op.wgid = wgid;
@@ -237,7 +214,7 @@ bool Tma::issue_lmem_to_tmem_copy(uint32_t async_id,
   op.lmem_addr = lmem_addr;
   op.byte_offset = byte_offset;
   op.total_bytes = total_bytes;
-  pending_lmem_to_tmem_copy_ops_[async_id] = op;
+  pending_lmem_to_tmem_copies_[async_id] = op;
   return true;
 }
 
@@ -246,16 +223,16 @@ void Tma::drain_tmem_responses() {
     return;
   }
   auto response = TmemRspIn.front();
-  completed_lmem_to_tmem_transfer_responses_[response.request_id] = response;
+  completed_lmem_to_tmem_responses_[response.request_id] = response;
   TmemRspIn.pop();
 }
 
 void Tma::advance_lmem_to_tmem_copy_ops() {
-  if (pending_lmem_to_tmem_copy_ops_.empty()) {
+  if (pending_lmem_to_tmem_copies_.empty()) {
     return;
   }
 
-  auto issue_request = [this](PendingLmemToTmemCopyOp& op,
+  auto issue_request = [this](pending_lmem_to_tmem_copy_t& op,
                               TensorMemPortReq::AccessType access_type) {
     TensorMemPortReq request{};
     request.request_id = next_lmem_to_tmem_request_id_++;
@@ -278,7 +255,7 @@ void Tma::advance_lmem_to_tmem_copy_ops() {
     op.request_id = request.request_id;
   };
 
-  auto prepare_packet_window = [](PendingLmemToTmemCopyOp& op) {
+  auto prepare_packet_window = [](pending_lmem_to_tmem_copy_t& op) {
     auto absolute_offset = op.byte_offset + op.cursor;
     op.packet_idx = absolute_offset / Tmem::kPacketBytes;
     op.packet_offset = absolute_offset % Tmem::kPacketBytes;
@@ -287,38 +264,38 @@ void Tma::advance_lmem_to_tmem_copy_ops() {
   };
 
   std::vector<uint32_t> completed_ops;
-  for (auto& entry : pending_lmem_to_tmem_copy_ops_) {
+  for (auto& entry : pending_lmem_to_tmem_copies_) {
     auto& op = entry.second;
 
     if (op.request_id != 0) {
-      auto response_it = completed_lmem_to_tmem_transfer_responses_.find(op.request_id);
-      if (response_it == completed_lmem_to_tmem_transfer_responses_.end()) {
-        if (op.stage == LmemToTmemCopyStage::WaitRead) {
+      auto response_it = completed_lmem_to_tmem_responses_.find(op.request_id);
+      if (response_it == completed_lmem_to_tmem_responses_.end()) {
+        if (op.stage == lmem_to_tmem_copy_stage_t::WaitRead) {
           ++core_->mutable_perf_stats().stall_tmem_read_port_busy;
-        } else if (op.stage == LmemToTmemCopyStage::WaitWrite) {
+        } else if (op.stage == lmem_to_tmem_copy_stage_t::WaitWrite) {
           ++core_->mutable_perf_stats().stall_tmem_write_port_busy;
         }
         continue;
       }
 
       auto response = response_it->second;
-      completed_lmem_to_tmem_transfer_responses_.erase(response_it);
+      completed_lmem_to_tmem_responses_.erase(response_it);
       op.request_id = 0;
 
-      if (op.stage == LmemToTmemCopyStage::WaitRead) {
+      if (op.stage == lmem_to_tmem_copy_stage_t::WaitRead) {
         ++core_->mutable_perf_stats().tmem_read_packets;
         op.packet = response.read_packet;
         core_->lmem_read(op.packet.bytes.data() + op.packet_offset,
                          op.lmem_addr + op.cursor,
                          op.packet_bytes);
-        op.stage = LmemToTmemCopyStage::Ready;
+        op.stage = lmem_to_tmem_copy_stage_t::Ready;
         issue_request(op, TensorMemPortReq::AccessType::Write);
-        op.stage = LmemToTmemCopyStage::WaitWrite;
+        op.stage = lmem_to_tmem_copy_stage_t::WaitWrite;
         continue;
-      } else if (op.stage == LmemToTmemCopyStage::WaitWrite) {
+      } else if (op.stage == lmem_to_tmem_copy_stage_t::WaitWrite) {
         ++core_->mutable_perf_stats().tmem_write_packets;
         op.cursor += op.packet_bytes;
-        op.stage = LmemToTmemCopyStage::Ready;
+        op.stage = lmem_to_tmem_copy_stage_t::Ready;
       }
     }
 
@@ -329,7 +306,7 @@ void Tma::advance_lmem_to_tmem_copy_ops() {
       continue;
     }
 
-    if (op.stage != LmemToTmemCopyStage::Ready || op.request_id != 0) {
+    if (op.stage != lmem_to_tmem_copy_stage_t::Ready || op.request_id != 0) {
       continue;
     }
 
@@ -339,23 +316,23 @@ void Tma::advance_lmem_to_tmem_copy_ops() {
                        op.lmem_addr + op.cursor,
                        Tmem::kPacketBytes);
       issue_request(op, TensorMemPortReq::AccessType::Write);
-      op.stage = LmemToTmemCopyStage::WaitWrite;
+      op.stage = lmem_to_tmem_copy_stage_t::WaitWrite;
     } else {
       issue_request(op, TensorMemPortReq::AccessType::Read);
-      op.stage = LmemToTmemCopyStage::WaitRead;
+      op.stage = lmem_to_tmem_copy_stage_t::WaitRead;
     }
   }
 
   for (auto async_id : completed_ops) {
-    pending_lmem_to_tmem_copy_ops_.erase(async_id);
+    pending_lmem_to_tmem_copies_.erase(async_id);
   }
 }
 
 void Tma::dump_debug_state(std::ostream& os) const {
-  os << "[Tma] lmem_to_tmem_pending=" << pending_lmem_to_tmem_copy_ops_.size()
-     << " completed_tmem_responses=" << completed_lmem_to_tmem_transfer_responses_.size()
+  os << "[Tma] lmem_to_tmem_pending=" << pending_lmem_to_tmem_copies_.size()
+     << " completed_tmem_responses=" << completed_lmem_to_tmem_responses_.size()
      << "\n";
-  for (const auto& entry : pending_lmem_to_tmem_copy_ops_) {
+  for (const auto& entry : pending_lmem_to_tmem_copies_) {
     const auto& op = entry.second;
     os << "  async_id=" << op.async_id
        << " wid=" << op.wid

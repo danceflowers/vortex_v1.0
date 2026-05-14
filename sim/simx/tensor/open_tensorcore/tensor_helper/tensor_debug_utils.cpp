@@ -1,6 +1,4 @@
-// ============================================================================
-// tensor_debug_utils.cpp —— TensorUnit 调试与日志实现（单实例简化版）
-// ============================================================================
+// TensorUnit debug and log-formatting helper implementation.
 
 #include "tensor_debug_utils.h"
 

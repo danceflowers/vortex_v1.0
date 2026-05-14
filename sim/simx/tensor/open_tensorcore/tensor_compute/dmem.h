@@ -1,19 +1,12 @@
 #pragma once
 
 // ============================================================================
-// DMem -- 输出结果缓冲 (单实例版本)
+// DMem -- single-instance output-result buffer.
 // ============================================================================
 //
-// 存储组织:
-//   - 单实例，深度 = 4 subtile（与 CMem 对称）
-//   - 每个 subtile = 8×8 fp22
-//
-// 数据流:
-//   1. WMMA 计算结果写入:
-//      - first/single 模式：A*B + CMem_bypass 结果直接写 DMem[subtile]
-//      - middle/tail 模式：A*B + DMem[subtile]_prev 结果原位写回 DMem[subtile]
-//   2. MMA_STORE 读取:
-//      - 从 DMem 读出 fp22 subtile，精度转换为 fp8/fp16/fp32 后写回 TMEM
+// DMem stores four 8x8 FP22 subtiles. TensorCore retire writes the first K
+// phase directly and accumulates later K phases in place. The store path dumps
+// DMem subtiles back into fp8/fp16/fp32 TMEM packets.
 // ============================================================================
 
 #include <array>
@@ -69,6 +62,7 @@ public:
     return row_valid_.at(subtile_id);
   }
 
+  /// Write the first FP22 result for a subtile.
   void write_subtile_fp22(uint32_t subtile_id,
                           const uint32_t in[kPrimitiveDim][kPrimitiveDim]) {
     if (subtile_id >= kDepth) {
@@ -83,6 +77,7 @@ public:
     row_valid_.at(subtile_id) = true;
   }
 
+  /// Read a completed FP22 subtile for accumulation or dump.
   void read_subtile_fp22(uint32_t subtile_id,
                          uint32_t out[kPrimitiveDim][kPrimitiveDim]) const {
     if (subtile_id >= kDepth || !row_valid_.at(subtile_id)) {
@@ -96,6 +91,7 @@ public:
     }
   }
 
+  /// Accumulate one FP22 TensorCore result into an existing subtile.
   void accumulate_subtile_fp22(uint32_t subtile_id,
                                const uint32_t in[kPrimitiveDim][kPrimitiveDim]) {
     if (subtile_id >= kDepth || !row_valid_.at(subtile_id)) {
@@ -139,6 +135,7 @@ public:
     }
   }
 
+  /// Convert one FP22 subtile segment back into a 64B external-format packet.
   static bool build_dump_packet(uint32_t fmt_d,
                                 const uint32_t subtile[kPrimitiveDim][kPrimitiveDim],
                                 uint32_t segment_idx,
@@ -190,6 +187,7 @@ public:
     return false;
   }
 
+  /// Dump one DMem subtile as the packet sequence expected by TMEM store.
   bool dump_subtile_packets(uint32_t fmt_d,
                             uint32_t subtile_id,
                             std::vector<packet_t>* packets) const {

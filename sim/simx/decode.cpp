@@ -40,7 +40,7 @@ namespace {
 using InstrAllocator = PoolAllocator<Instr, 64>;
 
 // Create one pipeline-visible TCU instruction shell. Runtime register values
-// such as handles and control words are resolved later during execute.
+// such as taddrs and control words are resolved later during execute.
 std::shared_ptr<Instr> make_tcu_instr(InstrAllocator& instr_pool,
                                       uint64_t uuid,
                                       TcuType op_type,
@@ -1118,10 +1118,10 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
       auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TMEM_REL_PERMIT, args);
       ibuffer.push_back(instr);
     } break;
-    case 0b010: { // TMEM_ALLOC: rs1=dst_addr ptr, rs2=nCols, rd=handle
+    case 0b010: { // TMEM_ALLOC: rs1=dst_addr ptr, rs2=nCols, rd=taddr
       args.shared_addr_space = (qualifier >> 1) & 1;
       auto instr = make_tcu_instr(instr_pool_, uuid, TcuType::TMEM_ALLOC, args);
-      instr->setDestReg(rd, RegType::Integer);  // returned handle
+      instr->setDestReg(rd, RegType::Integer);  // returned taddr
       instr->setSrcReg(0, rs1, RegType::Integer);
       instr->setSrcReg(1, rs2, RegType::Integer);
       ibuffer.push_back(instr);

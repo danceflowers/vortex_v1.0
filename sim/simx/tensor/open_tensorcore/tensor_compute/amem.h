@@ -1,25 +1,21 @@
 #pragma once
 
 // ============================================================================
-// AMem -- A 操作数 SRAM (单实例版本)
+// AMem -- single-instance A operand SRAM.
 // ============================================================================
 //
-// 存储组织:
-//   - 单实例，深度 = 4 行 (kDepth = 4)
-//   - 每行存储一个 8×8 primitive block (64 个 fp9 元素)
-//   - m16n16k16 tile: line 0/1 = K-phase 0 的两个 M-block
-//                     line 2/3 = K-phase 1 的两个 M-block
+// Storage layout:
+//   - depth = 4 lines, one 8x8 primitive block per line.
+//   - m16n16k16 mapping: lines 0/1 are K phase 0 M blocks, and lines 2/3
+//     are K phase 1 M blocks.
 //
-// Bank 分组:
-//   - 8 个 bank，每个 bank 持有 kBankElems = 8 个元素
+// Fill path:
+//   convert_fill_packets() and write_fill_line() unpack TMEM packets and
+//   convert external fp8/fp16 payloads into the internal fp9 operand format.
 //
-// Fill 路径 (TMEM → AMem)：
-//   convert_fill_packets() / write_fill_line(line_idx, fmt, packets) 将外部
-//   fp8/fp16 精度转为 fp9 后写入指定行。
-//
-// Read 路径 (AMem → WMMA 计算单元):
-//   read_primitive(line_idx, out, transpose) 读出一个 8×8 block。
-//   line_idx 由发射引擎按 k_phase * 2 + storage_m 给出。
+// Compute path:
+//   read_primitive() returns one 8x8 block selected by
+//   k_phase * 2 + storage_m for TensorCore issue.
 // ============================================================================
 
 #include <array>
@@ -39,7 +35,7 @@ public:
   static constexpr uint32_t kBankCount = 8;
   static constexpr uint32_t kBankElems = kLineElems / kBankCount;
 
-  /// fill 一个完整 tile 需要写入的行数（全部 4 行）
+  /// Number of AMem lines needed to fill one complete tile.
   static constexpr uint32_t fill_lines() {
     return kDepth;
   }
@@ -66,8 +62,7 @@ public:
     row_valid_.fill(false);
   }
 
-  /// fill 一个完整 m16n16k16 tile 所需的 TMEM 包数:
-  /// fp16 = 8 包 (每行 2 包 × 4 行), fp8 = 4 包
+  /// Number of TMEM packets required for one m16n16k16 A tile.
   static uint32_t packet_count(uint32_t fmt_a) {
     return (fmt_a == vortex::tensor::fp16::id) ? 8 : 4;
   }
@@ -87,19 +82,19 @@ public:
     return mask;
   }
 
-  /// WMMA 读 primitive 时涉及的 bank 掩码
+  /// Bank mask touched when TensorCore reads one primitive block.
   static uint32_t primitive_bank_mask(uint32_t line_idx,
                                       bool transpose = false) {
     (void)transpose;
     return line_bank_mask(line_idx);
   }
 
-  /// fill 一行需要的 TMEM 包数: fp16=2, fp8=1
+  /// Number of TMEM packets required to fill one AMem line.
   static uint32_t packets_per_fill_line(uint32_t fmt_a) {
     return (fmt_a == vortex::tensor::fp16::id) ? 2 : 1;
   }
 
-  /// 精度转换: fp8/fp16 → fp9
+  /// Convert external fp8/fp16 fill packets into internal fp9 elements.
   static bool convert_fill_packets(uint32_t fmt_a,
                                    const std::vector<packet_t>& packets,
                                    uint16_t out[8][8]) {
@@ -136,7 +131,7 @@ public:
     return false;
   }
 
-  /// 便捷路径：转换 + 写入
+  /// Convert the incoming packet group and write one AMem line.
   bool write_fill_line(uint32_t fmt_a,
                        uint32_t line_idx,
                        const std::vector<packet_t>& packets) {
@@ -162,7 +157,7 @@ public:
     return true;
   }
 
-  /// 时序路径：已转换好的数据直接写入
+  /// Timing path helper: write already-converted fp9 data directly.
   bool write_converted_line(uint32_t line_idx,
                             const uint16_t in[8][8]) {
     if (line_idx >= kDepth) {
@@ -181,7 +176,7 @@ public:
     return true;
   }
 
-  /// 所有 4 行都填有有效数据
+  /// True when all four AMem lines contain a valid tile.
   bool valid() const {
     for (uint32_t line = 0; line < kDepth; ++line) {
       if (!row_valid_.at(line)) {
@@ -191,7 +186,7 @@ public:
     return true;
   }
 
-  /// WMMA 读 primitive: 读出 line_idx 对应的 8×8 block
+  /// Read the selected 8x8 primitive block for TensorCore issue.
   void read_primitive(uint32_t line_idx,
                       uint16_t out[8][8],
                       bool transpose = false) const {

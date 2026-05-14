@@ -54,7 +54,7 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
       /*b_sdesc=*/static_cast<uint64_t>(handle_b),
       /*lanes_off=*/0);
 
-  uint32_t idesc = vt::make_idescriptor<vt::fp16, vt::fp16, vt::fp32, vt::fp32>(
+  uint32_t idesc = vt::make_i_descriptor<vt::fp16, vt::fp16, vt::fp32, vt::fp32>(
       /*M=*/16, /*N=*/16);
 
   uint32_t a_taddr = handle_a;       // base_off=0 in low byte form

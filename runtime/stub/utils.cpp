@@ -215,17 +215,11 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE* stream) {
   uint64_t mem_lat = 0;
   uint64_t mem_bank_stalls = 0;
   // PERF: tensorcore
-  uint64_t tcu_total_cycles = 0;
   uint64_t tcu_stall_setup = 0;
   uint64_t tcu_stall_epilogue = 0;
   uint64_t tcu_active_cycles = 0;
-  uint64_t tcu_idle_cycles = 0;
   uint64_t tcu_issued_primitives = 0;
   uint64_t tcu_retired_primitives = 0;
-  uint64_t tcu_first_issue = 0;
-  uint64_t tcu_last_issue = 0;
-  uint64_t tcu_first_retire = 0;
-  uint64_t tcu_last_retire = 0;
   uint64_t tcu_stall_a_not_ready = 0;
   uint64_t tcu_stall_b_not_ready = 0;
   uint64_t tcu_stall_c_not_ready = 0;
@@ -240,15 +234,10 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE* stream) {
   uint64_t tcu_issued_macro_wmma = 0;
   uint64_t tcu_retired_macro_wmma = 0;
   uint64_t tcu_pending_wmma_max = 0;
-  uint64_t tcu_mem_queue_max = 0;
   uint64_t tcu_stall_a_meta_not_ready = 0;
   uint64_t tcu_stall_no_wmma_ready = 0;
   uint64_t tcu_stall_tmem_read_busy = 0;
   uint64_t tcu_stall_tmem_write_busy = 0;
-  uint64_t tcu_stall_amem_busy = 0;
-  uint64_t tcu_stall_bmem_busy = 0;
-  uint64_t tcu_stall_cmem_busy = 0;
-  uint64_t tcu_stall_meta_busy = 0;
   uint64_t tcu_tmem_read_packets = 0;
   uint64_t tcu_tmem_write_packets = 0;
   uint64_t tcu_stall_no_tensor_candidate = 0;
@@ -259,15 +248,6 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE* stream) {
   uint64_t tcu_stall_no_wmma_wait_mma_load = 0;
   uint64_t tcu_stall_no_wmma_wait_handle_alloc = 0;
   uint64_t tcu_stall_no_wmma_wait_slot_release = 0;
-  uint64_t tcu_pending_wmma_depth0 = 0;
-  uint64_t tcu_pending_wmma_depth1 = 0;
-  uint64_t tcu_pending_wmma_depth2 = 0;
-  uint64_t tcu_pending_wmma_depth3plus = 0;
-  uint64_t tcu_stall_no_wmma_wait_c_wmma_drain = 0;
-  uint64_t tcu_stall_no_wmma_wait_accum_live_only = 0;
-  uint64_t tcu_stall_no_wmma_wait_dirty_flush_only = 0;
-  uint64_t tcu_stall_no_wmma_wait_store_pending = 0;
-  uint64_t tcu_stall_no_wmma_wait_ab_pending_clear = 0;
 
   uint64_t num_cores;
   CHECK_ERR(vx_dev_caps(hdevice, VX_CAPS_NUM_CORES, &num_cores), {
@@ -644,28 +624,16 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE* stream) {
     } break;
     case VX_DCR_MPM_CLASS_TCU: {
       uint64_t tmp = 0;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_TOTAL_CYCLES, core_id, &tmp), { return err; });
-      tcu_total_cycles += tmp;
       CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_STALL_SETUP, core_id, &tmp), { return err; });
       tcu_stall_setup += tmp;
       CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_STALL_EPILOGUE, core_id, &tmp), { return err; });
       tcu_stall_epilogue += tmp;
       CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_ACTIVE_CYCLES, core_id, &tmp), { return err; });
       tcu_active_cycles += tmp;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_IDLE_CYCLES, core_id, &tmp), { return err; });
-      tcu_idle_cycles += tmp;
       CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_ISSUED_PRIMITIVES, core_id, &tmp), { return err; });
       tcu_issued_primitives += tmp;
       CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_RETIRED_PRIMITIVES, core_id, &tmp), { return err; });
       tcu_retired_primitives += tmp;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_FIRST_ISSUE, core_id, &tmp), { return err; });
-      if (0 != tmp && (0 == tcu_first_issue || tmp < tcu_first_issue)) tcu_first_issue = tmp;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_LAST_ISSUE, core_id, &tmp), { return err; });
-      tcu_last_issue = std::max(tcu_last_issue, tmp);
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_FIRST_RETIRE, core_id, &tmp), { return err; });
-      if (0 != tmp && (0 == tcu_first_retire || tmp < tcu_first_retire)) tcu_first_retire = tmp;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_LAST_RETIRE, core_id, &tmp), { return err; });
-      tcu_last_retire = std::max(tcu_last_retire, tmp);
       CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_STALL_A_NOT_READY, core_id, &tmp), { return err; });
       tcu_stall_a_not_ready += tmp;
       CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_STALL_B_NOT_READY, core_id, &tmp), { return err; });
@@ -694,8 +662,6 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE* stream) {
       tcu_retired_macro_wmma += tmp;
       CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_PENDING_WMMA_MAX, core_id, &tmp), { return err; });
       tcu_pending_wmma_max = std::max(tcu_pending_wmma_max, tmp);
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_MEM_QUEUE_MAX, core_id, &tmp), { return err; });
-      tcu_mem_queue_max = std::max(tcu_mem_queue_max, tmp);
       CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_STALL_A_META_NOT_READY, core_id, &tmp), { return err; });
       tcu_stall_a_meta_not_ready += tmp;
       CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_STALL_NO_WMMA_READY, core_id, &tmp), { return err; });
@@ -704,14 +670,6 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE* stream) {
       tcu_stall_tmem_read_busy += tmp;
       CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_STALL_TMEM_WRITE_BUSY, core_id, &tmp), { return err; });
       tcu_stall_tmem_write_busy += tmp;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_STALL_AMEM_BUSY, core_id, &tmp), { return err; });
-      tcu_stall_amem_busy += tmp;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_STALL_BMEM_BUSY, core_id, &tmp), { return err; });
-      tcu_stall_bmem_busy += tmp;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_STALL_CMEM_BUSY, core_id, &tmp), { return err; });
-      tcu_stall_cmem_busy += tmp;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_STALL_META_BUSY, core_id, &tmp), { return err; });
-      tcu_stall_meta_busy += tmp;
       CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_TMEM_READ_PACKETS, core_id, &tmp), { return err; });
       tcu_tmem_read_packets += tmp;
       CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_TMEM_WRITE_PACKETS, core_id, &tmp), { return err; });
@@ -732,24 +690,6 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE* stream) {
       tcu_stall_no_wmma_wait_handle_alloc += tmp;
       CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_STALL_NO_WMMA_WAIT_SLOT_RELEASE, core_id, &tmp), { return err; });
       tcu_stall_no_wmma_wait_slot_release += tmp;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_PENDING_WMMA_DEPTH0, core_id, &tmp), { return err; });
-      tcu_pending_wmma_depth0 += tmp;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_PENDING_WMMA_DEPTH1, core_id, &tmp), { return err; });
-      tcu_pending_wmma_depth1 += tmp;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_PENDING_WMMA_DEPTH2, core_id, &tmp), { return err; });
-      tcu_pending_wmma_depth2 += tmp;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_PENDING_WMMA_DEPTH3PLUS, core_id, &tmp), { return err; });
-      tcu_pending_wmma_depth3plus += tmp;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_STALL_NO_WMMA_WAIT_C_WMMA_DRAIN, core_id, &tmp), { return err; });
-      tcu_stall_no_wmma_wait_c_wmma_drain += tmp;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_STALL_NO_WMMA_WAIT_ACCUM_LIVE_ONLY, core_id, &tmp), { return err; });
-      tcu_stall_no_wmma_wait_accum_live_only += tmp;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_STALL_NO_WMMA_WAIT_DIRTY_FLUSH_ONLY, core_id, &tmp), { return err; });
-      tcu_stall_no_wmma_wait_dirty_flush_only += tmp;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_STALL_NO_WMMA_WAIT_STORE_PENDING, core_id, &tmp), { return err; });
-      tcu_stall_no_wmma_wait_store_pending += tmp;
-      CHECK_ERR(vx_mpm_query(hdevice, VX_CSR_MPM_TCU_STALL_NO_WMMA_WAIT_AB_PENDING_CLEAR, core_id, &tmp), { return err; });
-      tcu_stall_no_wmma_wait_ab_pending_clear += tmp;
     } break;
     default:
       break;
@@ -843,26 +783,14 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE* stream) {
     }
   } break;
   case VX_DCR_MPM_CLASS_TCU: {
-    uint64_t tcu_total_aligned = max_cycles;
-    uint64_t tcu_active_aligned = std::min<uint64_t>(tcu_active_cycles, tcu_total_aligned);
-    uint64_t tcu_idle_aligned = (tcu_total_aligned > tcu_active_aligned) ? (tcu_total_aligned - tcu_active_aligned) : 0;
-    uint64_t tcu_stall_setup_aligned = (tcu_issued_primitives == 0) ? tcu_total_aligned : tcu_first_issue;
-    uint64_t tcu_stall_epilogue_aligned = (tcu_retired_primitives == 0 || tcu_total_aligned == 0 || tcu_total_aligned - 1 <= tcu_last_retire)
-                                        ? 0
-                                        : ((tcu_total_aligned - 1) - tcu_last_retire);
+    uint64_t tcu_active_aligned = std::min<uint64_t>(tcu_active_cycles, max_cycles);
     int tma_load_avg_lat = caclAverage(tcu_tma_load_latency_sum, tcu_tma_load_count);
     int tma_store_avg_lat = caclAverage(tcu_tma_store_latency_sum, tcu_tma_store_count);
-    fprintf(stream, "PERF: tcu total cycles=%ld\n", tcu_total_aligned);
-    fprintf(stream, "PERF: tcu stall launch/setup=%ld\n", tcu_stall_setup_aligned);
-    fprintf(stream, "PERF: tcu stall epilogue/store=%ld\n", tcu_stall_epilogue_aligned);
+    fprintf(stream, "PERF: tcu stall launch/setup=%ld\n", tcu_stall_setup);
+    fprintf(stream, "PERF: tcu stall epilogue/store=%ld\n", tcu_stall_epilogue);
     fprintf(stream, "PERF: tcu active cycles=%ld\n", tcu_active_aligned);
-    fprintf(stream, "PERF: tcu idle cycles=%ld\n", tcu_idle_aligned);
     fprintf(stream, "PERF: tcu issued primitive tiles=%ld\n", tcu_issued_primitives);
     fprintf(stream, "PERF: tcu retired primitive tiles=%ld\n", tcu_retired_primitives);
-    fprintf(stream, "PERF: tcu first issue cycle=%ld\n", tcu_first_issue);
-    fprintf(stream, "PERF: tcu last issue cycle=%ld\n", tcu_last_issue);
-    fprintf(stream, "PERF: tcu first retire cycle=%ld\n", tcu_first_retire);
-    fprintf(stream, "PERF: tcu last retire cycle=%ld\n", tcu_last_retire);
     fprintf(stream, "PERF: tcu stall a not ready=%ld\n", tcu_stall_a_not_ready);
     fprintf(stream, "PERF: tcu stall b not ready=%ld\n", tcu_stall_b_not_ready);
     fprintf(stream, "PERF: tcu stall c not ready=%ld\n", tcu_stall_c_not_ready);
@@ -873,10 +801,6 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE* stream) {
     fprintf(stream, "PERF: tcu stall no wmma ready=%ld\n", tcu_stall_no_wmma_ready);
     fprintf(stream, "PERF: tcu stall tmem read port busy=%ld\n", tcu_stall_tmem_read_busy);
     fprintf(stream, "PERF: tcu stall tmem write port busy=%ld\n", tcu_stall_tmem_write_busy);
-    fprintf(stream, "PERF: tcu stall amem port busy=%ld\n", tcu_stall_amem_busy);
-    fprintf(stream, "PERF: tcu stall bmem port busy=%ld\n", tcu_stall_bmem_busy);
-    fprintf(stream, "PERF: tcu stall cmem port busy=%ld\n", tcu_stall_cmem_busy);
-    fprintf(stream, "PERF: tcu stall meta port busy=%ld\n", tcu_stall_meta_busy);
     fprintf(stream, "PERF: tcu tma load count=%ld\n", tcu_tma_load_count);
     fprintf(stream, "PERF: tcu tma load latency sum=%ld (avg=%d cycles)\n", tcu_tma_load_latency_sum, tma_load_avg_lat);
     fprintf(stream, "PERF: tcu tma store count=%ld\n", tcu_tma_store_count);
@@ -886,7 +810,6 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE* stream) {
     fprintf(stream, "PERF: tcu issued macro wmma=%ld\n", tcu_issued_macro_wmma);
     fprintf(stream, "PERF: tcu retired macro wmma=%ld\n", tcu_retired_macro_wmma);
     fprintf(stream, "PERF: tcu pending wmma max=%ld\n", tcu_pending_wmma_max);
-    fprintf(stream, "PERF: tcu mem queue max=%ld\n", tcu_mem_queue_max);
     fprintf(stream, "PERF: tcu stall a meta not ready=%ld\n", tcu_stall_a_meta_not_ready);
     fprintf(stream, "PERF: tcu stall no tensor instr candidate=%ld\n", tcu_stall_no_tensor_candidate);
     fprintf(stream, "PERF: tcu stall mma_load handle not ready=%ld\n", tcu_stall_mma_load_handle_not_ready);
@@ -896,15 +819,6 @@ extern int vx_dump_perf(vx_device_h hdevice, FILE* stream) {
     fprintf(stream, "PERF: tcu stall no wmma waiting for mma_load=%ld\n", tcu_stall_no_wmma_wait_mma_load);
     fprintf(stream, "PERF: tcu stall no wmma waiting for handle alloc=%ld\n", tcu_stall_no_wmma_wait_handle_alloc);
     fprintf(stream, "PERF: tcu stall no wmma waiting for slot release=%ld\n", tcu_stall_no_wmma_wait_slot_release);
-    fprintf(stream, "PERF: tcu pending wmma depth[0]=%ld\n", tcu_pending_wmma_depth0);
-    fprintf(stream, "PERF: tcu pending wmma depth[1]=%ld\n", tcu_pending_wmma_depth1);
-    fprintf(stream, "PERF: tcu pending wmma depth[2]=%ld\n", tcu_pending_wmma_depth2);
-    fprintf(stream, "PERF: tcu pending wmma depth[3+]=%ld\n", tcu_pending_wmma_depth3plus);
-    fprintf(stream, "PERF: tcu stall no wmma waiting for c_wmma drain=%ld\n", tcu_stall_no_wmma_wait_c_wmma_drain);
-    fprintf(stream, "PERF: tcu stall no wmma waiting for accum_live only=%ld\n", tcu_stall_no_wmma_wait_accum_live_only);
-    fprintf(stream, "PERF: tcu stall no wmma waiting for dirty flush only=%ld\n", tcu_stall_no_wmma_wait_dirty_flush_only);
-    fprintf(stream, "PERF: tcu stall no wmma waiting for store_pending=%ld\n", tcu_stall_no_wmma_wait_store_pending);
-    fprintf(stream, "PERF: tcu stall no wmma waiting for ab wmma pending clear=%ld\n", tcu_stall_no_wmma_wait_ab_pending_clear);
   } break;
   default:
     break;

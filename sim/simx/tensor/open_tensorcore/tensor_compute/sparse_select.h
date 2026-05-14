@@ -4,6 +4,7 @@
 
 namespace vortex::sparse {
 
+// Clear an 8x8 primitive tile before sparse routing fills the active lanes.
 inline void zero_primitive_u16(uint16_t out[8][8]) {
   for (uint32_t i = 0; i < 8; ++i) {
     for (uint32_t j = 0; j < 8; ++j) {
@@ -12,11 +13,13 @@ inline void zero_primitive_u16(uint16_t out[8][8]) {
   }
 }
 
+// Each sparse metadata row is stored as two little-endian bytes.
 inline uint16_t row_meta_bits(const uint8_t meta_line[16], uint32_t row) {
   return static_cast<uint16_t>(meta_line[row * 2 + 0])
        | (static_cast<uint16_t>(meta_line[row * 2 + 1]) << 8);
 }
 
+// Expand a 2:4-compressed A primitive and mask B to the selected K lanes.
 inline void route_sparse_2_4_primitive(const uint8_t meta_line[16],
                                        const uint16_t a_compact[8][8],
                                        const uint16_t b_dense[8][8],
@@ -44,6 +47,7 @@ inline void route_sparse_2_4_primitive(const uint8_t meta_line[16],
   }
 }
 
+// Expand a 1:4-compressed A primitive and mask B to the selected K lane.
 inline void route_sparse_1_4_primitive(const uint8_t meta_line[16],
                                        const uint16_t a_compact[8][8],
                                        const uint16_t b_dense[8][8],
@@ -67,6 +71,7 @@ inline void route_sparse_1_4_primitive(const uint8_t meta_line[16],
   }
 }
 
+// Dispatch sparse primitive routing by decoded tcgen05 sparse mode.
 inline bool route_sparse_primitive(uint32_t sparse_mode,
                                    const uint8_t meta_line[16],
                                    const uint16_t a_compact[8][8],
@@ -87,6 +92,7 @@ inline bool route_sparse_primitive(uint32_t sparse_mode,
 
 } // namespace vortex::sparse
 
+// Legacy helper: select B rows for 2:4 sparse metadata without routing A.
 inline void sparse_select_2_4(const uint8_t meta_line[16],
                               const uint16_t b_source[16][8],
                               uint16_t b_selected[8][8]) {
@@ -107,6 +113,7 @@ inline void sparse_select_2_4(const uint8_t meta_line[16],
   }
 }
 
+// Legacy helper: select B rows for 1:4 sparse metadata without routing A.
 inline void sparse_select_1_4(const uint8_t meta_line[16],
                               const uint16_t b_source[32][8],
                               uint16_t b_selected[8][8]) {

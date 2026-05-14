@@ -37,6 +37,7 @@ void reset_trace_for_async_dispatch(TensorUnit::ExeTraceData* trace_data) {
   }
 }
 
+// Map descriptor format IDs into the compute pipeline precision enum.
 PrecisionType fmt_to_precision(uint32_t fmt) {
   namespace vt = vortex::tensor;
   switch (fmt) {
@@ -47,11 +48,13 @@ PrecisionType fmt_to_precision(uint32_t fmt) {
   }
 }
 
+// Decode the shared-memory descriptor used by tcgen05.mma B operands.
 uint64_t shared_desc_to_lmem_addr(uint64_t sdesc) {
   uint32_t smem_offset = static_cast<uint32_t>(sdesc & 0x3fffu) * 16u;
   return static_cast<uint64_t>(LMEM_BASE_ADDR) + smem_offset;
 }
 
+// Element width used when packing/unpacking TMEM result packets.
 uint32_t fmt_element_bytes(uint32_t fmt) {
   namespace vt = vortex::tensor;
   switch (fmt) {
@@ -62,6 +65,7 @@ uint32_t fmt_element_bytes(uint32_t fmt) {
   }
 }
 
+// DMem dumps one 8x8 subtile as a format-dependent sequence of 64B packets.
 uint32_t dmem_rows_per_packet(uint32_t fmt) {
   constexpr uint32_t kDmemPrimitiveDim = 8;
   auto elem_bytes = fmt_element_bytes(fmt);
@@ -158,8 +162,6 @@ public:
 
     if (tensorcore_.active()) {
       ++perf_stats_.tc_active_cycles;
-    } else {
-      ++perf_stats_.tc_idle_cycles;
     }
 
     if (!pending_mma_.empty()) {
@@ -220,26 +222,26 @@ public:
       std::abort();
     }
 
-    auto a_block_reason = core_->tmem_handle_load_block_reason(op.a_region.col_base,
+    auto a_block_reason = core_->tmem_taddr_load_block_reason(op.a_region.col_base,
                                                                TcuTarget::A,
                                                                cmd.sparsity_kind);
-    if (a_block_reason != TmemHandleBlockReason::None) {
+    if (a_block_reason != TmemTaddrBlockReason::None) {
       if (trace_data) {
         trace_data->retry = true;
       }
-      record_issue_stall(IssueBlockReason::MmaLoadHandleNotReady);
+      record_issue_stall(IssueBlockReason::MmaLoadTaddrNotReady);
       return false;
     }
     auto d_block_reason = (cmd.enable_input_d != 0)
-        ? core_->tmem_handle_load_block_reason(op.d_region.col_base,
+        ? core_->tmem_taddr_load_block_reason(op.d_region.col_base,
                                                TcuTarget::C,
                                                tensor::sparse_none)
-        : core_->tmem_handle_store_block_reason(op.d_region.col_base);
-    if (d_block_reason != TmemHandleBlockReason::None) {
+        : core_->tmem_taddr_store_block_reason(op.d_region.col_base);
+    if (d_block_reason != TmemTaddrBlockReason::None) {
       if (trace_data) {
         trace_data->retry = true;
       }
-      record_issue_stall(IssueBlockReason::HandleBusyDueToTmaStoreOrShift);
+      record_issue_stall(IssueBlockReason::TaddrBusyDueToTmaStoreOrShift);
       return false;
     }
 
@@ -312,17 +314,17 @@ public:
     case IssueBlockReason::NoTensorInstrCandidate:
       ++perf_stats_.stall_no_tensor_instr_candidate;
       break;
-    case IssueBlockReason::MmaLoadHandleNotReady:
-      ++perf_stats_.stall_mma_load_handle_not_ready;
+    case IssueBlockReason::MmaLoadTaddrNotReady:
+      ++perf_stats_.stall_mma_load_taddr_not_ready;
       break;
-    case IssueBlockReason::HandleReuse:
-      ++perf_stats_.stall_handle_reuse;
+    case IssueBlockReason::TaddrReuse:
+      ++perf_stats_.stall_taddr_reuse;
       break;
-    case IssueBlockReason::HandleBusyDueToTmaLoad:
-      ++perf_stats_.stall_handle_busy_due_to_tma_load;
+    case IssueBlockReason::TaddrBusyDueToTmaLoad:
+      ++perf_stats_.stall_taddr_busy_due_to_tma_load;
       break;
-    case IssueBlockReason::HandleBusyDueToTmaStoreOrShift:
-      ++perf_stats_.stall_handle_busy_due_to_tma_store_or_shift;
+    case IssueBlockReason::TaddrBusyDueToTmaStoreOrShift:
+      ++perf_stats_.stall_taddr_busy_due_to_tma_store_or_shift;
       break;
     case IssueBlockReason::SlotBusy:
       ++perf_stats_.stall_slot_busy;
@@ -360,6 +362,7 @@ public:
   }
 
 private:
+  // Accept only the subset of tcgen05.mma currently modeled by this C model.
   bool validate_mma(const TcDecodedMmaCmd& cmd) const {
     namespace vt = vortex::tensor;
     uint32_t shape_m = cmd.shape_m == 0 ? kTileM : cmd.shape_m;
@@ -396,6 +399,7 @@ private:
     return true;
   }
 
+  // Resolve a logical TADDR into its backing TMEM allocation and byte offset.
   bool resolve_taddr(uint32_t taddr, TaddrRegion* out) const {
     if (out == nullptr) {
       return false;
@@ -425,6 +429,8 @@ private:
     return true;
   }
 
+  // Keep the original instruction trace pipeline moving independently of the
+  // asynchronous tensor macro operation.
   void latch_tensor_instruction_pipe() {
     for (uint32_t iw = 0; iw < ISSUE_WIDTH; ++iw) {
       auto& input = simobject_->Inputs.at(iw);
@@ -439,6 +445,8 @@ private:
     }
   }
 
+  // Collect packet-level TMEM responses so the active macro state machine can
+  // consume them when its outstanding request completes.
   void receive_tensor_mem_responses() {
     if (simobject_->TensorMemRspIn.empty()) {
       return;
@@ -448,6 +456,7 @@ private:
     simobject_->TensorMemRspIn.pop();
   }
 
+  // Reset local operand/result SRAMs before starting a new macro MMA.
   void initialize_op(MmaOp& op) {
     if (op.initialized) {
       return;
@@ -460,6 +469,7 @@ private:
     op.initialized = true;
   }
 
+  // Step the front macro MMA through fill, compute, and store phases.
   void advance_mma(MmaOp& op) {
     initialize_op(op);
     switch (op.stage) {
@@ -486,6 +496,7 @@ private:
     }
   }
 
+  // Read A packets from TMEM and fill AMem once the complete tile is present.
   void advance_fill_a(MmaOp& op) {
     if (op.pending_request_id != 0) {
       auto rsp_it = completed_tensor_mem_responses_.find(op.pending_request_id);
@@ -520,11 +531,11 @@ private:
     op.pending_packet_index = op.next_a_packet;
   }
 
+  // Read the optional sparse metadata packet associated with A.
   void advance_fill_meta(MmaOp& op) {
     if (op.pending_request_id != 0) {
       auto rsp_it = completed_tensor_mem_responses_.find(op.pending_request_id);
       if (rsp_it == completed_tensor_mem_responses_.end()) {
-        ++perf_stats_.stall_meta_port_busy;
         return;
       }
       op.meta_packets.at(0) = rsp_it->second.read_packet;
@@ -547,6 +558,7 @@ private:
     op.pending_packet_index = 0;
   }
 
+  // Convert the fetched A packet sequence into AMem fill lines.
   void write_amem_lines(MmaOp& op) {
     uint32_t packets_per_line = AMem::packets_per_fill_line(op.cmd.fmt_a);
     for (uint32_t line = 0; line < AMem::kDepth; ++line) {
@@ -562,6 +574,7 @@ private:
     }
   }
 
+  // Load B packets from shared local memory and fill BMem.
   void advance_fill_b(MmaOp& op) {
     if (op.next_b_packet < op.b_packets.size()) {
       uint64_t b_lmem_addr = shared_desc_to_lmem_addr(op.cmd.b_sdesc)
@@ -590,6 +603,7 @@ private:
     op.stage = (op.cmd.enable_input_d != 0) ? MmaStage::FillC : MmaStage::Compute;
   }
 
+  // Read the optional input-D/C tile from TMEM before compute starts.
   void advance_fill_c(MmaOp& op) {
     if (op.pending_request_id != 0) {
       auto rsp_it = completed_tensor_mem_responses_.find(op.pending_request_id);
@@ -622,6 +636,7 @@ private:
     op.pending_packet_index = op.next_c_packet;
   }
 
+  // Convert input-D packets into CMem subtiles for the first accumulation.
   void write_input_d_to_cmem(MmaOp& op) {
     uint32_t packets_per_subtile = CMem::packets_per_subtile(op.cmd.fmt_c);
     for (uint32_t subtile = 0; subtile < CMem::kDepth; ++subtile) {
@@ -637,6 +652,7 @@ private:
     }
   }
 
+  // Check whether the next 8x8 primitive can be accepted by TensorCore.
   bool current_compute_ready(const MmaOp& op) const {
     if (op.issue_subtile >= kSubtiles) {
       return false;
@@ -648,6 +664,7 @@ private:
     return tensorcore_.ready(true);
   }
 
+  // Build one primitive from AMem/BMem/CMem and push it into TensorCore.
   void issue_current_primitive(MmaOp& op) {
     uint32_t subtile = op.issue_subtile;
     uint32_t k_phase = op.issue_k_phase;
@@ -705,10 +722,9 @@ private:
 
     tensorcore_.push_uop(a, b, c, meta);
     ++perf_stats_.issued_primitive_tiles;
-    if (perf_stats_.first_tc_issue_cycle == 0) {
-      perf_stats_.first_tc_issue_cycle = perf_stats_.latency;
+    if (perf_stats_.setup_end_cycle == 0) {
+      perf_stats_.setup_end_cycle = perf_stats_.latency;
     }
-    perf_stats_.last_tc_issue_cycle = perf_stats_.latency;
 
     if (op.issue_k_phase + 1 < kKPhases) {
       ++op.issue_k_phase;
@@ -718,6 +734,7 @@ private:
     }
   }
 
+  // Run TensorCore, retire completed primitives, and detect macro completion.
   void advance_compute(MmaOp& op) {
     if (current_compute_ready(op)) {
       issue_current_primitive(op);
@@ -735,10 +752,7 @@ private:
         dmem_.accumulate_subtile_fp22(subtile, retired.fp22_out);
       }
       ++perf_stats_.retired_primitive_tiles;
-      if (perf_stats_.first_tc_retire_cycle == 0) {
-        perf_stats_.first_tc_retire_cycle = perf_stats_.latency;
-      }
-      perf_stats_.last_tc_retire_cycle = perf_stats_.latency;
+      perf_stats_.epilogue_begin_cycle = perf_stats_.latency;
       if (retired.meta.a_slot_id == (kKPhases - 1)) {
         ++op.final_retired_subtiles;
       }
@@ -750,6 +764,7 @@ private:
     }
   }
 
+  // Repack the 16x16 D tile from DMem's subtile layout into TMEM packet order.
   void build_d_store_packets(MmaOp& op) {
     if (op.d_region.col_span < 32) {
       std::cerr << "TensorUnit error: D allocation must cover at least 32 lanes for warp tcgen05.ld"
@@ -801,6 +816,7 @@ private:
     }
   }
 
+  // Write result packets back to TMEM and wait for each packet response.
   void advance_store_d(MmaOp& op) {
     if (op.pending_request_id != 0) {
       auto rsp_it = completed_tensor_mem_responses_.find(op.pending_request_id);
@@ -832,6 +848,7 @@ private:
     op.pending_packet_index = op.next_d_packet;
   }
 
+  // Notify Core that the macro MMA async_id has completed.
   void complete_front_mma() {
     TensorAsyncOpCompletion completion{};
     completion.async_id = pending_mma_.front().async_id;

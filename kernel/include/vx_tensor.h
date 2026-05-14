@@ -33,7 +33,7 @@ static constexpr uint32_t tmem_alloc_reserved_operand = 0xffffffffu;
 // ============================================================================
 
 // Bit-packed 32-bit tcgen05.mma instruction descriptor (PTX §9.7.16.5.4).
-struct idescriptor_t {
+struct i_descriptor_t {
   uint32_t sparsity_meta_sel : 2;  // [1:0]
   uint32_t sparsity_kind     : 1;  // [2]
   uint32_t reserved_3        : 1;  // [3]
@@ -47,9 +47,9 @@ struct idescriptor_t {
   uint32_t transpose_a       : 1;  // [30]
   uint32_t transpose_b       : 1;  // [31]
 } __attribute__((packed));
-static_assert(sizeof(idescriptor_t) == 4, "idescriptor_t must be 32 bits");
+static_assert(sizeof(i_descriptor_t) == 4, "i_descriptor_t must be 32 bits");
 
-enum class idesc_kind : uint8_t {
+enum class i_descriptor_kind_t : uint8_t {
   F16        = 0,
   TF32       = 1,
   BF16       = 2,
@@ -66,17 +66,17 @@ enum class idesc_kind : uint8_t {
 // Specialise per supported precision pair; unspecialised pairs trigger
 // static_assert at use-site.
 template <typename At, typename Bt>
-struct idesc_kind_for {
+struct i_descriptor_kind_for {
   static_assert(sizeof(At) == 0,
-                "Unsupported tcgen05.mma type pair; specialise idesc_kind_for<At,Bt>");
+                "Unsupported tcgen05.mma type pair; specialise i_descriptor_kind_for<At,Bt>");
 };
-template <> struct idesc_kind_for<fp16, fp16> { static constexpr idesc_kind value = idesc_kind::F16; };
-template <> struct idesc_kind_for<bf16, bf16> { static constexpr idesc_kind value = idesc_kind::BF16; };
-template <> struct idesc_kind_for<fp32, fp32> { static constexpr idesc_kind value = idesc_kind::TF32; };
-template <> struct idesc_kind_for<fp8,  fp8 > { static constexpr idesc_kind value = idesc_kind::F8F6F4; };
-template <> struct idesc_kind_for<fp8,  fp16> { static constexpr idesc_kind value = idesc_kind::F8F16; };
-template <> struct idesc_kind_for<fp16, fp8 > { static constexpr idesc_kind value = idesc_kind::F16F8; };
-template <> struct idesc_kind_for<int8, int8> { static constexpr idesc_kind value = idesc_kind::I8; };
+template <> struct i_descriptor_kind_for<fp16, fp16> { static constexpr i_descriptor_kind_t value = i_descriptor_kind_t::F16; };
+template <> struct i_descriptor_kind_for<bf16, bf16> { static constexpr i_descriptor_kind_t value = i_descriptor_kind_t::BF16; };
+template <> struct i_descriptor_kind_for<fp32, fp32> { static constexpr i_descriptor_kind_t value = i_descriptor_kind_t::TF32; };
+template <> struct i_descriptor_kind_for<fp8,  fp8 > { static constexpr i_descriptor_kind_t value = i_descriptor_kind_t::F8F6F4; };
+template <> struct i_descriptor_kind_for<fp8,  fp16> { static constexpr i_descriptor_kind_t value = i_descriptor_kind_t::F8F16; };
+template <> struct i_descriptor_kind_for<fp16, fp8 > { static constexpr i_descriptor_kind_t value = i_descriptor_kind_t::F16F8; };
+template <> struct i_descriptor_kind_for<int8, int8> { static constexpr i_descriptor_kind_t value = i_descriptor_kind_t::I8; };
 
 enum class operand_fmt_code : uint32_t {
   FP32 = 0,
@@ -152,13 +152,13 @@ static_assert(sizeof(tensor_map_t) == 128, "tensor_map_t must be 128 bytes");
 
 // ----- Factories ------------------------------------------------------------
 
-// make_idescriptor — returns the 32-bit packed idesc value to pass as TCU_MMA rs1.
+// make_i_descriptor — returns the 32-bit packed idesc value to pass as TCU_MMA rs1.
 //   At, Bt: input matrix type tags (fp16, bf16, fp32, fp8, int8 from tensor_cfg.h)
 //   Ct, Dt: accumulator / output type tags are not encoded in idesc.kind.
 //           Use make_operand_block<Ct, Dt>() to carry fmt_c/fmt_d in operand_block_t.
 //   M, N  : tile dimensions (matched to NVIDIA shape_m/shape_n encoding)
 template <typename At, typename Bt, typename Ct = At, typename Dt = Ct>
-inline __attribute__((always_inline)) constexpr uint32_t make_idescriptor(
+inline __attribute__((always_inline)) constexpr uint32_t make_i_descriptor(
     uint16_t M,
     uint16_t N,
     bool saturate          = false,
@@ -174,7 +174,7 @@ inline __attribute__((always_inline)) constexpr uint32_t make_idescriptor(
   uint32_t v = 0;
   v |= (static_cast<uint32_t>(sparsity_meta_sel) & 0x3u) << 0;
   v |= (static_cast<uint32_t>(sparsity_kind)     & 0x1u) << 2;
-  v |= (static_cast<uint32_t>(idesc_kind_for<At, Bt>::value) & 0xFu) << 4;
+  v |= (static_cast<uint32_t>(i_descriptor_kind_for<At, Bt>::value) & 0xFu) << 4;
   v |= (static_cast<uint32_t>(M) & 0xFFu) << 8;
   v |= (static_cast<uint32_t>(N) & 0xFFu) << 16;
   v |= (static_cast<uint32_t>(a_storage_layout) & 0x3u) << 24;
@@ -229,12 +229,12 @@ inline __attribute__((always_inline)) constexpr cpabulk_transfer_args_t make_cpa
   };
 }
 
-inline __attribute__((always_inline)) uint16_t tmem_handle_base(uint32_t handle) {
-  return handle & 0xff;
+inline __attribute__((always_inline)) uint16_t tmem_taddr_lane(uint32_t taddr) {
+  return taddr & 0xffffu;
 }
 
-inline __attribute__((always_inline)) uint16_t tmem_handle_span(uint32_t handle) {
-  return (handle >> 8) & 0xff;
+inline __attribute__((always_inline)) uint16_t tmem_taddr_col_byte(uint32_t taddr) {
+  return (taddr >> 16) & 0xffffu;
 }
 
 // ============================================================================
@@ -251,24 +251,24 @@ inline __attribute__((always_inline)) uint16_t tmem_handle_span(uint32_t handle)
 //   funct3=0b111 CPABULK_TENSOR_ST
 
 inline __attribute__((always_inline)) uint32_t tmem_alloc(uint32_t col_span, uint32_t reserved_operand) {
-  uint32_t handle;
+  uint32_t taddr;
   // funct3=0b010, qualifier[0]=cta_group::1
   __asm__ volatile (".insn r %3, 0x2, 0x0, %0, %1, %2"
-    : "=r"(handle)
+    : "=r"(taddr)
     : "r"(col_span), "r"(reserved_operand), "i"(RISCV_CUSTOM1)
     : "memory");
-  return handle;
+  return taddr;
 }
 
 inline __attribute__((always_inline)) uint32_t tmem_alloc(uint32_t col_span) {
   return tmem_alloc(col_span, tmem_alloc_reserved_operand);
 }
 
-inline __attribute__((always_inline)) void tmem_dealloc(uint32_t handle, uint32_t n_cols = 0) {
+inline __attribute__((always_inline)) void tmem_dealloc(uint32_t taddr, uint32_t n_cols = 0) {
   // funct3=0b011, qualifier[0]=cta_group::1
   __asm__ volatile (".insn r %2, 0x3, 0x0, x0, %0, %1"
     :
-    : "r"(handle), "r"(n_cols), "i"(RISCV_CUSTOM1)
+    : "r"(taddr), "r"(n_cols), "i"(RISCV_CUSTOM1)
     : "memory");
 }
 
@@ -306,27 +306,27 @@ inline __attribute__((always_inline)) void tmem_cp_shape(uint32_t taddr, uint32_
   tmem_cp_q<qualifier>(taddr, s_desc);
 }
 
-inline __attribute__((always_inline)) uint32_t tmem_shift_ctl(uint32_t handle, uint32_t control) {
+inline __attribute__((always_inline)) uint32_t tmem_shift_ctl(uint32_t taddr, uint32_t control) {
   uint32_t async_id;
   // funct3=0b101 in custom-1
   __asm__ volatile (".insn r %3, 0x5, 0x0, %0, %1, %2"
     : "=r"(async_id)
-    : "r"(handle), "r"(control), "i"(RISCV_CUSTOM1)
+    : "r"(taddr), "r"(control), "i"(RISCV_CUSTOM1)
     : "memory");
   return async_id;
 }
 
-inline __attribute__((always_inline)) uint32_t tmem_shift(uint32_t handle) {
-  return tmem_shift_ctl(handle, 0);
+inline __attribute__((always_inline)) uint32_t tmem_shift(uint32_t taddr) {
+  return tmem_shift_ctl(taddr, 0);
 }
 
 // cp.async.bulk.tensor — DRAM -> shared.
-inline __attribute__((always_inline)) uint32_t cpabulk_tensor_ld(uint32_t tensor_map_handle, uint32_t coords_ctl) {
+inline __attribute__((always_inline)) uint32_t cpabulk_tensor_ld(uint32_t tensor_map_addr, uint32_t coords_ctl) {
   uint32_t async_id;
   // funct3=0b110, qualifier[2:0]=dim_count-1, [3]=im2col/tile, [4]=multicast, [5]=mbar_complete_tx
   __asm__ volatile (".insn r %3, 0x6, 0x0, %0, %1, %2"
     : "=r"(async_id)
-    : "r"(tensor_map_handle), "r"(coords_ctl), "i"(RISCV_CUSTOM1)
+    : "r"(tensor_map_addr), "r"(coords_ctl), "i"(RISCV_CUSTOM1)
     : "memory");
   return async_id;
 }
@@ -335,22 +335,22 @@ inline __attribute__((always_inline)) uint32_t cpabulk_tensor_ld(uint32_t tensor
 // qualifier[5]=1 wires the cpabulk completion to mbarrier_complete_tx via the
 // args.mbar_addr field of cpabulk_transfer_args_t. Use this with the typed
 // overload (rs2 in LMEM range) to drive Phase-3.2 GAP-2.
-inline __attribute__((always_inline)) uint32_t cpabulk_tensor_ld_complete_tx(uint32_t tensor_map_handle, uint32_t args_lmem_ptr) {
+inline __attribute__((always_inline)) uint32_t cpabulk_tensor_ld_complete_tx(uint32_t tensor_map_addr, uint32_t args_lmem_ptr) {
   uint32_t async_id;
   // funct7 = 0x20 = bit 5 set
   __asm__ volatile (".insn r %3, 0x6, 0x20, %0, %1, %2"
     : "=r"(async_id)
-    : "r"(tensor_map_handle), "r"(args_lmem_ptr), "i"(RISCV_CUSTOM1)
+    : "r"(tensor_map_addr), "r"(args_lmem_ptr), "i"(RISCV_CUSTOM1)
     : "memory");
   return async_id;
 }
 
 // cp.async.bulk.tensor — shared -> DRAM.
-inline __attribute__((always_inline)) uint32_t cpabulk_tensor_st(uint32_t tensor_map_handle, uint32_t coords_ctl) {
+inline __attribute__((always_inline)) uint32_t cpabulk_tensor_st(uint32_t tensor_map_addr, uint32_t coords_ctl) {
   uint32_t async_id;
   __asm__ volatile (".insn r %3, 0x7, 0x0, %0, %1, %2"
     : "=r"(async_id)
-    : "r"(tensor_map_handle), "r"(coords_ctl), "i"(RISCV_CUSTOM1)
+    : "r"(tensor_map_addr), "r"(coords_ctl), "i"(RISCV_CUSTOM1)
     : "memory");
   return async_id;
 }

@@ -1,6 +1,8 @@
 #pragma once
 #include "fmul_s2.h"
 #include "fp_types.h"
+// Final multiplier stage: normalize, round, and pack the product into the
+// requested floating-point format while preserving special-case results.
 inline uint32_t fmul_s3(const fmul_s2_out& s2, int EXPWIDTH, int PRECISION)
 {
     const int PADDINGBITS = PRECISION + 2;

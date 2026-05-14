@@ -39,7 +39,7 @@ static inline void issue_case_mma(uint32_t case_id,
                                   vt::operand_block_t* op_block) {
   if (case_id == TCGEN05_CASE_ASYM_F16_F8_F32) {
     *op_block = vt::make_operand_block<vt::fp32, vt::fp32>(a_taddr, b_sdesc, 0);
-    uint32_t idesc = vt::make_idescriptor<vt::fp16, vt::fp8, vt::fp32, vt::fp32>(
+    uint32_t idesc = vt::make_i_descriptor<vt::fp16, vt::fp8, vt::fp32, vt::fp32>(
         M_DIM, N_DIM);
     vt::tcu_mma(d_taddr, idesc, op_block);
     return;
@@ -47,7 +47,7 @@ static inline void issue_case_mma(uint32_t case_id,
 
   uint8_t sparsity_kind = (case_id == TCGEN05_CASE_SPARSE_1_4_F8) ? 1 : 0;
   *op_block = vt::make_operand_block<vt::fp16, vt::fp16>(a_taddr, b_sdesc, 0);
-  uint32_t idesc = vt::make_idescriptor<vt::fp8, vt::fp8, vt::fp16, vt::fp16>(
+  uint32_t idesc = vt::make_i_descriptor<vt::fp8, vt::fp8, vt::fp16, vt::fp16>(
       M_DIM, N_DIM,
       false, false, false, false,
       sparsity_kind,
