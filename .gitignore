@@ -3,3 +3,68 @@
 *.cache
 *.code-workspace
 miscs/apptainer/vortex.sif
+
+# Local workspace metadata.
+.claude/
+.codex
+
+# Local tool downloads and installs.
+tools/
+*.deb
+*.tar.gz
+*.tar.bz2.part*
+
+# Common compiler and linker outputs.
+*.o
+*.d
+*.a
+*.so
+*.so.*
+*.elf
+*.vxbin
+*.dump
+*.out
+*.exe
+*.stamp
+.config_stamp
+.depend
+
+# Vortex runtime and simulator build outputs.
+kernel/libvortex.a
+kernel/libvortex.dump
+runtime/lib*.so
+runtime/*_config.stamp
+runtime/obj/
+sim/simx/simx
+sim/simx/libsimx.so
+sim/simx/*_config.stamp
+sim/simx/obj/
+sim/simx/tensor/open_tensorcore/build/
+
+# Simulation traces and logs.
+trace/
+**/trace/
+*.log
+ramulator.stats.log
+*.stats.log
+
+# Regression test outputs.
+tests/regression/*/.depend
+tests/regression/*/.config_stamp
+tests/regression/*/kernel.elf
+tests/regression/*/kernel.vxbin
+tests/regression/*/kernel.dump
+tests/regression/*/ramulator.stats.log
+
+# Regression host binaries are usually named after the test directory.
+tests/regression/*/*
+!tests/regression/*/
+!tests/regression/*/.gitignore
+!tests/regression/*/Makefile
+!tests/regression/*/*.c
+!tests/regression/*/*.cc
+!tests/regression/*/*.cpp
+!tests/regression/*/*.h
+!tests/regression/*/*.hpp
+!tests/regression/*/*.S
+!tests/regression/*/*.md
