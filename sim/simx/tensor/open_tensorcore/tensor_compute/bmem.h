@@ -1,14 +1,5 @@
 #pragma once
 
-// ============================================================================
-// BMem -- single-instance B operand SRAM.
-// ============================================================================
-//
-// BMem mirrors AMem, but the four lines hold the two N blocks for each K
-// phase of an m16n16k16 tile. The write path converts external fp8/fp16
-// payloads to internal fp9, and the read path returns one 8x8 primitive block.
-// ============================================================================
-
 #include <array>
 #include <cstdint>
 #include <cstdlib>
@@ -21,14 +12,14 @@ class BMem {
 public:
   using packet_t = std::array<uint8_t, 64>;
 
-  static constexpr uint32_t kDepth = 4;
+  static constexpr uint32_t kNumSlots = 2;
+  static constexpr uint32_t kRowsPerSlot = 4;
+  static constexpr uint32_t kDepth = kNumSlots * kRowsPerSlot;
+  static constexpr uint32_t kTileLines = kRowsPerSlot;
+  static constexpr uint32_t kDenseLines = kRowsPerSlot;
   static constexpr uint32_t kLineElems = 64;
   static constexpr uint32_t kBankCount = 8;
   static constexpr uint32_t kBankElems = kLineElems / kBankCount;
-
-  static constexpr uint32_t fill_lines(uint32_t /*sparse_mode*/ = vortex::tensor::sparse_none) {
-    return kDepth;
-  }
 
   BMem() {
     reset();
@@ -43,50 +34,53 @@ public:
     row_valid_.fill(false);
   }
 
-  void clear() {
-    reset();
-  }
-
-  /// Number of TMEM packets required for one m16n16k16 B tile.
-  static uint32_t packet_count(uint32_t fmt_b, uint32_t /*sparse_mode*/ = vortex::tensor::sparse_none) {
-    return (fmt_b == vortex::tensor::fp16::id) ? 8 : 4;
-  }
-
-  static constexpr uint32_t all_bank_mask() {
-    return (1u << kBankCount) - 1u;
-  }
-
-  static uint32_t line_bank_mask(uint32_t line_idx) {
-    if (line_idx >= kDepth) {
-      std::abort();
+  void clear_slot(uint32_t slot_id) {
+    auto base = slot_base(slot_id);
+    for (uint32_t line = 0; line < kRowsPerSlot; ++line) {
+      auto& row = lines_.at(base + line);
+      for (auto& bank : row) {
+        bank.fill(0);
+      }
+      row_valid_.at(base + line) = false;
     }
-    uint32_t mask = 0;
-    for (uint32_t elem = 0; elem < kLineElems; ++elem) {
-      mask |= (1u << (elem / kBankElems));
+  }
+
+  static uint32_t packet_count(uint32_t fmt_ab, uint32_t sparse_mode = vortex::tensor::sparse_none) {
+    if (sparse_mode != vortex::tensor::sparse_none) {
+      return (fmt_ab == vortex::tensor::fp16::id) ? 8 : 4;
     }
-    return mask;
+    return (fmt_ab == vortex::tensor::fp16::id) ? 8 : 4;
   }
 
-  static uint32_t primitive_bank_mask(uint32_t line_idx,
-                                      bool transpose = false) {
-    (void)transpose;
-    return line_bank_mask(line_idx);
+  static uint32_t fill_beats(uint32_t sparse_mode = vortex::tensor::sparse_none) {
+    if (sparse_mode != vortex::tensor::sparse_none) {
+      return kRowsPerSlot;
+    }
+    return kRowsPerSlot;
   }
 
-  static uint32_t packets_per_fill_line(uint32_t fmt_b, uint32_t /*sparse_mode*/ = vortex::tensor::sparse_none) {
-    return (fmt_b == vortex::tensor::fp16::id) ? 2 : 1;
+  static uint32_t packets_per_fill_beat(uint32_t fmt_ab, uint32_t sparse_mode = vortex::tensor::sparse_none) {
+    if (sparse_mode != vortex::tensor::sparse_none) {
+      return (fmt_ab == vortex::tensor::fp16::id) ? 2 : 1;
+    }
+    return (fmt_ab == vortex::tensor::fp16::id) ? 2 : 1;
   }
 
-  static bool convert_fill_packets(uint32_t fmt_b,
-                                   const std::vector<packet_t>& packets,
-                                   uint16_t out[8][8],
-                                   uint32_t /*sparse_mode*/ = vortex::tensor::sparse_none) {
-    auto needed = packets_per_fill_line(fmt_b);
-    if (packets.size() < needed) {
+  bool write_fill_beat(uint32_t slot_id,
+                       uint32_t fmt_ab,
+                       uint32_t beat_idx,
+                       const std::vector<packet_t>& packets,
+                       uint32_t sparse_mode = vortex::tensor::sparse_none) {
+    auto needed = packets_per_fill_beat(fmt_ab, sparse_mode);
+    if (beat_idx >= kRowsPerSlot || packets.size() < needed) {
       return false;
     }
 
-    if (fmt_b == vortex::tensor::fp16::id) {
+    auto& dst = lines_.at(slot_base(slot_id) + beat_idx);
+    for (auto& bank : dst) {
+      bank.fill(0);
+    }
+    if (fmt_ab == vortex::tensor::fp16::id) {
       const auto& p0 = packets.at(0);
       const auto& p1 = packets.at(1);
       for (uint32_t elem = 0; elem < kLineElems; ++elem) {
@@ -98,79 +92,64 @@ public:
           auto local = byte_idx - 64;
           fp16 = static_cast<uint16_t>(p1.at(local + 0) | (p1.at(local + 1) << 8));
         }
-        out[elem / 8][elem % 8] = convert_to_fp9(fp16, PREC_FP16);
+        store_elem(dst, elem, convert_to_fp9(fp16, PREC_FP16));
       }
-      return true;
-    }
-
-    if (fmt_b == vortex::tensor::fp8::id) {
+    } else {
       const auto& p = packets.at(0);
       for (uint32_t elem = 0; elem < kLineElems; ++elem) {
-        out[elem / 8][elem % 8] = convert_to_fp9(p.at(elem), PREC_FP8_E4M3);
-      }
-      return true;
-    }
-
-    return false;
-  }
-
-  bool write_fill_line(uint32_t fmt_b,
-                       uint32_t line_idx,
-                       const std::vector<packet_t>& packets,
-                       uint32_t sparse_mode = vortex::tensor::sparse_none) {
-    auto needed = packets_per_fill_line(fmt_b, sparse_mode);
-    if (line_idx >= kDepth || packets.size() < needed) {
-      return false;
-    }
-
-    auto& dst = lines_.at(line_idx);
-    for (auto& bank : dst) {
-      bank.fill(0);
-    }
-    uint16_t converted[8][8] = {};
-    if (!convert_fill_packets(fmt_b, packets, converted, sparse_mode)) {
-      return false;
-    }
-    for (uint32_t i = 0; i < 8; ++i) {
-      for (uint32_t j = 0; j < 8; ++j) {
-        store_elem(dst, i * 8 + j, converted[i][j]);
+        store_elem(dst, elem, convert_to_fp9(p.at(elem), PREC_FP8_E4M3));
       }
     }
-    row_valid_.at(line_idx) = true;
+    row_valid_.at(slot_base(slot_id) + beat_idx) = true;
     return true;
   }
 
-  bool write_converted_line(uint32_t line_idx,
-                            const uint16_t in[8][8]) {
-    if (line_idx >= kDepth) {
+  bool fill_tile(uint32_t slot_id,
+                 uint32_t fmt_ab,
+                 const std::vector<packet_t>& packets,
+                 uint32_t sparse_mode = vortex::tensor::sparse_none) {
+    auto expected_packets = packet_count(fmt_ab, sparse_mode);
+    if (packets.size() < expected_packets) {
       return false;
     }
-    auto& dst = lines_.at(line_idx);
-    for (auto& bank : dst) {
-      bank.fill(0);
-    }
-    for (uint32_t i = 0; i < 8; ++i) {
-      for (uint32_t j = 0; j < 8; ++j) {
-        store_elem(dst, i * 8 + j, in[i][j]);
-      }
-    }
-    row_valid_.at(line_idx) = true;
-    return true;
-  }
 
-  bool valid() const {
-    for (uint32_t line = 0; line < kDepth; ++line) {
-      if (!row_valid_.at(line)) {
+    clear_slot(slot_id);
+    auto packets_per_beat = packets_per_fill_beat(fmt_ab, sparse_mode);
+    for (uint32_t beat = 0; beat < kRowsPerSlot; ++beat) {
+      std::vector<packet_t> beat_packets;
+      for (uint32_t packet = 0; packet < packets_per_beat; ++packet) {
+        beat_packets.push_back(packets.at(beat * packets_per_beat + packet));
+      }
+      if (!write_fill_beat(slot_id, fmt_ab, beat, beat_packets, sparse_mode)) {
         return false;
       }
     }
     return true;
   }
 
-  void read_primitive(uint32_t line_idx,
+  bool fill_tile(uint32_t fmt_ab,
+                 const std::vector<packet_t>& packets,
+                 uint32_t sparse_mode = vortex::tensor::sparse_none) {
+    return fill_tile(0, fmt_ab, packets, sparse_mode);
+  }
+
+  bool valid(uint32_t slot_id) const {
+    auto base = slot_base(slot_id);
+    for (uint32_t line = 0; line < kRowsPerSlot; ++line) {
+      if (!row_valid_.at(base + line)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void read_primitive(uint32_t slot_id,
+                      uint32_t step_k,
+                      uint32_t step_n,
                       uint16_t out[8][8],
                       bool transpose = false) const {
-    if (line_idx >= kDepth || !row_valid_.at(line_idx)) {
+    auto line_idx = slot_base(slot_id) + ((transpose ? step_k : step_n) * 2) + (transpose ? step_n : step_k);
+    if (!row_valid_.at(line_idx)) {
       std::abort();
     }
     const auto& line = lines_.at(line_idx);
@@ -182,17 +161,67 @@ public:
     }
   }
 
-  // Reserved sparse-source interfaces for the old standalone tests.
-  void read_sparse_2_4_source(uint32_t, uint16_t[16][8]) const {
-    std::abort();
+  void read_primitive(uint32_t step_k, uint32_t step_n, uint16_t out[8][8], bool transpose = false) const {
+    read_primitive(0, step_k, step_n, out, transpose);
   }
 
-  void read_sparse_1_4_source(uint32_t, uint16_t[32][8]) const {
-    std::abort();
+  // Read dense B source rows for 2:4 sparse A.
+  // One sparse 8x8 A payload represents 16 logical K positions.
+  // For each output N half, the source is two consecutive dense B lines.
+  void read_sparse_2_4_source(uint32_t slot_id, uint32_t storage_n, uint16_t out[16][8]) const {
+    if (storage_n >= 2) {
+      std::abort();
+    }
+    const uint32_t base = slot_base(slot_id) + storage_n * 2;
+    for (uint32_t k_block = 0; k_block < 2; ++k_block) {
+      const uint32_t line_idx = base + k_block;
+      if (line_idx >= lines_.size() || !row_valid_.at(line_idx)) {
+        std::abort();
+      }
+      const auto& line = lines_.at(line_idx);
+      for (uint32_t i = 0; i < 8; ++i) {
+        for (uint32_t j = 0; j < 8; ++j) {
+          out[k_block * 8 + i][j] = load_elem(line, i * 8 + j);
+        }
+      }
+    }
+  }
+
+  // Read dense B source rows for 1:4 sparse A.
+  // One sparse 8x8 A payload represents 32 logical K positions.
+  // Current Cmodel storage can hold 32x8 B source rows per slot. For N=16,
+  // software should load the second N half into the next B slot and issue/use
+  // that slot accordingly. If slot_id + storage_n is available and valid, use
+  // it; otherwise fall back to slot_id for backward-compatible N=8 tests.
+  void read_sparse_1_4_source(uint32_t slot_id, uint32_t storage_n, uint16_t out[32][8]) const {
+    uint32_t source_slot = slot_id;
+    if (storage_n != 0 && (slot_id + storage_n) < kNumSlots) {
+      source_slot = slot_id + storage_n;
+    }
+    const uint32_t base = slot_base(source_slot);
+    for (uint32_t k_block = 0; k_block < 4; ++k_block) {
+      const uint32_t line_idx = base + k_block;
+      if (line_idx >= lines_.size() || !row_valid_.at(line_idx)) {
+        std::abort();
+      }
+      const auto& line = lines_.at(line_idx);
+      for (uint32_t i = 0; i < 8; ++i) {
+        for (uint32_t j = 0; j < 8; ++j) {
+          out[k_block * 8 + i][j] = load_elem(line, i * 8 + j);
+        }
+      }
+    }
   }
 
 private:
   using row_t = std::array<std::array<uint16_t, kBankElems>, kBankCount>;
+
+  static uint32_t slot_base(uint32_t slot_id) {
+    if (slot_id >= kNumSlots) {
+      std::abort();
+    }
+    return slot_id * kRowsPerSlot;
+  }
 
   static void store_elem(row_t& row, uint32_t elem_idx, uint16_t value) {
     row.at(elem_idx / kBankElems).at(elem_idx % kBankElems) = value;
