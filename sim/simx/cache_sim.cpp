@@ -170,6 +170,7 @@ struct bank_req_t {
 	uint64_t uuid;
 	ReqType  type;
 	bool     write;
+	bool     write_response;
 
 	bank_req_t() {
 		this->reset();
@@ -177,6 +178,7 @@ struct bank_req_t {
 
 	void reset() {
 		type = ReqType::None;
+		write_response = false;
 	}
 
 	friend std::ostream &operator<<(std::ostream &os, const bank_req_t& req) {
@@ -185,7 +187,7 @@ struct bank_req_t {
 		os << ", addr_tag=0x" << std::hex << req.addr_tag;
 		os << ", req_tag=" << req.req_tag;
 		os << ", cid=" << std::dec << req.cid;
-		os << " (#" << req.uuid << ")";
+		os << ", wrsp=" << req.write_response << " (#" << req.uuid << ")";
 		return os;
 	}
 };
@@ -400,6 +402,7 @@ private:
 				bank_req.addr_tag = params_.addr_tag(core_req.addr);
 				bank_req.req_tag = core_req.tag;
 				bank_req.write = core_req.write;
+				bank_req.write_response = core_req.write_response;
 				pipe_req_->push(bank_req);
 				if (core_req.write)
 					++perf_stats_.writes;
@@ -421,8 +424,8 @@ private:
 			break;
 		case bank_req_t::Replay: {
 			// send core response
-			if (!bank_req.write || config_.write_reponse) {
-				MemRsp core_rsp{bank_req.req_tag, bank_req.cid, bank_req.uuid};
+			if (!bank_req.write || config_.write_reponse || bank_req.write_response) {
+				MemRsp core_rsp{bank_req.req_tag, bank_req.cid, bank_req.uuid, bank_req.write};
 				this->core_rsp_port.push(core_rsp);
 				DT(3, this->name() << "-replay: " << core_rsp);
 			}
@@ -453,8 +456,8 @@ private:
 					}
 				}
 				// send core response
-				if (!bank_req.write || config_.write_reponse) {
-					MemRsp core_rsp{bank_req.req_tag, bank_req.cid, bank_req.uuid};
+				if (!bank_req.write || config_.write_reponse || bank_req.write_response) {
+					MemRsp core_rsp{bank_req.req_tag, bank_req.cid, bank_req.uuid, bank_req.write};
 					this->core_rsp_port.push(core_rsp);
 					DT(3, this->name() << "-core-rsp: " << core_rsp);
 				}
@@ -492,8 +495,8 @@ private:
 						DT(3, this->name() << "-writethrough: " << mem_req);
 					}
 					// send core response
-					if (config_.write_reponse) {
-						MemRsp core_rsp{bank_req.req_tag, bank_req.cid, bank_req.uuid};
+					if (config_.write_reponse || bank_req.write_response) {
+						MemRsp core_rsp{bank_req.req_tag, bank_req.cid, bank_req.uuid, true};
 						this->core_rsp_port.push(core_rsp);
 						DT(3, this->name() << "-core-rsp: " << core_rsp);
 					}
@@ -689,7 +692,7 @@ private:
 	void processBypassResponse(const MemRsp& mem_rsp) {
 		uint32_t req_id = mem_rsp.tag & ((1 << params_.log2_num_inputs)-1);
 		uint64_t tag = mem_rsp.tag >> params_.log2_num_inputs;
-		MemRsp core_rsp{tag, mem_rsp.cid, mem_rsp.uuid};
+		MemRsp core_rsp{tag, mem_rsp.cid, mem_rsp.uuid, mem_rsp.write};
 		simobject_->CoreRspPorts.at(req_id).push(core_rsp, 0);
 		DT(3, simobject_->name() << "-bypass-core-rsp: " << core_rsp);
 	}
@@ -699,13 +702,14 @@ private:
 			// Push core request to non-cacheable arbiter's input 1
 			MemReq mem_req(core_req);
 			mem_req.tag = (core_req.tag << params_.log2_num_inputs) + req_id;
+			mem_req.write_response = core_req.write_response && !config_.write_reponse;
 			uint32_t mem_port = req_id % config_.mem_ports;
 			nc_mem_arbs_.at(mem_port)->ReqIn.at(1).push(mem_req, 0);
 			DT(3, simobject_->name() << "-bypass-dram-req: " << mem_req);
 		}
 
 		if (core_req.write && config_.write_reponse) {
-			MemRsp core_rsp{core_req.tag, core_req.cid, core_req.uuid};
+			MemRsp core_rsp{core_req.tag, core_req.cid, core_req.uuid, true};
 			simobject_->CoreRspPorts.at(req_id).push(core_rsp, 0);
 			DT(3, simobject_->name() << "-bypass-core-rsp: " << core_rsp);
 		}

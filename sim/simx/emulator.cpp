@@ -30,7 +30,7 @@
 
 using namespace vortex;
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
 namespace {
 
 bool warpgroup_debug_enabled() {
@@ -65,7 +65,7 @@ bool collective_args_match(TcuType type, const IntrTcuArgs& lhs, const IntrTcuAr
 }
 
 }
-#endif
+//#endif
 
 warp_t::warp_t(uint32_t num_threads)
   : ireg_file(MAX_NUM_REGS, std::vector<Word>(num_threads))
@@ -122,10 +122,10 @@ Emulator::Emulator(const Arch &arch, const DCRS &dcrs, Core* core)
     , stall_reasons_(arch.num_warps(), WarpStallReason::None)
     , barriers_(arch.num_barriers(), 0)
     , ipdom_size_(arch.num_threads()-1)
-  #ifdef EXT_TCU_ENABLE
+  //#ifdef EXT_TCU_ENABLE
     , tensor_unit_(core->tensor_unit())
     , warpgroup_collectives_(arch.num_warpgroups())
-  #endif
+  //#endif
   #ifdef EXT_V_ENABLE
     , vec_unit_(core->vec_unit())
   #endif
@@ -163,11 +163,11 @@ void Emulator::reset() {
   vec_unit_->reset();
 #endif
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   for (auto& collective : warpgroup_collectives_) {
     collective = {};
   }
-#endif
+//#endif
 
   startup_arg_ = startup_arg;
   csr_mscratch_ = startup_arg;
@@ -193,7 +193,7 @@ void Emulator::attach_ram(RAM* ram) {
 #endif
 }
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
 WarpMask Emulator::warpgroup_active_mask(uint32_t wgid) const {
   WarpMask mask;
   auto first = arch_.warpgroup_first_wid(wgid);
@@ -269,7 +269,7 @@ instr_trace_t* Emulator::retire_warpgroup_collective_nop(const Instr& instr, uin
   last_instr_retired_ = true;
   return trace;
 }
-#endif
+//#endif
 
 uint32_t Emulator::fetch(uint32_t wid, uint64_t uuid) {
   auto& warp = warps_.at(wid);
@@ -302,10 +302,10 @@ instr_trace_t* Emulator::step() {
 
   uint32_t best_score = 0;
   const auto nw = arch_.num_warps();
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   TensorUnit::IssueBlockReason best_tcu_block = TensorUnit::IssueBlockReason::None;
   bool saw_tensor_candidate = false;
-#endif
+//#endif
   bool saw_runnable_warp = false;
 
   // round-robin over non-stalled warps, but prefer warps that can make forward
@@ -318,7 +318,7 @@ instr_trace_t* Emulator::step() {
     saw_runnable_warp = true;
 
     uint32_t score = 1;
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
     auto& warp = warps_.at(wid);
     if (!warp.ibuffer.empty()) {
       const auto& instr = *warp.ibuffer.front();
@@ -349,14 +349,14 @@ instr_trace_t* Emulator::step() {
         }
       }
     }
-#endif
+//#endif
     if (score > best_score) {
       best_score = score;
       scheduled_warp = wid;
     }
   }
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   if (best_score <= 1) {
     if (best_tcu_block != TensorUnit::IssueBlockReason::None) {
       tensor_unit_->record_issue_stall(best_tcu_block);
@@ -364,7 +364,7 @@ instr_trace_t* Emulator::step() {
       tensor_unit_->record_no_tensor_instr_candidate_stall();
     }
   }
-#endif
+//#endif
 
   if (scheduled_warp == -1) {
     return nullptr;
@@ -402,7 +402,7 @@ instr_trace_t* Emulator::step() {
 
   auto instr = warp.ibuffer.front();
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   bool collective_leader_issue = false;
   uint32_t collective_wgid = 0;
   if (std::holds_alternative<TcuType>(instr->getOpType())) {
@@ -543,12 +543,12 @@ instr_trace_t* Emulator::step() {
       }
     }
   }
-#endif
+//#endif
 
   // Execute
   auto trace = this->execute(*instr, scheduled_warp);
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   if (collective_leader_issue && last_instr_retired_) {
     auto active_mask = warpgroup_active_mask(collective_wgid);
     auto& collective = warpgroup_collectives_.at(collective_wgid);
@@ -597,7 +597,7 @@ instr_trace_t* Emulator::step() {
               << " stall_reason=" << static_cast<int>(stall_reasons_.at(scheduled_warp))
               << std::endl;
   }
-#endif
+//#endif
 
   if (last_instr_retired_) {
     warp.ibuffer.pop_front();
@@ -895,9 +895,9 @@ void Emulator::cout_flush() {
 
 Word Emulator::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
   auto core_perf = core_->perf_stats();
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   auto tensor_perf = core_->tensor_unit()->perf_stats();
-#endif
+//#endif
   switch (addr) {
   case VX_CSR_SATP:
 #ifdef VM_ENABLE
@@ -959,9 +959,9 @@ Word Emulator::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
         CSR_READ_64(VX_CSR_MPM_SCRB_FPU, core_perf.scrb_fpu);
         CSR_READ_64(VX_CSR_MPM_SCRB_LSU, core_perf.scrb_lsu);
         CSR_READ_64(VX_CSR_MPM_SCRB_SFU, core_perf.scrb_sfu);
-      #ifdef EXT_TCU_ENABLE
+      //#ifdef EXT_TCU_ENABLE
         CSR_READ_64(VX_CSR_MPM_SCRB_TCU, core_perf.scrb_tcu);
-      #endif
+      //#endif
       #ifdef EXT_VPU_ENABLE
         CSR_READ_64(VX_CSR_MPM_SCRB_TCU, core_perf.scrb_vpu);
       #endif
@@ -1023,7 +1023,7 @@ Word Emulator::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
         CSR_READ_64(VX_CSR_MPM_LMEM_BANK_ST, lmem_perf.bank_stalls);
         }
       } break;
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
       case VX_DCR_MPM_CLASS_TCU: {
         uint64_t total_cycles = core_perf.cycles;
         uint64_t active_cycles = std::min<uint64_t>(tensor_perf.tc_active_cycles, total_cycles);
@@ -1071,7 +1071,7 @@ Word Emulator::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
         CSR_READ_64(VX_CSR_MPM_TCU_TMEM_WRITE_PACKETS, core_perf.tmem_write_packets);
         }
       } break;
-#endif
+//#endif
       default:
         std::cerr << "Error: invalid MPM CLASS: value=" << perf_class << std::endl;
         std::abort();

@@ -50,6 +50,9 @@ struct TensorMemPortRsp {
 // Core listens to this stream to wake warps blocked on waits or fences.
 struct TensorAsyncOpCompletion {
   uint32_t async_id = 0;            // Completed async operation ID.
+  uint64_t tx_bound_mbar = 0;       // Optional TMA complete_tx target.
+  uint32_t tx_bytes = 0;            // Optional completed TMA byte count.
+  uint32_t payload_size_bytes = 0;  // Optional completed payload size.
 };
 
 } // namespace vortex

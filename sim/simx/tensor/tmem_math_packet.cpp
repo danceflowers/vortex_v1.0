@@ -82,6 +82,9 @@ bool packet_math_region_impl(const TmemMathPacketLayout& layout,
     if (0 == packets_per_line) {
       return false;
     }
+
+    // For A-line native, consecutive packets in the same line cover disjoint math rows of the same math columns;
+    // the next line starts after all math rows of the previous line are covered.
     auto line_id = local_packet_idx / packets_per_line;
     auto packet_in_line = local_packet_idx % packets_per_line;
     if (math_row_base) {

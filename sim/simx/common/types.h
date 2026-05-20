@@ -130,9 +130,9 @@ enum class FUType {
 #ifdef EXT_V_ENABLE
   VPU,
 #endif
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   TCU,
-#endif
+//#endif
   Count
 };
 
@@ -145,9 +145,9 @@ inline std::ostream &operator<<(std::ostream &os, const FUType& type) {
 #ifdef EXT_V_ENABLE
   case FUType::VPU: os << "VPU"; break;
 #endif
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   case FUType::TCU: os << "TCU"; break;
-#endif
+//#endif
   default:
     assert(false);
   }
@@ -884,9 +884,9 @@ using OpType = std::variant<
 , VlsType
 , VopType
 #endif
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
 , TcuType
-#endif
+//#endif
 >;
 
 using IntrArgs = std::variant<
@@ -903,9 +903,9 @@ using IntrArgs = std::variant<
 , IntrVlsArgs
 , IntrVopArgs
 #endif
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
 , IntrTcuArgs
-#endif
+//#endif
 >;
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1175,26 +1175,29 @@ struct MemReq {
   uint32_t tag;
   uint32_t cid;
   uint64_t uuid;
+  bool     write_response;
 
   MemReq(uint64_t _addr = 0,
           bool _write = false,
           AddrType _type = AddrType::Global,
           uint64_t _tag = 0,
           uint32_t _cid = 0,
-          uint64_t _uuid = 0
+          uint64_t _uuid = 0,
+          bool _write_response = false
   ) : addr(_addr)
     , write(_write)
     , type(_type)
     , tag(_tag)
     , cid(_cid)
     , uuid(_uuid)
+    , write_response(_write_response)
   {}
 
   friend std::ostream &operator<<(std::ostream &os, const MemReq& req) {
     os << "rw=" << req.write << ", ";
     os << "addr=0x" << std::hex << req.addr << std::dec << ", type=" << req.type;
     os << ", tag=0x" << std::hex << req.tag << std::dec << ", cid=" << req.cid;
-    os << " (#" << req.uuid << ")";
+    os << ", wrsp=" << req.write_response << " (#" << req.uuid << ")";
     return os;
   }
 };
@@ -1205,16 +1208,18 @@ struct MemRsp {
   uint64_t tag;
   uint32_t cid;
   uint64_t uuid;
+  bool     write;
 
-  MemRsp(uint64_t _tag = 0, uint32_t _cid = 0, uint64_t _uuid = 0)
+  MemRsp(uint64_t _tag = 0, uint32_t _cid = 0, uint64_t _uuid = 0, bool _write = false)
     : tag (_tag)
     , cid(_cid)
     , uuid(_uuid)
+    , write(_write)
   {}
 
   friend std::ostream &operator<<(std::ostream &os, const MemRsp& rsp) {
     os << "tag=0x" << std::hex << rsp.tag << std::dec << ", cid=" << rsp.cid;
-    os << " (#" << rsp.uuid << ")";
+    os << ", write=" << rsp.write << " (#" << rsp.uuid << ")";
     return os;
   }
 };

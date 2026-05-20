@@ -70,9 +70,9 @@ public:
     uint64_t vinstrs;
     uint64_t scrb_vpu;
   #endif
-  #ifdef EXT_TCU_ENABLE
+  //#ifdef EXT_TCU_ENABLE
     uint64_t scrb_tcu;
-  #endif
+  //#endif
     uint64_t ifetches;
     uint64_t loads;
     uint64_t stores;
@@ -106,9 +106,9 @@ public:
       , vinstrs(0)
       , scrb_vpu(0)
     #endif
-    #ifdef EXT_TCU_ENABLE
+    //#ifdef EXT_TCU_ENABLE
       , scrb_tcu(0)
-    #endif
+    //#endif
       , ifetches(0)
       , loads(0)
       , stores(0)
@@ -216,22 +216,35 @@ public:
     local_mem_->write(data, offset, size);
   }
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   TensorUnit::Ptr& tensor_unit() {
     return tensor_unit_;
   }
 
+
+    //?
   using TmemPacket = vortex::TmemPacket;
   using TmemRequestDesc = vortex::Tmem::PortRequestDesc;
   using TmemRequestKind = vortex::Tmem::PortRequestKind;
   using TmemTaddrBlockReason = vortex::TmemTaddrBlockReason;
 
+  //?
   static constexpr uint32_t kTmemPayloadCols = Tmem::kPayloadCols;
   static constexpr uint32_t kTmemMetaCols = Tmem::kMetaCols;
   static constexpr uint32_t kTmemMetaColBase = Tmem::kMetaColBase;
   static constexpr uint32_t kTmemPacketBytes = Tmem::kPacketBytes;
   static constexpr uint32_t kTmemReadPacketsPerCycle = Tmem::kReadPacketsPerCycle;
   static constexpr uint32_t kTmemWritePacketsPerCycle = Tmem::kWritePacketsPerCycle;
+//?
+
+  SimPort<MemReq>& tma_cache_req_port(uint32_t idx) {
+    return tma_->CacheReqOut.at(idx);
+  }
+
+  SimPort<MemRsp>& tma_cache_rsp_port(uint32_t idx) {
+    return tma_->CacheRspIn.at(idx);
+  }
+
   uint32_t tmem_alloc(uint32_t col_span, uint32_t reserved_operand = kTmemAllocReservedOperand);
   // PTX tcgen05.dealloc.
   bool tmem_dealloc(uint32_t taddr);
@@ -339,7 +352,7 @@ public:
   void tmem_set_meta_ready(uint32_t taddr, bool ready);
   void tmem_set_meta_region(uint32_t taddr, uint32_t meta_col_base, uint32_t meta_col_span);
   bool tmem_set_row_bytes(uint32_t taddr, uint32_t row_bytes);
-#endif
+//#endif
 
 #ifdef EXT_V_ENABLE
   VecUnit::Ptr& vec_unit() {
@@ -375,23 +388,23 @@ private:
   void execute();
   void commit();
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   // tcgen05.wait::ld/st only track tcgen05.ld/st completion, not MMA.
   bool wait_for_inflight_tcgen05_ld_st(uint32_t wid, bool wait_store);
-#endif
+//#endif
 
   uint32_t core_id_;
   Socket* socket_;
   const Arch& arch_;
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   TensorUnit::Ptr tensor_unit_;
   std::shared_ptr<TmemSystem> tmem_system_;
   Tma::Ptr tma_;
   SimPort<TensorAsyncOpCompletion> tensor_async_op_completion_in_;
   SimPort<TensorAsyncOpCompletion> tma_async_op_completion_in_;
   SimPort<TensorAsyncOpCompletion> tmem_system_async_op_completion_in_;
-#endif
+//#endif
 
 #ifdef EXT_V_ENABLE
   VecUnit::Ptr vec_unit_;
@@ -425,7 +438,7 @@ private:
 
   PoolAllocator<instr_trace_t, 64> trace_pool_;
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   using TmemAllocation = vortex::TmemAllocation;
 
   enum class AsyncTensorOpType : uint8_t {
@@ -559,7 +572,7 @@ private:
   bool tmem_taddr_busy(uint32_t taddr) const;
   bool lookup_tmem_allocation(uint32_t taddr, TmemAllocation** allocation);
   bool lookup_tmem_allocation(uint32_t taddr, const TmemAllocation** allocation) const;
-#endif
+//#endif
 
   friend class LsuUnit;
   friend class AluUnit;

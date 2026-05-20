@@ -32,6 +32,10 @@ static inline bool is_sparse_case(uint32_t case_id) {
       || case_id == TCGEN05_CASE_SPARSE_1_4_F8;
 }
 
+static inline uint32_t c_payload_bytes(uint32_t case_id) {
+  return is_sparse_case(case_id) ? TCGEN05_PAYLOAD_BYTES : TCGEN05_C_PAYLOAD_BYTES;
+}
+
 static inline void issue_case_mma(uint32_t case_id,
                                   uint32_t d_taddr,
                                   uint32_t a_taddr,
@@ -64,15 +68,16 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   uint32_t b_payload_addr = reinterpret_cast<uint32_t>(lmem + kBPayloadOff);
   uint32_t c_payload_addr = reinterpret_cast<uint32_t>(lmem + kCPayloadOff);
   uint32_t meta_payload_addr = reinterpret_cast<uint32_t>(lmem + kMetaPayloadOff);
+  uint32_t mbar_addr = reinterpret_cast<uint32_t>(lmem + kMbarOff);
 
   auto* a_args = reinterpret_cast<vt::cpabulk_transfer_args_t*>(lmem + kAArgsOff);
   auto* b_args = reinterpret_cast<vt::cpabulk_transfer_args_t*>(lmem + kBArgsOff);
   auto* c_args = reinterpret_cast<vt::cpabulk_transfer_args_t*>(lmem + kCArgsOff);
   auto* meta_args = reinterpret_cast<vt::cpabulk_transfer_args_t*>(lmem + kMetaArgsOff);
-  *a_args = vt::make_cpabulk_args(a_payload_addr, 0, 0, 0, 0, 0, 0);
-  *b_args = vt::make_cpabulk_args(b_payload_addr, 0, 0, 0, 0, 0, 0);
-  *c_args = vt::make_cpabulk_args(c_payload_addr, 0, 0, 0, 0, 0, 0);
-  *meta_args = vt::make_cpabulk_args(meta_payload_addr, 0, 0, 0, 0, 0, 0);
+  *a_args = vt::make_cpabulk_args(a_payload_addr, mbar_addr, 0, 0, 0, 0, 0);
+  *b_args = vt::make_cpabulk_args(b_payload_addr, mbar_addr, 0, 0, 0, 0, 0);
+  *c_args = vt::make_cpabulk_args(c_payload_addr, mbar_addr, 0, 0, 0, 0, 0);
+  *meta_args = vt::make_cpabulk_args(meta_payload_addr, mbar_addr, 0, 0, 0, 0, 0);
 
   auto* a_tmap = reinterpret_cast<const vt::tensor_map_t*>(
       static_cast<uint32_t>(arg->a_tmap_addr));
@@ -80,15 +85,25 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
       static_cast<uint32_t>(arg->b_tmap_addr));
   auto* c_tmap = reinterpret_cast<const vt::tensor_map_t*>(
       static_cast<uint32_t>(arg->c_tmap_addr));
-  (void)vt::cpabulk_tensor_ld(a_tmap, a_args);
-  (void)vt::cpabulk_tensor_ld(b_tmap, b_args);
-  (void)vt::cpabulk_tensor_ld(c_tmap, c_args);
+  // The mbarrier tx target must match the descriptor payload bytes exactly.
+  uint32_t tma_tx_bytes =
+      (2 * TCGEN05_PAYLOAD_BYTES) + c_payload_bytes(arg->case_id);
+  if (is_sparse_case(arg->case_id)) {
+    tma_tx_bytes += TCGEN05_META_BYTES;
+  }
 
+  vt::mbarrier_init(mbar_addr, 1);
+  vt::mbarrier_expect_tx(mbar_addr, tma_tx_bytes);
+  (void)vt::cpabulk_tensor_ld_complete_tx(a_tmap, a_args);
+  (void)vt::cpabulk_tensor_ld_complete_tx(b_tmap, b_args);
+  (void)vt::cpabulk_tensor_ld_complete_tx(c_tmap, c_args);
   if (is_sparse_case(arg->case_id)) {
     auto* meta_tmap = reinterpret_cast<const vt::tensor_map_t*>(
         static_cast<uint32_t>(arg->meta_tmap_addr));
-    (void)vt::cpabulk_tensor_ld(meta_tmap, meta_args);
+    (void)vt::cpabulk_tensor_ld_complete_tx(meta_tmap, meta_args);
   }
+  uint32_t tma_phase = vt::mbarrier_arrive_token(mbar_addr);
+  vt::mbarrier_wait(mbar_addr, tma_phase);
 
   uint32_t a_taddr = vt::tmem_alloc(16);
   uint32_t d_taddr = vt::tmem_alloc(32);
@@ -118,7 +133,6 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
 
   auto* op_block = reinterpret_cast<vt::operand_block_t*>(lmem + kOpBlockOff);
 
-  uint32_t mbar_addr = reinterpret_cast<uint32_t>(lmem + kMbarOff);
   vt::mbarrier_init(mbar_addr, 1);
   issue_case_mma(arg->case_id, d_taddr, a_taddr, b_sdesc, op_block);
   (void)vt::mbar_commit(mbar_addr);

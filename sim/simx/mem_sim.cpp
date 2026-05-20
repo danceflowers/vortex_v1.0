@@ -84,9 +84,13 @@ public:
 				mem_req.write,
 				[](void* arg) {
 					auto rsp_args = reinterpret_cast<const DramCallbackArgs*>(arg);
-					if (!rsp_args->request.write) {
-						// only send a response for read requests
-						MemRsp mem_rsp{rsp_args->request.tag, rsp_args->request.cid, rsp_args->request.uuid};
+					if (!rsp_args->request.write || rsp_args->request.write_response) {
+						// Reads always respond; writes respond only when the requestor
+						// explicitly needs a timing completion acknowledgement.
+						MemRsp mem_rsp{rsp_args->request.tag,
+						               rsp_args->request.cid,
+						               rsp_args->request.uuid,
+						               rsp_args->request.write};
 						rsp_args->memsim->mem_xbar_->RspOut.at(rsp_args->bank_id).push(mem_rsp, 1);
 						DT(3, rsp_args->memsim->simobject_->name() << "-mem-rsp" << rsp_args->bank_id << ": " << mem_rsp);
 					}

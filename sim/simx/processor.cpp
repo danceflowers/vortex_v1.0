@@ -77,9 +77,11 @@ ProcessorImpl::ProcessorImpl(const Arch& arch)
       perf_mem_writes_ += req.write;
       perf_mem_pending_reads_ += !req.write;
     });
-    memsim_->MemRspPorts.at(i).tx_callback([&](const MemRsp&, uint64_t cycle){
+    memsim_->MemRspPorts.at(i).tx_callback([&](const MemRsp& rsp, uint64_t cycle){
       __unused (cycle);
-      --perf_mem_pending_reads_;
+      if (!rsp.write) {
+        --perf_mem_pending_reads_;
+      }
     });
   }
 

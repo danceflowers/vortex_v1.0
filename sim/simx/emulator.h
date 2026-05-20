@@ -21,9 +21,9 @@
 #include <mem.h>
 #include "types.h"
 #include "instr.h"
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
 #include "open_tensorcore/tensor_unit.h"
-#endif
+//#endif
 #ifdef EXT_V_ENABLE
 #include "vec_unit.h"
 #endif
@@ -191,7 +191,7 @@ private:
   wspawn_t    wspawn_;
   uint32_t    next_warp_rr_;
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   TensorUnit::Ptr tensor_unit_;
 
   struct WarpGroupCollectiveState {
@@ -224,7 +224,7 @@ private:
                                 uint32_t src2) const;
   void clear_warpgroup_collective(uint32_t wgid);
   instr_trace_t* retire_warpgroup_collective_nop(const Instr& instr, uint32_t wid, uint32_t rd_value, bool rd_valid);
-#endif
+//#endif
 
 #ifdef EXT_V_ENABLE
   VecUnit::Ptr vec_unit_;

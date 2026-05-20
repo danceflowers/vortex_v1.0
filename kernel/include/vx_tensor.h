@@ -562,6 +562,13 @@ inline __attribute__((always_inline)) uint32_t cpabulk_tensor_ld(const tensor_ma
                            reinterpret_cast<uint32_t>(args));
 }
 
+inline __attribute__((always_inline)) uint32_t cpabulk_tensor_ld_complete_tx(
+    const tensor_map_t* tmap,
+    const cpabulk_transfer_args_t* args) {
+  return cpabulk_tensor_ld_complete_tx(reinterpret_cast<uint32_t>(tmap),
+                                       reinterpret_cast<uint32_t>(args));
+}
+
 inline __attribute__((always_inline)) uint32_t cpabulk_tensor_st(const tensor_map_t* tmap,
                                                                   const cpabulk_transfer_args_t* args) {
   return cpabulk_tensor_st(reinterpret_cast<uint32_t>(tmap),

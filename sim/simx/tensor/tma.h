@@ -38,9 +38,8 @@ struct cpabulk_transfer_result_t {
 // - owns the TMA-facing data movement helpers that were previously embedded in
 //   Core
 // - talks to TMEM through packet-level SimPorts
-// - keeps the existing functional DRAM/LMEM behavior by using Core's memory
-//   callbacks; CacheReqOut/CacheRspIn are exposed for future cache-timing
-//   wiring without changing the current data path semantics
+// - talks to the socket-to-L2 path through CacheReqOut/CacheRspIn; descriptor
+//   and payload bytes become functionally visible only after timing responses
 class Tma : public SimObject<Tma> {
 public:
   SimPort<TensorMemPortReq> TmemReqOut;
@@ -64,12 +63,14 @@ public:
   static uint32_t element_type_bytes(uint8_t element_type);
 
   // Execute cp.async.bulk.tensor.global.shared: DRAM tensor map -> LMEM payload.
-  cpabulk_transfer_result_t cpabulk_tensor_load(uint64_t tensor_map_addr,
+  cpabulk_transfer_result_t cpabulk_tensor_load(uint32_t async_id,
+                                                uint64_t tensor_map_addr,
                                                 uint64_t args_lmem_ptr,
                                                 bool complete_tx);
 
   // Execute cp.async.bulk.tensor.shared.global: LMEM payload -> DRAM tensor map.
-  cpabulk_transfer_result_t cpabulk_tensor_store(uint64_t tensor_map_addr,
+  cpabulk_transfer_result_t cpabulk_tensor_store(uint32_t async_id,
+                                                 uint64_t tensor_map_addr,
                                                  uint64_t args_lmem_ptr);
 
   // Start an asynchronous LMEM -> TMEM packet copy used by tcgen05.cp.
@@ -91,6 +92,35 @@ private:
     WaitWrite,
   };
 
+  enum class cpabulk_cache_stage_t : uint8_t {
+    Descriptor = 0,
+    Payload,
+  };
+
+  struct pending_cpabulk_cache_request_t {
+    uint32_t async_id = 0;
+    cpabulk_cache_stage_t stage = cpabulk_cache_stage_t::Descriptor;
+    uint32_t offset = 0;
+    uint32_t bytes = 0;
+  };
+
+  struct pending_cpabulk_transfer_t {
+    uint32_t async_id = 0;
+    bool is_store = false;
+    bool descriptor_ready = false;
+    uint64_t tensor_map_addr = 0;
+    uint64_t global_addr = 0;
+    uint64_t lmem_addr = 0;
+    uint64_t tx_bound_mbar = 0;
+    uint32_t coords[5] = {};
+    uint32_t total_bytes = 0;
+    uint32_t descriptor_next_offset = 0;
+    uint32_t descriptor_completed_bytes = 0;
+    uint32_t payload_next_offset = 0;
+    uint32_t payload_completed_bytes = 0;
+    uint32_t inflight_cache_requests = 0;
+  };
+
   struct pending_lmem_to_tmem_copy_t {
     uint32_t async_id = 0;
     uint32_t wid = 0;
@@ -110,9 +140,24 @@ private:
   };
 
   Core* core_;
+  std::unordered_map<uint32_t, pending_cpabulk_transfer_t> pending_cpabulk_transfers_;
+  std::unordered_map<uint64_t, pending_cpabulk_cache_request_t> pending_cpabulk_cache_requests_;
   std::unordered_map<uint32_t, pending_lmem_to_tmem_copy_t> pending_lmem_to_tmem_copies_;
   std::unordered_map<uint64_t, TensorMemPortRsp> completed_lmem_to_tmem_responses_;
+  uint64_t next_cache_request_id_;
   uint64_t next_lmem_to_tmem_request_id_;
+
+  void issue_cache_timing_request(pending_cpabulk_transfer_t& op,
+                                  cpabulk_cache_stage_t stage,
+                                  uint64_t addr,
+                                  uint32_t offset,
+                                  uint32_t bytes);
+
+  // Retire completed L2/global timing responses back into cp.async.bulk ops.
+  void drain_cache_responses();
+
+  // Issue descriptor and payload requests for in-flight cp.async.bulk ops.
+  void advance_cpabulk_transfer_ops();
 
   // Collect completed TMEM packet responses and make them visible to copy ops.
   void drain_tmem_responses();

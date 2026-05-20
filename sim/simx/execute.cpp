@@ -1455,7 +1455,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       rd_write = true;
     }
   #endif // EXT_V_ENABLE
-  #ifdef EXT_TCU_ENABLE
+  //#ifdef EXT_TCU_ENABLE
     ,[&](TcuType tcu_type) {
       auto tpuArgs = std::get<IntrTcuArgs>(instrArgs);
       auto trace_data = std::make_shared<TensorUnit::ExeTraceData>();
@@ -1694,7 +1694,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         std::abort();
       }
     }
-  #endif // EXT_TCU_ENABLE
+  //#endif // EXT_TCU_ENABLE
   );
 
   if (!last_instr_retired_) {

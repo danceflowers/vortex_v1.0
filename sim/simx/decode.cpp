@@ -28,13 +28,13 @@
 #include "arch.h"
 #include "instr.h"
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
 #include "tensor_cfg.h"
-#endif
+//#endif
 
 using namespace vortex;
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
 namespace {
 
 using InstrAllocator = PoolAllocator<Instr, 64>;
@@ -58,7 +58,7 @@ void set_optional_int_dest(const std::shared_ptr<Instr>& instr, uint32_t rd) {
 }
 
 } // namespace
-#endif
+//#endif
 
 static op_string_t op_string(const Instr &instr) {
   auto op_type = instr.getOpType();
@@ -495,12 +495,12 @@ static op_string_t op_string(const Instr &instr) {
       }
     }
   #endif // EXT_V_ENABLE
-  #ifdef EXT_TCU_ENABLE
+  //#ifdef EXT_TCU_ENABLE
     ,[&](TcuType tcu_type)-> op_string_t {
       auto tpuArgs = std::get<IntrTcuArgs>(instrArgs);
       return op_string(tcu_type, tpuArgs);
     }
-  #endif // EXT_TCU_ENABLE
+  //#endif // EXT_TCU_ENABLE
  );
  return {"", ""};
 }
@@ -1108,7 +1108,7 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
       std::abort();
     }
   } break;
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   case Opcode::EXT2: { // custom-1 (0x2B): tcgen05 TMEM management + cp.async.bulk.tensor
     auto qualifier = funct7;
     IntrTcuArgs args{};
@@ -1302,7 +1302,7 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
       std::abort();
     }
   } break;
-#endif
+//#endif
   default:
     std::abort();
   }

@@ -19,18 +19,23 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   uint32_t lmem_base = reinterpret_cast<uint32_t>(__local_mem(0));
   uint32_t a_payload_addr = reinterpret_cast<uint32_t>(lmem + kAPayloadOff);
   uint32_t b_payload_addr = reinterpret_cast<uint32_t>(lmem + kBPayloadOff);
+  uint32_t mbar_addr = reinterpret_cast<uint32_t>(lmem + kMbarOff);
 
   auto* a_args = reinterpret_cast<vt::cpabulk_transfer_args_t*>(lmem + kAArgsOff);
   auto* b_args = reinterpret_cast<vt::cpabulk_transfer_args_t*>(lmem + kBArgsOff);
-  *a_args = vt::make_cpabulk_args(a_payload_addr, 0, 0, 0, 0, 0, 0);
-  *b_args = vt::make_cpabulk_args(b_payload_addr, 0, 0, 0, 0, 0, 0);
+  *a_args = vt::make_cpabulk_args(a_payload_addr, mbar_addr, 0, 0, 0, 0, 0);
+  *b_args = vt::make_cpabulk_args(b_payload_addr, mbar_addr, 0, 0, 0, 0, 0);
 
   auto* a_tmap = reinterpret_cast<const vt::tensor_map_t*>(
       static_cast<uint32_t>(arg->a_tmap_addr));
   auto* b_tmap = reinterpret_cast<const vt::tensor_map_t*>(
       static_cast<uint32_t>(arg->b_tmap_addr));
-  (void)vt::cpabulk_tensor_ld(a_tmap, a_args);
-  (void)vt::cpabulk_tensor_ld(b_tmap, b_args);
+  vt::mbarrier_init(mbar_addr, 1);
+  vt::mbarrier_expect_tx(mbar_addr, 2 * TCGEN05_PAYLOAD_BYTES);
+  (void)vt::cpabulk_tensor_ld_complete_tx(a_tmap, a_args);
+  (void)vt::cpabulk_tensor_ld_complete_tx(b_tmap, b_args);
+  uint32_t tma_phase = vt::mbarrier_arrive_token(mbar_addr);
+  vt::mbarrier_wait(mbar_addr, tma_phase);
 
   uint32_t a_taddr = vt::tmem_alloc(16);
   uint32_t d_taddr = vt::tmem_alloc(32);
@@ -48,7 +53,6 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
 
   uint32_t idesc = vt::make_i_descriptor<vt::fp16, vt::fp16, vt::fp32, vt::fp32>(
       M_DIM, N_DIM);
-  uint32_t mbar_addr = reinterpret_cast<uint32_t>(lmem + kMbarOff);
   vt::mbarrier_init(mbar_addr, 1);
   vt::tcu_mma_no_accum(d_taddr, idesc, op_block);
   (void)vt::mbar_commit(mbar_addr);

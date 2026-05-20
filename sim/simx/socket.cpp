@@ -65,11 +65,44 @@ Socket::Socket(const SimContext& ctx,
     2,                      // pipeline latency
   });
 
+  // create cores
+  for (uint32_t i = 0; i < cores_per_socket; ++i) {
+    uint32_t core_id = socket_id * cores_per_socket + i;
+    cores_.at(i) = Core::Create(core_id, this, arch, dcrs);
+  }
+
   // find overlap
   uint32_t overlap = MIN(ICACHE_MEM_PORTS, L1_MEM_PORTS);
 
   // connect l1 caches to outgoing memory interfaces
   for (uint32_t i = 0; i < L1_MEM_PORTS; ++i) {
+//#ifdef EXT_TCU_ENABLE
+    // TMA global-memory traffic bypasses L1 and arbitrates directly onto the
+    // socket-to-L2 path, matching the TMAU/L2 requestor model.
+    snprintf(sname, 100, "%s-tma_l2_arb%d", this->name().c_str(), i);
+    auto tma_l2_arb = MemArbiter::Create(sname, ArbiterType::RoundRobin, 1 + cores_per_socket, 1);
+//#endif
+
+    auto bind_l1_path_to_socket = [&](SimPort<MemReq>* req_source,
+                                      SimPort<MemRsp>* rsp_sink) {
+//#ifdef EXT_TCU_ENABLE
+      req_source->bind(&tma_l2_arb->ReqIn.at(0));
+      tma_l2_arb->RspIn.at(0).bind(rsp_sink);
+      for (uint32_t c = 0; c < cores_per_socket; ++c) {
+        if ((c % L1_MEM_PORTS) != i) {
+          continue;
+        }
+        cores_.at(c)->tma_cache_req_port(0).bind(&tma_l2_arb->ReqIn.at(1 + c));
+        tma_l2_arb->RspIn.at(1 + c).bind(&cores_.at(c)->tma_cache_rsp_port(0));
+      }
+      tma_l2_arb->ReqOut.at(0).bind(&this->mem_req_ports.at(i));
+      this->mem_rsp_ports.at(i).bind(&tma_l2_arb->RspOut.at(0));
+#else
+      req_source->bind(&this->mem_req_ports.at(i));
+      this->mem_rsp_ports.at(i).bind(rsp_sink);
+//#endif
+    };
+
     snprintf(sname, 100, "%s-l1_arb%d", this->name().c_str(), i);
     auto l1_arb = MemArbiter::Create(sname, ArbiterType::RoundRobin, 2 * overlap, overlap);
 
@@ -80,25 +113,16 @@ Socket::Socket(const SimContext& ctx,
       dcaches_->MemReqPorts.at(i).bind(&l1_arb->ReqIn.at(overlap + i));
       l1_arb->RspIn.at(overlap + i).bind(&dcaches_->MemRspPorts.at(i));
 
-      l1_arb->ReqOut.at(i).bind(&this->mem_req_ports.at(i));
-      this->mem_rsp_ports.at(i).bind(&l1_arb->RspOut.at(i));
+      bind_l1_path_to_socket(&l1_arb->ReqOut.at(i), &l1_arb->RspOut.at(i));
     } else {
       if (L1_MEM_PORTS > ICACHE_MEM_PORTS) {
         // if more dcache ports
-        dcaches_->MemReqPorts.at(i).bind(&this->mem_req_ports.at(i));
-        this->mem_rsp_ports.at(i).bind(&dcaches_->MemRspPorts.at(i));
+        bind_l1_path_to_socket(&dcaches_->MemReqPorts.at(i), &dcaches_->MemRspPorts.at(i));
       } else {
         // if more icache ports
-        icaches_->MemReqPorts.at(i).bind(&this->mem_req_ports.at(i));
-        this->mem_rsp_ports.at(i).bind(&icaches_->MemRspPorts.at(i));
+        bind_l1_path_to_socket(&icaches_->MemReqPorts.at(i), &icaches_->MemRspPorts.at(i));
       }
     }
-  }
-
-  // create cores
-  for (uint32_t i = 0; i < cores_per_socket; ++i) {
-    uint32_t core_id = socket_id * cores_per_socket + i;
-    cores_.at(i) = Core::Create(core_id, this, arch, dcrs);
   }
 
   // connect cores to caches

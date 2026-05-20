@@ -22,28 +22,27 @@
 namespace vortex {
 namespace tensor {
 
-static constexpr uint32_t descriptor_table_magic = 0x54435544u;
-static constexpr uint16_t descriptor_table_version = 3;
-static constexpr uint32_t max_static_descriptor_id = 32;
+// ============================================================================
+// Tensor 扩展配置定义
+//
+// 本文件定义了 Vortex GPU 张量扩展的全局配置，包括：
+//   - 数据格式枚举（fp32, fp16, bf16, fp8, fp4, int32, int8, uint8, int4, uint4）
+//   - 稀疏模式常量（sparse_none, sparse_2_4, sparse_1_4）
+//   - WMMA 分块配置模板（wmma_config_t / wmma_ab_config_t）
+//
+// 数据格式使用 id 字段进行运行时匹配，id 值在整个 CModel 和 RTL 中保持一致。
+// ============================================================================
 
-struct descriptor_table_arg_t {
-  uint32_t magic = descriptor_table_magic;
-  uint16_t version = descriptor_table_version;
-  uint16_t reserved0 = 0;
-  uint32_t tma_desc_count = 0;
-  uint32_t mma_desc_count = 0;
-  uint64_t tma_desc_addr = 0;
-  uint64_t mma_desc_addr = 0;
-};
-
-struct fp32 {
+// 数据格式类型标签 —— 每个类型包含 C++ 原始类型、运行时 id、位宽和名称
+// id 值在 CModel 和 RTL 指令编码中保持一致，用于 switch/case 分发
+struct fp32 {                              // IEEE 754 单精度浮点
   using dtype = float;
   static constexpr uint32_t id = 0;
   static constexpr uint32_t bits = 32;
   static constexpr const char* name = "fp32";
 };
 
-struct fp16 {
+struct fp16 {                              // IEEE 754 半精度浮点
   using dtype = uint16_t;
   static constexpr uint32_t id = 1;
   static constexpr uint32_t bits = 16;
@@ -125,16 +124,28 @@ inline const char* fmt_string(uint32_t fmt) {
   }
 }
 
-static constexpr uint8_t sparse_none = 0;
-static constexpr uint8_t sparse_2_4 = 1;
-static constexpr uint8_t sparse_1_4 = 2;
+// 稀疏模式常量
+static constexpr uint8_t sparse_none = 0;   // 稠密模式（无稀疏）
+static constexpr uint8_t sparse_2_4 = 1;    // 2:4 结构化稀疏（每 4 个元素保留 2 个）
+static constexpr uint8_t sparse_1_4 = 2;    // 1:4 结构化稀疏（每 4 个元素保留 1 个）
 
-template <uint32_t NT,      // number of threads per warp
-          typename It = fp32, // input type (A,B)
-          typename Ot = fp32, // output type (C,D)
-          uint32_t XB = 4,  // vector element type size in bytes
-          uint32_t NR = 8,  // registers per fragment
-          uint32_t DP = 0   // Dot-Product Length (0 for auto)
+// ============================================================================
+// WMMA 分块配置模板
+//
+// 根据线程数(NT)、输入/输出精度、寄存器数量等参数，自动计算：
+//   - xtileM/N/K: 寄存器级分块大小（一次 WMMA 指令操作的矩阵维度）
+//   - tcM/N/K: 硬件 TensorCore 单次操作的原语维度
+//   - m/n/k_steps: 需要多少步原语操作才能覆盖完整的寄存器分块
+//   - NRA/NRB/NRC: 每个 warp 中每线程需要的 A/B/C 寄存器数量
+//
+// 这些编译期常量同时用于 CModel 模拟和驱动程序的 kernel 编译。
+// ============================================================================
+template <uint32_t NT,      // 每个 warp 的线程数
+          typename It = fp32, // 输入类型 (A,B)
+          typename Ot = fp32, // 输出类型 (C,D)
+          uint32_t XB = 4,  // 向量元素类型字节大小
+          uint32_t NR = 8,  // 每个 fragment 的寄存器数
+          uint32_t DP = 0   // 点积长度 (0 = 自动计算)
           >
 struct wmma_config_t {
 private:

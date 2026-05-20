@@ -60,14 +60,14 @@ Core::Core(const SimContext& ctx,
   , core_id_(core_id)
   , socket_(socket)
   , arch_(arch)
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   , tensor_unit_(TensorUnit::Create("tcu", arch, this))
   , tmem_system_(TmemSystem::Create("tmem_system", this))
   , tma_(Tma::Create("tma", this))
   , tensor_async_op_completion_in_(this)
   , tma_async_op_completion_in_(this)
   , tmem_system_async_op_completion_in_(this)
-#endif
+// #endif
 #ifdef EXT_V_ENABLE
   , vec_unit_(VecUnit::Create("vpu", arch, this))
 #endif
@@ -82,15 +82,15 @@ Core::Core(const SimContext& ctx,
   , pending_icache_(arch_.num_warps())
   , commit_arbs_(ISSUE_WIDTH)
   , ibuffer_arbs_(ISSUE_WIDTH, {ArbiterType::RoundRobin, PER_ISSUE_WARPS})
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   , mbarrier_wait_targets_(arch.num_warps())
   , fence_wait_states_(arch.num_warps())
   , next_async_id_(1)
-#endif
+// #endif
 {
   char sname[100];
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   tensor_unit_->TensorMemReqOut.bind(&tmem_system_->TensorExecuteReqIn);
   tmem_system_->TensorExecuteRspOut.bind(&tensor_unit_->TensorMemRspIn);
   tma_->TmemReqOut.bind(&tmem_system_->CoreTransferReqIn);
@@ -183,7 +183,7 @@ Core::Core(const SimContext& ctx,
 #ifdef EXT_V_ENABLE
   dispatchers_.at((int)FUType::VPU) = SimPlatform::instance().create_object<Dispatcher>(this, 2, NUM_VPU_BLOCKS, NUM_VPU_LANES);
 #endif
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   dispatchers_.at((int)FUType::TCU) = SimPlatform::instance().create_object<Dispatcher>(this, 2, NUM_TCU_BLOCKS, NUM_TCU_LANES);
 #endif
 
@@ -195,7 +195,7 @@ Core::Core(const SimContext& ctx,
 #ifdef EXT_V_ENABLE
   func_units_.at((int)FUType::VPU) = SimPlatform::instance().create_object<VpuUnit>(this);
 #endif
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   func_units_.at((int)FUType::TCU) = SimPlatform::instance().create_object<TcuUnit>(this);
 #endif
 
@@ -240,7 +240,7 @@ void Core::reset() {
   pending_instrs_.clear();
   pending_ifetches_ = 0;
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   tensor_unit_->reset();
   tmem_system_->reset();
   tma_->reset();
@@ -267,7 +267,7 @@ void Core::reset() {
 }
 
 void Core::tick() {
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   execute_cycle_tmem_shift_reserved_taddrs_.clear();
   drain_tensor_execute_completion_notices();
   drain_tma_completion_notices();
@@ -277,14 +277,14 @@ void Core::tick() {
     async_tensor_complete(completion.async_id);
     tmem_system_async_op_completion_in_.pop();
   }
-#endif
+// #endif
   this->commit();
   this->execute();
   this->issue();
   this->decode();
   this->fetch();
   this->schedule();
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   auto watchdog_cycle = env_u64_value("VORTEX_SIMX_TENSOR_WATCHDOG_CYCLES", 0);
   if (watchdog_cycle != 0 && perf_stats_.cycles >= watchdog_cycle) {
     this->dump_tensor_debug_state(std::cerr);
@@ -305,7 +305,7 @@ uint64_t Core::startup_arg() const {
 }
 
 void Core::dump_tensor_debug_state(std::ostream& os) const {
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   os << "==== tensor-debug-state begin ====\n";
   os << "cycle=" << perf_stats_.cycles << "\n";
   os << "emulator_running=" << emulator_.running()
@@ -343,6 +343,21 @@ void Core::dump_tensor_debug_state(std::ostream& os) const {
        << " completed=" << op.completed
        << " committed=" << op.committed
        << " barrier=" << op.barrier_id
+       << " tx_bound_mbar=0x" << std::hex << op.tx_bound_mbar << std::dec
+       << " tx_bytes=" << op.tx_bytes
+       << "\n";
+  }
+  os << "mbarriers=" << mbarriers_.size() << "\n";
+  for (const auto& entry : mbarriers_) {
+    const auto& mbar = entry.second;
+    os << "  mbar_addr=0x" << std::hex << entry.first << std::dec
+       << " valid=" << mbar.valid
+       << " phase=" << mbar.phase
+       << " expected_arrivals=" << mbar.expected_arrival_count
+       << " pending_arrivals=" << mbar.pending_arrival_count
+       << " expected_tx=" << mbar.expected_tx_count
+       << " pending_tx=" << mbar.pending_tx_count
+       << " waiters=" << mbar.waiters_bitmap.to_string()
        << "\n";
   }
   tmem_system_->dump_debug_state(os);
@@ -490,7 +505,7 @@ void Core::issue() {
         #ifdef EXT_V_ENABLE
           case FUType::VPU: ++perf_stats_.scrb_vpu; break;
         #endif
-        #ifdef EXT_TCU_ENABLE
+        //#ifdef EXT_TCU_ENABLE
           case FUType::TCU: ++perf_stats_.scrb_tcu; break;
         #endif
           default: assert(false);
@@ -551,7 +566,7 @@ void Core::commit() {
     DT(3, "pipeline-commit: " << *trace);
     assert(trace->cid == core_id_);
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
     if (auto tcu_type = std::get_if<TcuType>(&trace->op_type)) {
       if (*tcu_type == TcuType::TCU_LD
        && !tcgen05_ld_trace_ready(reinterpret_cast<uint64_t>(trace))) {
@@ -642,7 +657,7 @@ void Core::set_satp(uint64_t satp) {
 }
 #endif
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
 
 bool Core::lookup_tmem_allocation(uint32_t taddr, TmemAllocation** allocation) {
   return tmem_system_->lookup_allocation(taddr, allocation);
@@ -876,23 +891,23 @@ void Core::try_complete_mbarrier(uint64_t mbar_addr) {
   if (it == mbarriers_.end()) {
     return;
   }
-  auto& barrier = it->second;
-  if (!barrier.valid
-   || barrier.pending_arrival_count != 0
-   || barrier.pending_tx_count < barrier.expected_tx_count) {
+  auto& mbar = it->second;
+  if (!mbar.valid
+   || mbar.pending_arrival_count != 0
+   || mbar.pending_tx_count < mbar.expected_tx_count) {
     return;
   }
 
   // Phase advance.
-  barrier.phase = (barrier.phase + 1) & 0x3u;
-  barrier.pending_arrival_count = barrier.expected_arrival_count;
-  barrier.pending_tx_count = 0;
-  barrier.expected_tx_count = 0;
-  mirror_mbarrier_to_lmem(mbar_addr, barrier);
+  mbar.phase = (mbar.phase + 1) & 0x3u;
+  mbar.pending_arrival_count = mbar.expected_arrival_count;
+  mbar.pending_tx_count = 0;
+  mbar.expected_tx_count = 0;
+  mirror_mbarrier_to_lmem(mbar_addr, mbar);
 
   // Wake up warps that were waiting on the prior phase.
-  auto waiters = barrier.waiters_bitmap;
-  barrier.waiters_bitmap.reset();
+  auto waiters = mbar.waiters_bitmap;
+  mbar.waiters_bitmap.reset();
   for (uint32_t wid = 0; wid < arch_.num_warps(); ++wid) {
     if (waiters.test(wid)) {
       emulator_.resume(wid);
@@ -921,18 +936,18 @@ void Core::on_async_tensor_op_completed(AsyncTensorOp& op) {
   }
   // tcgen05.commit semantics (PTX §9.7.16.5.7): each prior tcgen05.async op
   // bound by tcgen05.commit signals an arrival on the bound mbarrier on
-  // completion. NOT a tx_count update -- those go via mbarrier.complete_tx.
+  // completion. NOT a tx_count update -- those go via mmbar.complete_tx.
   // op.barrier_id was reinterpreted in tc_commit() as the LMEM mbar address.
   uint64_t mbar_addr = op.barrier_id;
   auto it = mbarriers_.find(mbar_addr);
   if (it == mbarriers_.end() || !it->second.valid) {
     return;
   }
-  auto& barrier = it->second;
-  if (barrier.pending_arrival_count > 0) {
-    --barrier.pending_arrival_count;
+  auto& mbar = it->second;
+  if (mbar.pending_arrival_count > 0) {
+    --mbar.pending_arrival_count;
   }
-  mirror_mbarrier_to_lmem(mbar_addr, barrier);
+  mirror_mbarrier_to_lmem(mbar_addr, mbar);
   try_complete_mbarrier(mbar_addr);
 }
 
@@ -959,6 +974,12 @@ void Core::drain_tma_completion_notices() {
     return;
   }
   auto completion = tma_async_op_completion_in_.front();
+  auto it = async_tensor_ops_.find(completion.async_id);
+  if (it != async_tensor_ops_.end()) {
+    it->second.payload_size_bytes = completion.payload_size_bytes;
+    it->second.tx_bound_mbar = completion.tx_bound_mbar;
+    it->second.tx_bytes = completion.tx_bytes;
+  }
   async_tensor_complete(completion.async_id);
   tma_async_op_completion_in_.pop();
   last_tma_completion_drain_cycle_ = cycle;
@@ -1118,6 +1139,12 @@ void Core::async_tensor_complete(uint32_t async_id) {
   auto it = async_tensor_ops_.find(async_id);
   if (it == async_tensor_ops_.end() || it->second.completed) {
     return;
+  }
+  auto latency = perf_stats_.cycles - it->second.issue_cycle;
+  if (it->second.type == AsyncTensorOpType::TmaLoad) {
+    perf_stats_.tma_load_latency_sum += latency;
+  } else if (it->second.type == AsyncTensorOpType::TmaStore) {
+    perf_stats_.tma_store_latency_sum += latency;
   }
   it->second.completed = true;
   on_async_tensor_op_completed(it->second);
@@ -1371,24 +1398,24 @@ bool Core::wait_for_inflight_tcgen05_ld_st(uint32_t wid, bool wait_store) {
   return false;
 }
 
-// PTX §7.6.3 mbarrier.init: initialize the 8 B mbarrier object in shared mem
+// PTX §7.6.3 mmbar.init: initialize the 8 B mbarrier object in shared mem
 // with `count` expected arrivals; phase parity starts at 0; tx counters at 0.
 bool Core::mbarrier_init(uint64_t mbar_addr, uint32_t count) {
-  auto& barrier = mbarriers_[mbar_addr];
-  barrier = {};
-  barrier.valid = true;
-  barrier.expected_arrival_count = count;
-  barrier.pending_arrival_count = count;
-  barrier.phase = 0;
+  auto& mbar = mbarriers_[mbar_addr];
+  mbar = {};
+  mbar.valid = true;
+  mbar.expected_arrival_count = count;
+  mbar.pending_arrival_count = count;
+  mbar.phase = 0;
   // Drop any stale waiter targets for this address from prior generations.
   for (auto& wait_targets : mbarrier_wait_targets_) {
     wait_targets.erase(mbar_addr);
   }
-  mirror_mbarrier_to_lmem(mbar_addr, barrier);
+  mirror_mbarrier_to_lmem(mbar_addr, mbar);
   return true;
 }
 
-// PTX §7.6.3 mbarrier.invalidate: tear down the object.
+// PTX §7.6.3 mmbar.invalidate: tear down the object.
 void Core::mbarrier_invalidate(uint64_t mbar_addr) {
   auto it = mbarriers_.find(mbar_addr);
   if (it == mbarriers_.end()) {
@@ -1407,44 +1434,44 @@ void Core::mbarrier_invalidate(uint64_t mbar_addr) {
   this->lmem_write(&zero, mbar_addr, sizeof(zero));
 }
 
-// PTX §7.6.3 mbarrier.arrive: decrement pending_arrival_count by `decrement`.
+// PTX §7.6.3 mmbar.arrive: decrement pending_arrival_count by `decrement`.
 // Returns the *current* phase token so caller can wait on this phase.
 uint32_t Core::mbarrier_arrive(uint64_t mbar_addr, uint32_t decrement_count) {
   auto it = mbarriers_.find(mbar_addr);
   if (it == mbarriers_.end() || !it->second.valid) {
     return 0;
   }
-  auto& barrier = it->second;
-  uint32_t observed_phase = barrier.phase;
-  if (barrier.pending_arrival_count >= decrement_count) {
-    barrier.pending_arrival_count -= decrement_count;
+  auto& mbar = it->second;
+  uint32_t observed_phase = mbar.phase;
+  if (mbar.pending_arrival_count >= decrement_count) {
+    mbar.pending_arrival_count -= decrement_count;
   } else {
-    barrier.pending_arrival_count = 0;
+    mbar.pending_arrival_count = 0;
   }
-  mirror_mbarrier_to_lmem(mbar_addr, barrier);
+  mirror_mbarrier_to_lmem(mbar_addr, mbar);
   try_complete_mbarrier(mbar_addr);
   return observed_phase;
 }
 
-// PTX §7.6.3 mbarrier.arrive_drop: arrive AND decrement expected_arrival_count
+// PTX §7.6.3 mmbar.arrive_drop: arrive AND decrement expected_arrival_count
 // permanently (participant leaves the barrier).
 void Core::mbarrier_arrive_drop(uint64_t mbar_addr) {
   auto it = mbarriers_.find(mbar_addr);
   if (it == mbarriers_.end() || !it->second.valid) {
     return;
   }
-  auto& barrier = it->second;
-  if (barrier.expected_arrival_count > 0) {
-    --barrier.expected_arrival_count;
+  auto& mbar = it->second;
+  if (mbar.expected_arrival_count > 0) {
+    --mbar.expected_arrival_count;
   }
-  if (barrier.pending_arrival_count > 0) {
-    --barrier.pending_arrival_count;
+  if (mbar.pending_arrival_count > 0) {
+    --mbar.pending_arrival_count;
   }
-  mirror_mbarrier_to_lmem(mbar_addr, barrier);
+  mirror_mbarrier_to_lmem(mbar_addr, mbar);
   try_complete_mbarrier(mbar_addr);
 }
 
-// PTX §7.6.4 mbarrier.expect_tx: increase expected tx-byte target.
+// PTX §7.6.4 mmbar.expect_tx: increase expected tx-byte target.
 void Core::mbarrier_expect_tx(uint64_t mbar_addr, uint32_t tx_bytes) {
   auto it = mbarriers_.find(mbar_addr);
   if (it == mbarriers_.end() || !it->second.valid) {
@@ -1454,7 +1481,7 @@ void Core::mbarrier_expect_tx(uint64_t mbar_addr, uint32_t tx_bytes) {
   mirror_mbarrier_to_lmem(mbar_addr, it->second);
 }
 
-// PTX §7.6.4 mbarrier.complete_tx: contribute completed tx bytes; if combined
+// PTX §7.6.4 mmbar.complete_tx: contribute completed tx bytes; if combined
 // with arrival it can advance phase.
 void Core::mbarrier_complete_tx(uint64_t mbar_addr, uint32_t tx_bytes) {
   auto it = mbarriers_.find(mbar_addr);
@@ -1466,7 +1493,7 @@ void Core::mbarrier_complete_tx(uint64_t mbar_addr, uint32_t tx_bytes) {
   try_complete_mbarrier(mbar_addr);
 }
 
-// PTX §7.6.3 mbarrier.wait.parity: blocking wait until current phase parity
+// PTX §7.6.3 mmbar.wait.parity: blocking wait until current phase parity
 // differs from `phase_token`. Returns false to indicate stall (caller suspends
 // the warp); returns true once the phase has advanced.
 bool Core::mbarrier_wait(uint32_t wid, uint64_t mbar_addr, uint32_t phase_token) {
@@ -1477,10 +1504,10 @@ bool Core::mbarrier_wait(uint32_t wid, uint64_t mbar_addr, uint32_t phase_token)
   if (it == mbarriers_.end() || !it->second.valid) {
     return true;
   }
-  auto& barrier = it->second;
+  auto& mbar = it->second;
   // Phase parity comparison (PTX semantics): if current parity bit differs
   // from input token, the wait is satisfied.
-  if ((barrier.phase & 0x1u) != (phase_token & 0x1u)) {
+  if ((mbar.phase & 0x1u) != (phase_token & 0x1u)) {
     for (uint32_t gwid = 0; gwid < arch_.num_warps(); ++gwid) {
       if (group_mask.test(gwid)) {
         mbarrier_wait_targets_.at(gwid).erase(mbar_addr);
@@ -1493,12 +1520,12 @@ bool Core::mbarrier_wait(uint32_t wid, uint64_t mbar_addr, uint32_t phase_token)
       mbarrier_wait_targets_.at(gwid)[mbar_addr] = phase_token;
     }
   }
-  barrier.waiters_bitmap |= group_mask;
+  mbar.waiters_bitmap |= group_mask;
   ++perf_stats_.stall_wait_barrier;
   return false;
 }
 
-// PTX §7.6.3 mbarrier.test_wait: non-blocking poll. Returns ready bit
+// PTX §7.6.3 mmbar.test_wait: non-blocking poll. Returns ready bit
 // without suspending the warp.
 bool Core::mbarrier_test_wait(uint64_t mbar_addr, uint32_t phase_token) {
   auto it = mbarriers_.find(mbar_addr);
@@ -1508,7 +1535,7 @@ bool Core::mbarrier_test_wait(uint64_t mbar_addr, uint32_t phase_token) {
   return (it->second.phase & 0x1u) != (phase_token & 0x1u);
 }
 
-// PTX §7.6.3 mbarrier.try_wait: bounded blocking wait. Behaves like wait()
+// PTX §7.6.3 mmbar.try_wait: bounded blocking wait. Behaves like wait()
 // but returns false (timeout) after `1 << timeout_bucket` cycles. CModel
 // approximation: behaves like wait() (no real timeout tracker), reports
 // timeout=false on first poll if not ready, lets caller re-issue.
@@ -1546,11 +1573,11 @@ uint32_t Core::cpabulk_tensor_load(uint32_t wid,
 
   advance_async_tensor_engine();
   auto wgid = arch_.warpgroup_id(wid);
-  auto result = tma_->cpabulk_tensor_load(tensor_map_addr,
+  auto async_id = next_async_id_++;
+  auto result = tma_->cpabulk_tensor_load(async_id,
+                                          tensor_map_addr,
                                           args_lmem_ptr,
                                           complete_tx);
-
-  auto async_id = next_async_id_++;
   AsyncTensorOp op{};
   op.async_id = async_id;
   op.type = AsyncTensorOpType::TmaLoad;
@@ -1558,16 +1585,11 @@ uint32_t Core::cpabulk_tensor_load(uint32_t wid,
   op.wgid = wgid;
   op.taddr = 0;
   op.issue_cycle = perf_stats_.cycles;
-  op.completed = true;        // direct copy completes synchronously for now
   op.payload_size_bytes = result.payload_size_bytes;
   op.tx_bound_mbar = result.tx_bound_mbar;
   op.tx_bytes = result.tx_bytes;
   async_tensor_ops_[async_id] = std::move(op);
   ++perf_stats_.tma_load_count;
-  // Fire the completion hook now so mbarrier_complete_tx + waiter resume
-  // both run (functional model; timing of the actual copy is approximated).
-  auto& stored = async_tensor_ops_[async_id];
-  on_async_tensor_op_completed(stored);
   return async_id;
 }
 
@@ -1583,21 +1605,17 @@ uint32_t Core::cpabulk_tensor_store(uint32_t wid,
 
   advance_async_tensor_engine();
   auto wgid = arch_.warpgroup_id(wid);
-  auto result = tma_->cpabulk_tensor_store(tensor_map_addr, args_lmem_ptr);
-
   auto async_id = next_async_id_++;
+  auto result = tma_->cpabulk_tensor_store(async_id, tensor_map_addr, args_lmem_ptr);
   AsyncTensorOp op{};
   op.async_id = async_id;
   op.type = AsyncTensorOpType::TmaStore;
   op.wid = wid;
   op.wgid = wgid;
   op.issue_cycle = perf_stats_.cycles;
-  op.completed = true;
   op.payload_size_bytes = result.payload_size_bytes;
   async_tensor_ops_[async_id] = std::move(op);
   ++perf_stats_.tma_store_count;
-  auto& stored = async_tensor_ops_[async_id];
-  on_async_tensor_op_completed(stored);
   return async_id;
 }
 
@@ -1719,7 +1737,7 @@ uint32_t Core::mbar_commit(uint32_t wid, uint64_t mbar_addr, uint32_t cta_mask) 
   if (it == mbarriers_.end() || !it->second.valid) {
     return 0;
   }
-  auto& barrier = it->second;
+  auto& mbar = it->second;
 
   uint32_t committed = 0;
   for (auto& entry : async_tensor_ops_) {
@@ -1736,9 +1754,9 @@ uint32_t Core::mbar_commit(uint32_t wid, uint64_t mbar_addr, uint32_t cta_mask) 
   }
 
   if (committed != 0) {
-    barrier.expected_arrival_count += committed;
-    barrier.pending_arrival_count  += committed;
-    mirror_mbarrier_to_lmem(mbar_addr, barrier);
+    mbar.expected_arrival_count += committed;
+    mbar.pending_arrival_count  += committed;
+    mirror_mbarrier_to_lmem(mbar_addr, mbar);
   }
   try_resume_fence_waiters();
   return committed;

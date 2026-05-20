@@ -426,7 +426,7 @@ void VpuUnit::tick() {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
 
 TcuUnit::TcuUnit(const SimContext& ctx, Core* core)
 	: FuncUnit(ctx, core, "tcu-unit")
@@ -441,4 +441,4 @@ TcuUnit::TcuUnit(const SimContext& ctx, Core* core)
 void TcuUnit::tick() {
 	// use tensor_unit
 }
-#endif
+//#endif

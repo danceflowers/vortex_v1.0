@@ -50,7 +50,7 @@ uint32_t tensor_map_total_bytes(const tensor_map_t& tmap) {
 
 // Resolve the global byte address for the requested tensor coordinates.
 uint64_t tensor_map_address(const tensor_map_t& tmap,
-                            const cpabulk_transfer_args_t& args) {
+                            const uint32_t coords[5]) {
   auto rank = tensor_map_rank(tmap);
   auto elem_bytes = Tma::element_type_bytes(tmap.element_type);
   if (elem_bytes == 0) {
@@ -63,9 +63,14 @@ uint64_t tensor_map_address(const tensor_map_t& tmap,
     if (stride == 0) {
       stride = (d == 0) ? elem_bytes : tmap.box_size[d - 1] * elem_bytes;
     }
-    address += static_cast<uint64_t>(args.coords[d]) * stride;
+    address += static_cast<uint64_t>(coords[d]) * stride;
   }
   return address;
+}
+
+uint32_t cache_line_window_bytes(uint64_t addr, uint32_t remaining) {
+  auto line_offset = static_cast<uint32_t>(addr & (MEM_BLOCK_SIZE - 1));
+  return std::min<uint32_t>(MEM_BLOCK_SIZE - line_offset, remaining);
 }
 
 } // namespace
@@ -78,17 +83,23 @@ Tma::Tma(const SimContext& ctx, const char* name, Core* core)
   , CacheReqOut(1, this)
   , CacheRspIn(1, this)
   , core_(core)
+  , next_cache_request_id_(1)
   , next_lmem_to_tmem_request_id_(1) {
   (void)name;
 }
 
 void Tma::reset() {
+  pending_cpabulk_transfers_.clear();
+  pending_cpabulk_cache_requests_.clear();
   pending_lmem_to_tmem_copies_.clear();
   completed_lmem_to_tmem_responses_.clear();
+  next_cache_request_id_ = 1;
   next_lmem_to_tmem_request_id_ = 1;
 }
 
 void Tma::tick() {
+  drain_cache_responses();
+  advance_cpabulk_transfer_ops();
   drain_tmem_responses();
   advance_lmem_to_tmem_copy_ops();
 }
@@ -122,7 +133,8 @@ uint32_t Tma::element_type_bytes(uint8_t element_type) {
   }
 }
 
-cpabulk_transfer_result_t Tma::cpabulk_tensor_load(uint64_t tensor_map_addr,
+cpabulk_transfer_result_t Tma::cpabulk_tensor_load(uint32_t async_id,
+                                                   uint64_t tensor_map_addr,
                                                    uint64_t args_lmem_ptr,
                                                    bool complete_tx) {
   if (!is_lmem_addr(args_lmem_ptr)) {
@@ -134,33 +146,27 @@ cpabulk_transfer_result_t Tma::cpabulk_tensor_load(uint64_t tensor_map_addr,
   cpabulk_transfer_args_t args = {};
   core_->lmem_read(&args, args_lmem_ptr, sizeof(args));
 
-  tensor_map_t tmap = {};
-  core_->dcache_read(&tmap, tensor_map_addr, sizeof(tmap));
-
-  auto total_bytes = tensor_map_total_bytes(tmap);
-  auto src_addr = tensor_map_address(tmap, args);
-
-  constexpr uint32_t kChunk = 64;
-  uint8_t buf[kChunk];
-  auto lmem_dst = static_cast<uint64_t>(args.smem_addr);
-  uint32_t copied = 0;
-  while (copied < total_bytes) {
-    auto take = std::min(kChunk, total_bytes - copied);
-    core_->dcache_read(buf, src_addr + copied, take);
-    core_->lmem_write(buf, lmem_dst + copied, take);
-    copied += take;
+  pending_cpabulk_transfer_t op{};
+  op.async_id = async_id;
+  op.tensor_map_addr = tensor_map_addr;
+  op.lmem_addr = static_cast<uint64_t>(args.smem_addr);
+  for (uint32_t dim = 0; dim < 5; ++dim) {
+    op.coords[dim] = args.coords[dim];
   }
+  if (complete_tx && args.mbar_addr != 0) {
+    op.tx_bound_mbar = static_cast<uint64_t>(args.mbar_addr);
+  }
+  pending_cpabulk_transfers_[async_id] = op;
 
   cpabulk_transfer_result_t result{};
-  result.payload_size_bytes = total_bytes;
-  if (complete_tx && args.mbar_addr != 0) {
-    result.tx_bound_mbar = static_cast<uint64_t>(args.mbar_addr);
-    result.tx_bytes = total_bytes;
+  if (op.tx_bound_mbar != 0) {
+    result.tx_bound_mbar = op.tx_bound_mbar;
   }
   return result;
 }
 
-cpabulk_transfer_result_t Tma::cpabulk_tensor_store(uint64_t tensor_map_addr,
+cpabulk_transfer_result_t Tma::cpabulk_tensor_store(uint32_t async_id,
+                                                    uint64_t tensor_map_addr,
                                                     uint64_t args_lmem_ptr) {
   if (!is_lmem_addr(args_lmem_ptr)) {
     throw std::runtime_error(
@@ -171,26 +177,151 @@ cpabulk_transfer_result_t Tma::cpabulk_tensor_store(uint64_t tensor_map_addr,
   cpabulk_transfer_args_t args = {};
   core_->lmem_read(&args, args_lmem_ptr, sizeof(args));
 
-  tensor_map_t tmap = {};
-  core_->dcache_read(&tmap, tensor_map_addr, sizeof(tmap));
-
-  auto total_bytes = tensor_map_total_bytes(tmap);
-  auto dst_addr = tensor_map_address(tmap, args);
-
-  constexpr uint32_t kChunk = 64;
-  uint8_t buf[kChunk];
-  auto lmem_src = static_cast<uint64_t>(args.smem_addr);
-  uint32_t copied = 0;
-  while (copied < total_bytes) {
-    auto take = std::min(kChunk, total_bytes - copied);
-    core_->lmem_read(buf, lmem_src + copied, take);
-    core_->dcache_write(buf, dst_addr + copied, take);
-    copied += take;
+  pending_cpabulk_transfer_t op{};
+  op.async_id = async_id;
+  op.is_store = true;
+  op.tensor_map_addr = tensor_map_addr;
+  op.lmem_addr = static_cast<uint64_t>(args.smem_addr);
+  for (uint32_t dim = 0; dim < 5; ++dim) {
+    op.coords[dim] = args.coords[dim];
   }
+  pending_cpabulk_transfers_[async_id] = op;
 
   cpabulk_transfer_result_t result{};
-  result.payload_size_bytes = total_bytes;
   return result;
+}
+
+void Tma::issue_cache_timing_request(pending_cpabulk_transfer_t& op,
+                                     cpabulk_cache_stage_t stage,
+                                     uint64_t addr,
+                                     uint32_t offset,
+                                     uint32_t bytes) {
+  auto request_id = next_cache_request_id_++;
+  pending_cpabulk_cache_request_t request{};
+  request.async_id = op.async_id;
+  request.stage = stage;
+  request.offset = offset;
+  request.bytes = bytes;
+  pending_cpabulk_cache_requests_[request_id] = request;
+
+  MemReq mem_req{};
+  mem_req.addr = addr;
+  mem_req.write = op.is_store && stage == cpabulk_cache_stage_t::Payload;
+  mem_req.write_response = mem_req.write;
+  mem_req.type = AddrType::Global;
+  mem_req.tag = static_cast<uint32_t>(request_id);
+  mem_req.cid = core_->id();
+  mem_req.uuid = request_id;
+  CacheReqOut.at(0).push(mem_req, 0);
+  ++op.inflight_cache_requests;
+}
+
+void Tma::drain_cache_responses() {
+  auto& response_port = CacheRspIn.at(0);
+  if (response_port.empty()) {
+    return;
+  }
+
+  auto response = response_port.front();
+  response_port.pop();
+
+  auto request_it = pending_cpabulk_cache_requests_.find(response.tag);
+  if (request_it == pending_cpabulk_cache_requests_.end()) {
+    return;
+  }
+
+  auto request = request_it->second;
+  pending_cpabulk_cache_requests_.erase(request_it);
+
+  auto op_it = pending_cpabulk_transfers_.find(request.async_id);
+  if (op_it == pending_cpabulk_transfers_.end()) {
+    return;
+  }
+
+  auto& op = op_it->second;
+  if (op.inflight_cache_requests != 0) {
+    --op.inflight_cache_requests;
+  }
+
+  if (request.stage == cpabulk_cache_stage_t::Descriptor) {
+    op.descriptor_completed_bytes += request.bytes;
+    if (!op.descriptor_ready
+     && op.descriptor_completed_bytes >= sizeof(tensor_map_t)) {
+      tensor_map_t tmap = {};
+      core_->dcache_read(&tmap, op.tensor_map_addr, sizeof(tmap));
+      op.total_bytes = tensor_map_total_bytes(tmap);
+      op.global_addr = tensor_map_address(tmap, op.coords);
+      op.descriptor_ready = true;
+    }
+    return;
+  }
+
+  uint8_t buf[MEM_BLOCK_SIZE];
+  if (op.is_store) {
+    core_->lmem_read(buf, op.lmem_addr + request.offset, request.bytes);
+    core_->dcache_write(buf, op.global_addr + request.offset, request.bytes);
+  } else {
+    core_->dcache_read(buf, op.global_addr + request.offset, request.bytes);
+    core_->lmem_write(buf, op.lmem_addr + request.offset, request.bytes);
+  }
+  op.payload_completed_bytes += request.bytes;
+}
+
+void Tma::advance_cpabulk_transfer_ops() {
+  if (pending_cpabulk_transfers_.empty()) {
+    return;
+  }
+
+  constexpr uint32_t kMaxInflightCacheRequests = 8;
+  std::vector<uint32_t> completed_ops;
+
+  for (auto& entry : pending_cpabulk_transfers_) {
+    auto& op = entry.second;
+
+    if (!op.descriptor_ready) {
+      if (op.descriptor_next_offset < sizeof(tensor_map_t)
+       && op.inflight_cache_requests < kMaxInflightCacheRequests) {
+        auto addr = op.tensor_map_addr + op.descriptor_next_offset;
+        auto remaining = static_cast<uint32_t>(sizeof(tensor_map_t) - op.descriptor_next_offset);
+        auto bytes = cache_line_window_bytes(addr, remaining);
+        issue_cache_timing_request(op,
+                                   cpabulk_cache_stage_t::Descriptor,
+                                   addr,
+                                   op.descriptor_next_offset,
+                                   bytes);
+        op.descriptor_next_offset += bytes;
+      }
+      continue;
+    }
+
+    if (op.payload_completed_bytes >= op.total_bytes) {
+      AsyncOpCompletionOut.push({
+        op.async_id,
+        op.tx_bound_mbar,
+        op.tx_bound_mbar != 0 ? op.total_bytes : 0,
+        op.total_bytes
+      }, 0);
+      completed_ops.push_back(entry.first);
+      continue;
+    }
+
+    if (op.payload_next_offset < op.total_bytes
+     && op.inflight_cache_requests < kMaxInflightCacheRequests) {
+      auto addr = op.global_addr + op.payload_next_offset;
+      auto remaining = op.total_bytes - op.payload_next_offset;
+      auto bytes = cache_line_window_bytes(addr, remaining);
+      issue_cache_timing_request(op,
+                                 cpabulk_cache_stage_t::Payload,
+                                 addr,
+                                 op.payload_next_offset,
+                                 bytes);
+      op.payload_next_offset += bytes;
+    }
+  }
+
+  for (auto async_id : completed_ops) {
+    pending_cpabulk_transfers_.erase(async_id);
+  }
 }
 
 bool Tma::issue_lmem_to_tmem_copy(uint32_t async_id,
@@ -329,9 +460,24 @@ void Tma::advance_lmem_to_tmem_copy_ops() {
 }
 
 void Tma::dump_debug_state(std::ostream& os) const {
-  os << "[Tma] lmem_to_tmem_pending=" << pending_lmem_to_tmem_copies_.size()
+  os << "[Tma] cpbulk_pending=" << pending_cpabulk_transfers_.size()
+     << " cpbulk_cache_reqs=" << pending_cpabulk_cache_requests_.size()
+     << " lmem_to_tmem_pending=" << pending_lmem_to_tmem_copies_.size()
      << " completed_tmem_responses=" << completed_lmem_to_tmem_responses_.size()
      << "\n";
+  for (const auto& entry : pending_cpabulk_transfers_) {
+    const auto& op = entry.second;
+    os << "  cpbulk async_id=" << op.async_id
+       << " is_store=" << op.is_store
+       << " descriptor_ready=" << op.descriptor_ready
+       << " gaddr=0x" << std::hex << op.global_addr << std::dec
+       << " lmem=0x" << std::hex << op.lmem_addr << std::dec
+       << " tx_mbar=0x" << std::hex << op.tx_bound_mbar << std::dec
+       << " desc=" << op.descriptor_completed_bytes << "/" << sizeof(tensor_map_t)
+       << " payload=" << op.payload_completed_bytes << "/" << op.total_bytes
+       << " inflight=" << op.inflight_cache_requests
+       << "\n";
+  }
   for (const auto& entry : pending_lmem_to_tmem_copies_) {
     const auto& op = entry.second;
     os << "  async_id=" << op.async_id

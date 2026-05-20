@@ -160,12 +160,12 @@ public:
   std::vector<SimPort<instr_trace_t*>> Inputs;
   // Delayed instruction output ports, one per issue lane.
 	std::vector<SimPort<instr_trace_t*>> Outputs;
-#ifdef EXT_TCU_ENABLE
+//#ifdef EXT_TCU_ENABLE
   // Packet-level boundary between TensorUnit and TmemSystem.
   SimPort<TensorMemPortReq> TensorMemReqOut;           // TMEM read/write requests.
   SimPort<TensorMemPortRsp> TensorMemRspIn;            // TMEM read/write responses.
   SimPort<TensorAsyncOpCompletion> TensorAsyncOpCompletionOut; // Async completion events.
-#endif
+//#endif
 
   TensorUnit(const SimContext &ctx, const char* name, const Arch& arch, Core* core);
   virtual ~TensorUnit();
