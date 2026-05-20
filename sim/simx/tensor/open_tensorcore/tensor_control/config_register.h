@@ -18,7 +18,7 @@ struct Config {
 struct TensorCoreMeta {
     uint32_t wgid = 0;                             // Warpgroup ID
     uint32_t async_id = 0;                          // Async operation tracking ID.
-    uint32_t a_slot_id = 0;                         // A operand slot or K phase.
+    uint32_t k_phase_id = 0;                        // K-phase index within a macro MMA.
     uint32_t b_slot_id = 0;                         // B operand slot.
     uint32_t c_slot_id = 0;                         // C operand slot.
     uint32_t c_subtile_id = 0;                      // Output subtile index.

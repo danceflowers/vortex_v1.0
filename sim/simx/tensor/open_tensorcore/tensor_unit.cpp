@@ -711,7 +711,7 @@ private:
     meta.wgid = op.wgid;
     meta.async_id = op.async_id;
     meta.c_subtile_id = subtile;
-    meta.a_slot_id = k_phase;
+    meta.k_phase_id = k_phase;
     meta.in_prec = PREC_FP9;
     meta.out_prec = fmt_to_precision(op.cmd.fmt_d);
     meta.c_prec = fmt_to_precision(op.cmd.fmt_c);
@@ -746,14 +746,14 @@ private:
     TensorCoreRetire retired{};
     if (tensorcore_.pop_retired(&retired)) {
       uint32_t subtile = retired.meta.c_subtile_id;
-      if (retired.meta.a_slot_id == 0) {
+      if (retired.meta.k_phase_id == 0) {
         dmem_.write_subtile_fp22(subtile, retired.fp22_out);
       } else {
         dmem_.accumulate_subtile_fp22(subtile, retired.fp22_out);
       }
       ++perf_stats_.retired_primitive_tiles;
       perf_stats_.epilogue_begin_cycle = perf_stats_.latency;
-      if (retired.meta.a_slot_id == (kKPhases - 1)) {
+      if (retired.meta.k_phase_id == (kKPhases - 1)) {
         ++op.final_retired_subtiles;
       }
     }

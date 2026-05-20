@@ -131,9 +131,9 @@ uint32_t line_chunk_bank(uint32_t logical_line,
                          uint32_t bank_swizzle_base_stride,
                          uint32_t packet_lanes) {
   auto physical_row = logical_line / 2;
-  auto line_slot = logical_line % 2;
+  auto line_parity = logical_line % 2;
   auto base = (physical_row * bank_swizzle_base_stride) % physical_bank_count;
-  return (base + line_slot * packet_lanes + chunk_idx) % physical_bank_count;
+  return (base + line_parity * packet_lanes + chunk_idx) % physical_bank_count;
 }
 
 uint32_t packet_lane_bank(uint32_t logical_col,
