@@ -98,7 +98,7 @@ Core::Core(const SimContext& ctx,
   tensor_unit_->TensorAsyncOpCompletionOut.bind(&tensor_async_op_completion_in_);
   tma_->AsyncOpCompletionOut.bind(&tma_async_op_completion_in_);
   tmem_system_->AsyncOpCompletionOut.bind(&tmem_system_async_op_completion_in_);
-#endif
+//#endif
 
   for (uint32_t iw = 0; iw < ISSUE_WIDTH; ++iw) {
     operands_.at(iw) = Operands::Create(this);
@@ -185,7 +185,7 @@ Core::Core(const SimContext& ctx,
 #endif
 //#ifdef EXT_TCU_ENABLE
   dispatchers_.at((int)FUType::TCU) = SimPlatform::instance().create_object<Dispatcher>(this, 2, NUM_TCU_BLOCKS, NUM_TCU_LANES);
-#endif
+//#endif
 
   // initialize execute units
   func_units_.at((int)FUType::ALU) = SimPlatform::instance().create_object<AluUnit>(this);
@@ -197,7 +197,7 @@ Core::Core(const SimContext& ctx,
 #endif
 //#ifdef EXT_TCU_ENABLE
   func_units_.at((int)FUType::TCU) = SimPlatform::instance().create_object<TcuUnit>(this);
-#endif
+//#endif
 
   // bind commit arbiters
   for (uint32_t iw = 0; iw < ISSUE_WIDTH; ++iw) {
@@ -261,7 +261,7 @@ void Core::reset() {
   last_tensor_completion_drain_cycle_ = std::numeric_limits<uint64_t>::max();
   last_tma_completion_drain_cycle_ = std::numeric_limits<uint64_t>::max();
   last_tcgen05_ldst_advance_cycle_ = std::numeric_limits<uint64_t>::max();
-#endif
+//#endif
 
   perf_stats_ = PerfStats();
 }
@@ -290,7 +290,7 @@ void Core::tick() {
     this->dump_tensor_debug_state(std::cerr);
     std::abort();
   }
-#endif
+//#endif
 
   ++perf_stats_.cycles;
   DPN(2, std::flush);
@@ -368,9 +368,9 @@ void Core::dump_tensor_debug_state(std::ostream& os) const {
     tensor_unit_->dump_debug_state(os);
   }
   os << "==== tensor-debug-state end ====\n";
-#else
-  (void)os;
-#endif
+//#else
+//  (void)os;
+//#endif
 }
 
 void Core::schedule() {
@@ -507,7 +507,7 @@ void Core::issue() {
         #endif
         //#ifdef EXT_TCU_ENABLE
           case FUType::TCU: ++perf_stats_.scrb_tcu; break;
-        #endif
+        //#endif
           default: assert(false);
           }
         }
@@ -573,7 +573,7 @@ void Core::commit() {
         continue;
       }
     }
-#endif
+//#endif
 
     // update scoreboard
     if (trace->eop) {
@@ -1770,4 +1770,4 @@ bool Core::tcgen05_wait_st(uint32_t wid) {
   return wait_for_inflight_tcgen05_ld_st(wid, true);
 }
 
-#endif
+//#endif

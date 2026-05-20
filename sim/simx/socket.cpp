@@ -97,9 +97,9 @@ Socket::Socket(const SimContext& ctx,
       }
       tma_l2_arb->ReqOut.at(0).bind(&this->mem_req_ports.at(i));
       this->mem_rsp_ports.at(i).bind(&tma_l2_arb->RspOut.at(0));
-#else
-      req_source->bind(&this->mem_req_ports.at(i));
-      this->mem_rsp_ports.at(i).bind(rsp_sink);
+//#else
+//      req_source->bind(&this->mem_req_ports.at(i));
+//      this->mem_rsp_ports.at(i).bind(rsp_sink);
 //#endif
     };
 
