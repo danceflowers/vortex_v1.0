@@ -447,33 +447,45 @@ struct TileHostUtils {
                                                  uint32_t fp22_out[8][8]) {
     TensorCoreTop tc;
     uint32_t c_raw[8][8] = {};
+    uint32_t phase_out[2][8][8] = {};
 
     g_cfg.precisions.clear();
     g_cfg.out_precisions.clear();
     g_cfg.precisions.push_back(PREC_FP9);
     g_cfg.out_precisions.push_back(out_precision());
 
-    TensorCoreMeta meta{};
-    meta.in_prec = PREC_FP9;
-    meta.out_prec = out_precision();
-    meta.c_prec = out_precision();
-    meta.c_bypass_is_fp22 = 1;
-    meta.valid = true;
-
     tc.reset();
-    // 非输出驻留模式: C 通过管线透传, push_uop 传入 c_raw
-    tc.set_circulating(false);
-    tc.push_uop(a_in, b_in, c_raw, meta);
+    for (uint32_t phase = 0; phase < 2; ++phase) {
+      TensorCoreMeta meta{};
+      meta.accum_phase_id = phase;
+      meta.valid = true;
+      while (!tc.ready(true)) {
+        tc.tick(true);
+      }
+      tc.push_uop(a_in, b_in, c_raw, meta);
 
-    // 推进流水线直到结果输出
-    uint32_t spin_limit = 10000;
-    while (spin_limit-- > 0 && tc.jobs_completed < tc.set_jobs) {
-      tc.tick(true);
+      TensorCoreRetire retired{};
+      uint32_t spin_limit = 10000;
+      while (spin_limit-- > 0) {
+        tc.tick(true);
+        if (tc.pop_retired(&retired)) {
+          break;
+        }
+      }
+      if (!retired.valid) {
+        std::abort();
+      }
+      for (uint32_t i = 0; i < 8; ++i) {
+        for (uint32_t j = 0; j < 8; ++j) {
+          phase_out[phase][i][j] = retired.fp22_out[i][j];
+        }
+      }
     }
 
     for (uint32_t i = 0; i < 8; ++i) {
       for (uint32_t j = 0; j < 8; ++j) {
-        fp22_out[i][j] = tc.fp22_out[i][j];
+        fp22_out[i][j] = add_fp22_raw(phase_out[0][i][j],
+                                      phase_out[1][i][j]);
       }
     }
   }

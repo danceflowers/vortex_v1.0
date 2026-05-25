@@ -91,8 +91,8 @@ public:
   static constexpr uint32_t kPacketLanes = kPacketBytes / kPhysicalBankBytes;
   // Phase-3.3.3: expand logical view to 128 lanes × 512 cols (1-byte cell).
   // Total = 128 × 512 = 64 KB. Banks / ports / swizzle unchanged.
-  static constexpr uint32_t kLogicalLines = 512;   // was 128 (cols per lane)
-  static constexpr uint32_t kPayloadCols = 128;    // was 64  (lanes)
+  static constexpr uint32_t kLogicalLines = 128;   // was 128 (cols per lane)
+  static constexpr uint32_t kPayloadCols = 512;    // was 64  (lanes)
   static constexpr uint32_t kMetaCols = 0;
   static constexpr uint32_t kMetaColBase = kPayloadCols;
   static constexpr uint32_t kNumCols = kPayloadCols + kMetaCols;

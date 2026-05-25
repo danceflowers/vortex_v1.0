@@ -667,23 +667,10 @@ bool Core::lookup_tmem_allocation(uint32_t taddr, const TmemAllocation** allocat
   return tmem_system_->lookup_allocation(taddr, allocation);
 }
 
-WarpMask Core::warpgroup_mask(uint32_t wgid) const {
-  WarpMask mask;
-  auto first = arch_.warpgroup_first_wid(wgid);
-  for (uint32_t lane = 0; lane < arch_.warpgroup_size(); ++lane) {
-    auto wid = first + lane;
-    if (wid < arch_.num_warps()) {
-      mask.set(wid);
-    }
-  }
-  return mask;
-}
-
 bool Core::has_pending_async_ops(uint32_t wid, bool committed_only) const {
-  auto wgid = arch_.warpgroup_id(wid);
   for (const auto& entry : async_tensor_ops_) {
     const auto& op = entry.second;
-    if (op.wgid != wgid || op.completed) {
+    if (op.wid != wid || op.completed) {
       continue;
     }
     if (committed_only && !op.committed) {
@@ -698,10 +685,9 @@ bool Core::has_pending_async_ops(uint32_t wid, bool committed_only) const {
 }
 
 bool Core::has_pending_local_tensor_ops(uint32_t wid) const {
-  auto wgid = arch_.warpgroup_id(wid);
   for (const auto& entry : async_tensor_ops_) {
     const auto& op = entry.second;
-    if (op.wgid != wgid || op.completed) {
+    if (op.wid != wid || op.completed) {
       continue;
     }
     switch (op.type) {
@@ -736,22 +722,12 @@ void Core::try_resume_fence_waiters() {
     if (!fence_wait.active) {
       continue;
     }
-    auto wgid = arch_.warpgroup_id(wid);
     bool ready = (fence_wait.mode == TcuFenceMode::After)
               ? !has_pending_async_ops(wid, true)
               : !has_pending_async_ops(wid, false);
     if (ready) {
-      auto mask = warpgroup_mask(wgid);
-      for (uint32_t gwid = 0; gwid < arch_.num_warps(); ++gwid) {
-        if (mask.test(gwid)) {
-          fence_wait_states_.at(gwid).active = false;
-        }
-      }
-      for (uint32_t gwid = 0; gwid < arch_.num_warps(); ++gwid) {
-        if (mask.test(gwid)) {
-          emulator_.resume(gwid);
-        }
-      }
+      fence_wait_states_.at(wid).active = false;
+      emulator_.resume(wid);
     }
   }
 }
@@ -1007,13 +983,11 @@ uint32_t Core::launch_lmem_to_tmem_copy(uint32_t wid,
     return 0;
   }
 
-  auto wgid = arch_.warpgroup_id(wid);
   auto async_id = next_async_id_++;
   AsyncTensorOp async_op{};
   async_op.async_id = async_id;
   async_op.type = AsyncTensorOpType::TmemCopy;
   async_op.wid = wid;
-  async_op.wgid = wgid;
   async_op.taddr = col_base;
   async_op.issue_cycle = perf_stats_.cycles;
   async_op.payload_size_bytes = total_bytes;
@@ -1022,7 +996,6 @@ uint32_t Core::launch_lmem_to_tmem_copy(uint32_t wid,
   tmem_system_->set_payload_ready(col_base, false, true);
   if (!tma_->issue_lmem_to_tmem_copy(async_id,
                                      wid,
-                                     wgid,
                                      col_base,
                                      col_span,
                                      lmem_addr,
@@ -1069,7 +1042,6 @@ uint32_t Core::tmem_shift(uint32_t wid, uint32_t taddr, uint32_t control_word) {
     throw std::runtime_error(
       "TMEM_SHIFT non-zero control word is not part of the PTX-only model");
   }
-  auto wgid = arch_.warpgroup_id(wid);
   TmemAllocation* allocation = nullptr;
   if (!lookup_tmem_allocation(taddr, &allocation)) {
     return 0;
@@ -1080,24 +1052,21 @@ uint32_t Core::tmem_shift(uint32_t wid, uint32_t taddr, uint32_t control_word) {
   op.async_id = async_id;
   op.type = AsyncTensorOpType::TmemShift;
   op.wid = wid;
-  op.wgid = wgid;
   op.taddr = taddr;
   op.issue_cycle = perf_stats_.cycles;
   async_tensor_ops_[async_id] = std::move(op);
   execute_cycle_tmem_shift_reserved_taddrs_.insert(taddr);
-  (void)tmem_system_->issue_shift(async_id, wid, wgid, taddr, perf_stats_.cycles);
+  (void)tmem_system_->issue_shift(async_id, wid, taddr, perf_stats_.cycles);
   return async_id;
 }
 
 uint32_t Core::mma_load_async_issue(uint32_t wid, uint32_t taddr, uint32_t idesc) {
   advance_async_tensor_engine();
-  auto wgid = arch_.warpgroup_id(wid);
   auto async_id = next_async_id_++;
   AsyncTensorOp op{};
   op.async_id = async_id;
   op.type = AsyncTensorOpType::MmaLoad;
   op.wid = wid;
-  op.wgid = wgid;
   op.taddr = taddr;
   op.idesc = idesc;
   op.issue_cycle = perf_stats_.cycles;
@@ -1107,13 +1076,11 @@ uint32_t Core::mma_load_async_issue(uint32_t wid, uint32_t taddr, uint32_t idesc
 
 uint32_t Core::mma_store_async_issue(uint32_t wid, uint32_t taddr, uint32_t idesc) {
   advance_async_tensor_engine();
-  auto wgid = arch_.warpgroup_id(wid);
   auto async_id = next_async_id_++;
   AsyncTensorOp op{};
   op.async_id = async_id;
   op.type = AsyncTensorOpType::MmaStore;
   op.wid = wid;
-  op.wgid = wgid;
   op.taddr = taddr;
   op.idesc = idesc;
   op.issue_cycle = perf_stats_.cycles;
@@ -1123,13 +1090,11 @@ uint32_t Core::mma_store_async_issue(uint32_t wid, uint32_t taddr, uint32_t ides
 
 uint32_t Core::wmma_async_issue(uint32_t wid) {
   advance_async_tensor_engine();
-  auto wgid = arch_.warpgroup_id(wid);
   auto async_id = next_async_id_++;
   AsyncTensorOp op{};
   op.async_id = async_id;
   op.type = AsyncTensorOpType::Wmma;
   op.wid = wid;
-  op.wgid = wgid;
   op.issue_cycle = perf_stats_.cycles;
   async_tensor_ops_[async_id] = std::move(op);
   return async_id;
@@ -1498,8 +1463,6 @@ void Core::mbarrier_complete_tx(uint64_t mbar_addr, uint32_t tx_bytes) {
 // the warp); returns true once the phase has advanced.
 bool Core::mbarrier_wait(uint32_t wid, uint64_t mbar_addr, uint32_t phase_token) {
   advance_async_tensor_engine();
-  auto wgid = arch_.warpgroup_id(wid);
-  auto group_mask = warpgroup_mask(wgid);
   auto it = mbarriers_.find(mbar_addr);
   if (it == mbarriers_.end() || !it->second.valid) {
     return true;
@@ -1508,19 +1471,11 @@ bool Core::mbarrier_wait(uint32_t wid, uint64_t mbar_addr, uint32_t phase_token)
   // Phase parity comparison (PTX semantics): if current parity bit differs
   // from input token, the wait is satisfied.
   if ((mbar.phase & 0x1u) != (phase_token & 0x1u)) {
-    for (uint32_t gwid = 0; gwid < arch_.num_warps(); ++gwid) {
-      if (group_mask.test(gwid)) {
-        mbarrier_wait_targets_.at(gwid).erase(mbar_addr);
-      }
-    }
+    mbarrier_wait_targets_.at(wid).erase(mbar_addr);
     return true;
   }
-  for (uint32_t gwid = 0; gwid < arch_.num_warps(); ++gwid) {
-    if (group_mask.test(gwid)) {
-      mbarrier_wait_targets_.at(gwid)[mbar_addr] = phase_token;
-    }
-  }
-  mbar.waiters_bitmap |= group_mask;
+  mbarrier_wait_targets_.at(wid)[mbar_addr] = phase_token;
+  mbar.waiters_bitmap.set(wid);
   ++perf_stats_.stall_wait_barrier;
   return false;
 }
@@ -1572,7 +1527,6 @@ uint32_t Core::cpabulk_tensor_load(uint32_t wid,
   }
 
   advance_async_tensor_engine();
-  auto wgid = arch_.warpgroup_id(wid);
   auto async_id = next_async_id_++;
   auto result = tma_->cpabulk_tensor_load(async_id,
                                           tensor_map_addr,
@@ -1582,7 +1536,6 @@ uint32_t Core::cpabulk_tensor_load(uint32_t wid,
   op.async_id = async_id;
   op.type = AsyncTensorOpType::TmaLoad;
   op.wid = wid;
-  op.wgid = wgid;
   op.taddr = 0;
   op.issue_cycle = perf_stats_.cycles;
   op.payload_size_bytes = result.payload_size_bytes;
@@ -1604,14 +1557,12 @@ uint32_t Core::cpabulk_tensor_store(uint32_t wid,
   }
 
   advance_async_tensor_engine();
-  auto wgid = arch_.warpgroup_id(wid);
   auto async_id = next_async_id_++;
   auto result = tma_->cpabulk_tensor_store(async_id, tensor_map_addr, args_lmem_ptr);
   AsyncTensorOp op{};
   op.async_id = async_id;
   op.type = AsyncTensorOpType::TmaStore;
   op.wid = wid;
-  op.wgid = wgid;
   op.issue_cycle = perf_stats_.cycles;
   op.payload_size_bytes = result.payload_size_bytes;
   async_tensor_ops_[async_id] = std::move(op);
@@ -1702,7 +1653,6 @@ bool Core::tmem_cp(uint32_t wid,
 // Body inlined from former Core::tc_fence (now deleted).
 bool Core::mbar_fence(uint32_t wid, TcuFenceMode mode) {
   advance_async_tensor_engine();
-  auto wgid = arch_.warpgroup_id(wid);
   if (mode == TcuFenceMode::Before) {
     // In-order warp issue already preserves relative ordering before a
     // following thread sync.
@@ -1712,27 +1662,19 @@ bool Core::mbar_fence(uint32_t wid, TcuFenceMode mode) {
   if (!has_pending_async_ops(wid, true)) {
     return true;
   }
-  auto mask = warpgroup_mask(wgid);
-  for (uint32_t gwid = 0; gwid < arch_.num_warps(); ++gwid) {
-    if (!mask.test(gwid)) {
-      continue;
-    }
-    auto& wait_state = fence_wait_states_.at(gwid);
-    wait_state.active = true;
-    wait_state.mode = mode;
-  }
+  auto& wait_state = fence_wait_states_.at(wid);
+  wait_state.active = true;
+  wait_state.mode = mode;
   ++perf_stats_.stall_wait_barrier;
   return false;
 }
 
-// tcgen05.commit (PTX §9.7.16.5.7): registers all currently inflight
-// tcgen05.async ops in this warpgroup to the mbarrier at `mbar_addr`. Each
-// registered op will trigger ONE mbarrier_arrive on completion (NOT a
-// tx_count update). Body inlined from former Core::tc_commit (now deleted).
+// tcgen05.commit (PTX §9.7.16.5.7): registers this warp's currently inflight
+// tcgen05.async ops to the mbarrier at `mbar_addr`. Each registered op will
+// trigger ONE mbarrier_arrive on completion (NOT a tx_count update).
 uint32_t Core::mbar_commit(uint32_t wid, uint64_t mbar_addr, uint32_t cta_mask) {
   (void)cta_mask; // Vortex single-cluster: cta_mask broadcast is no-op.
   advance_async_tensor_engine();
-  auto wgid = arch_.warpgroup_id(wid);
   auto it = mbarriers_.find(mbar_addr);
   if (it == mbarriers_.end() || !it->second.valid) {
     return 0;
@@ -1742,7 +1684,7 @@ uint32_t Core::mbar_commit(uint32_t wid, uint64_t mbar_addr, uint32_t cta_mask) 
   uint32_t committed = 0;
   for (auto& entry : async_tensor_ops_) {
     auto& op = entry.second;
-    if (op.wgid != wgid || op.completed || op.committed) {
+    if (op.wid != wid || op.completed || op.committed) {
       continue;
     }
     op.committed = true;

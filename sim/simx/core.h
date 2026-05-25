@@ -466,7 +466,6 @@ private:
     uint32_t async_id = 0;
     AsyncTensorOpType type = AsyncTensorOpType::TmaLoad;
     uint32_t wid = 0;
-    uint32_t wgid = 0;
     uint32_t taddr = 0;
     uint32_t idesc = 0;
     uint64_t issue_cycle = 0;
@@ -560,7 +559,6 @@ private:
   void advance_tcgen05_ldst_async_ops();
   void on_async_tensor_op_completed(AsyncTensorOp& op);
   void resume_async_waiters(uint32_t async_id);
-  WarpMask warpgroup_mask(uint32_t wgid) const;
   void try_resume_fence_waiters();
   bool has_pending_tcgen05_ldst(uint32_t wid, bool wait_store) const;
   void try_resume_tcgen05_ldst_waiters();

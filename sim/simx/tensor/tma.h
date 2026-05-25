@@ -76,7 +76,6 @@ public:
   // Start an asynchronous LMEM -> TMEM packet copy used by tcgen05.cp.
   bool issue_lmem_to_tmem_copy(uint32_t async_id,
                                uint32_t wid,
-                               uint32_t wgid,
                                uint32_t col_base,
                                uint32_t col_span,
                                uint64_t lmem_addr,
@@ -124,7 +123,6 @@ private:
   struct pending_lmem_to_tmem_copy_t {
     uint32_t async_id = 0;
     uint32_t wid = 0;
-    uint32_t wgid = 0;
     uint32_t col_base = 0;
     uint32_t col_span = 0;
     uint64_t lmem_addr = 0;

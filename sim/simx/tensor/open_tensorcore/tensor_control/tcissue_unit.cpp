@@ -138,7 +138,6 @@ void tcissue_unit::issue_mma_load(
     for (uint32_t line = 0; line < AMem::fill_lines(); ++line) {
       tud::MemUop op{};
       op.kind = tud::MemUop::Kind::FillA;
-      op.wgid = arch.warpgroup_id(wid);
       op.line_idx = line;
       op.taddr = taddr;
       op.window_id = args.window_id;
@@ -162,7 +161,6 @@ void tcissue_unit::issue_mma_load(
     for (uint32_t line = 0; line < BMem::fill_lines(); ++line) {
       tud::MemUop op{};
       op.kind = tud::MemUop::Kind::FillB;
-      op.wgid = arch.warpgroup_id(wid);
       op.line_idx = line;
       op.taddr = taddr;
       op.window_id = args.window_id;
@@ -182,7 +180,6 @@ void tcissue_unit::issue_mma_load(
     for (uint32_t sub = 0; sub < CMem::fill_subtiles(fmt); ++sub) {
       tud::MemUop op{};
       op.kind = tud::MemUop::Kind::FillC;
-      op.wgid = arch.warpgroup_id(wid);
       op.line_idx = sub;
       op.taddr = taddr;
       op.window_id = args.window_id;
@@ -254,7 +251,6 @@ void tcissue_unit::issue_mma_store(
 
   tud::MemUop op{};
   op.kind = tud::MemUop::Kind::StoreC;
-  op.wgid = arch.warpgroup_id(wid);
   op.line_idx = 0;
   op.taddr = taddr;
   op.window_id = args.window_id;
@@ -305,7 +301,7 @@ void tcissue_unit::issue_mma_store(
 //    || nullptr == prev_or || nullptr == perf_stats) {
 //     return;
 //   }
-//   auto wgid = arch.warpgroup_id(wid);
+//   auto issue_wid = wid;
 
 //   if (!use_open_tensorcore(fmt_a, fmt_b, fmt_c)) {
 //     if (trace_data) { trace_data->retry = true; }
@@ -357,7 +353,7 @@ void tcissue_unit::issue_mma_store(
 
 //   bool ws = (args.ws != 0);
 //   tud::PendingWmmaJob wmma_job{};
-//   wmma_job.wgid = wgid;
+//   wmma_job.wid = issue_wid;
 //   wmma_job.fmt_a = fmt_a;
 //   wmma_job.fmt_b = fmt_b;
 //   wmma_job.fmt_c = fmt_c;
@@ -575,11 +571,10 @@ void tcissue_unit::issue_tcu_mma_uop(
 
   // Build metadata and issue to TensorCore.
   TensorCoreMeta meta{};
-  meta.wgid = job.wgid;
+  meta.wid = active_wmma_job->wid;
   meta.async_id = job.async_id;
   meta.c_subtile_id = c_subtile_id;
   // meta.valid = true;
-  meta.out_prec = tud::map_out_precision(cmem_state->fmt_d);
 
 
   tensorcore->push_uop(a_block, b_block, c_bypass, meta);

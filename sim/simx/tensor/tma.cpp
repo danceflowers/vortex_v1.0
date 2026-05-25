@@ -326,7 +326,6 @@ void Tma::advance_cpabulk_transfer_ops() {
 
 bool Tma::issue_lmem_to_tmem_copy(uint32_t async_id,
                                   uint32_t wid,
-                                  uint32_t wgid,
                                   uint32_t col_base,
                                   uint32_t col_span,
                                   uint64_t lmem_addr,
@@ -339,7 +338,6 @@ bool Tma::issue_lmem_to_tmem_copy(uint32_t async_id,
   pending_lmem_to_tmem_copy_t op{};
   op.async_id = async_id;
   op.wid = wid;
-  op.wgid = wgid;
   op.col_base = col_base;
   op.col_span = col_span;
   op.lmem_addr = lmem_addr;
@@ -482,7 +480,6 @@ void Tma::dump_debug_state(std::ostream& os) const {
     const auto& op = entry.second;
     os << "  async_id=" << op.async_id
        << " wid=" << op.wid
-       << " wgid=" << op.wgid
        << " col_base=" << op.col_base
        << " col_span=" << op.col_span
        << " cursor=" << op.cursor

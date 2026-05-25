@@ -16,13 +16,10 @@ inline void load_inputs(TensorCoreTop* sim,
   uint32_t zero_operand1[TensorCoreTop::M][TensorCoreTop::N] = {};
   uint32_t fp22_c[TensorCoreTop::M][TensorCoreTop::N] = {};
   TensorCoreMeta meta{};
-  meta.in_prec = g_cfg.precisions.empty() ? PREC_FP9 : g_cfg.precisions.at(0);
-  meta.out_prec = g_cfg.out_precisions.empty() ? PREC_FP16 : g_cfg.out_precisions.at(0);
-  meta.c_prec = meta.out_prec;
-  meta.c_bypass_is_fp22 = 1;
+  meta.valid = true;
   for (int i = 0; i < TensorCoreTop::M; ++i) {
     for (int j = 0; j < TensorCoreTop::N; ++j) {
-      fp22_c[i][j] = convert_c_to_fp22(c[i][j], meta.c_prec);
+      fp22_c[i][j] = convert_c_to_fp22(c[i][j], PREC_FP16);
     }
   }
   sim->push_uop(a, b, fp22_c, meta);

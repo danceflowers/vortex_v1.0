@@ -480,11 +480,6 @@ PrimitiveFp22 run_primitive(TensorCoreTop* sim,
   }
 
   TensorCoreMeta meta{};
-  meta.in_prec = PREC_FP9;
-  meta.out_prec = tc.d_prec;
-  meta.c_prec = tc.c_prec;
-  meta.c_bypass_is_fp22 = 1;
-  meta.sparse_mode = static_cast<uint8_t>(tc.sparse_mode);
   meta.valid = true;
 
   sim->push_uop(a_in, b_in, c_in, meta);

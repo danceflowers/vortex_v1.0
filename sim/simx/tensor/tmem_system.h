@@ -81,7 +81,6 @@ public:
   // Launch an asynchronous tcgen05.shift operation through the shared TMEM ports.
   bool issue_shift(uint32_t async_id,
                    uint32_t wid,
-                   uint32_t wgid,
                    uint32_t taddr,
                    uint64_t issue_cycle);
 
@@ -103,7 +102,6 @@ private:
   struct ShiftTransaction {
     uint32_t async_id = 0;
     uint32_t wid = 0;
-    uint32_t wgid = 0;
     uint32_t taddr = 0;
     uint64_t issue_cycle = 0;
     uint64_t first_service_cycle = 0;

@@ -83,7 +83,6 @@ enum class WarpStallReason : uint8_t {
   Pipeline,
   Barrier,
   MBarrier,
-  WarpGroup,
   AsyncTensor,
 };
 
@@ -193,37 +192,6 @@ private:
 
 //#ifdef EXT_TCU_ENABLE
   TensorUnit::Ptr tensor_unit_;
-
-  struct WarpGroupCollectiveState {
-    bool valid = false;
-    bool issued = false;
-    TcuType type = TcuType::TMEM_ALLOC;
-    Word pc = 0;
-    uint32_t leader_wid = 0;
-    IntrTcuArgs args{};
-    uint32_t src0 = 0;
-    uint32_t src1 = 0;
-    uint32_t src2 = 0;
-    bool rd_valid = false;
-    uint32_t rd_value = 0;
-    WarpMask arrived_mask;
-    WarpMask consumed_mask;
-  };
-
-  std::vector<WarpGroupCollectiveState> warpgroup_collectives_;
-
-  WarpMask warpgroup_active_mask(uint32_t wgid) const;
-  uint32_t first_active_thread(uint32_t wid) const;
-  uint32_t read_collective_scalar_operand(uint32_t wid, const RegOpd& reg) const;
-  bool collective_state_matches(const WarpGroupCollectiveState& state,
-                                TcuType type,
-                                Word pc,
-                                const IntrTcuArgs& args,
-                                uint32_t src0,
-                                uint32_t src1,
-                                uint32_t src2) const;
-  void clear_warpgroup_collective(uint32_t wgid);
-  instr_trace_t* retire_warpgroup_collective_nop(const Instr& instr, uint32_t wid, uint32_t rd_value, bool rd_valid);
 //#endif
 
 #ifdef EXT_V_ENABLE

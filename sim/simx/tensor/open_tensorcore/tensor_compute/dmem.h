@@ -4,9 +4,9 @@
 // DMem -- single-instance output-result buffer.
 // ============================================================================
 //
-// DMem stores four 8x8 FP22 subtiles. TensorCore retire writes the first K
-// phase directly and accumulates later K phases in place. The store path dumps
-// DMem subtiles back into fp8/fp16/fp32 TMEM packets.
+// DMem stores four 8x8 FP22 subtiles. TensorCore retire writes the first
+// accumulation phase directly and accumulates later phases in place. The store
+// path dumps DMem subtiles back into fp8/fp16/fp32 TMEM packets.
 // ============================================================================
 
 #include <array>

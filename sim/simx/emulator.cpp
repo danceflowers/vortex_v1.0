@@ -30,43 +30,6 @@
 
 using namespace vortex;
 
-//#ifdef EXT_TCU_ENABLE
-namespace {
-
-bool warpgroup_debug_enabled() {
-  static bool enabled = (nullptr != std::getenv("SIMX_WARPGROUP_DEBUG"));
-  return enabled;
-}
-
-bool warpgroup_debug_enabled(Word pc) {
-  return warpgroup_debug_enabled() && pc >= 0x8000019cu;
-}
-
-bool is_warpgroup_collective_tcu(TcuType type) {
-  switch (type) {
-  case TcuType::TMEM_ALLOC:
-  case TcuType::TMEM_DEALLOC:
-  case TcuType::TMEM_REL_PERMIT:
-    return false;
-  default:
-    return true;
-  }
-}
-
-bool collective_args_match(TcuType type, const IntrTcuArgs& lhs, const IntrTcuArgs& rhs) {
-  switch (type) {
-  case TcuType::TCU_MMA:
-    return lhs.idesc == rhs.idesc;
-  case TcuType::MBAR_FENCE:
-    return lhs.fence_mode == rhs.fence_mode;
-  default:
-    return true;
-  }
-}
-
-}
-//#endif
-
 warp_t::warp_t(uint32_t num_threads)
   : ireg_file(MAX_NUM_REGS, std::vector<Word>(num_threads))
   , freg_file(MAX_NUM_REGS, std::vector<uint64_t>(num_threads))
@@ -124,7 +87,6 @@ Emulator::Emulator(const Arch &arch, const DCRS &dcrs, Core* core)
     , ipdom_size_(arch.num_threads()-1)
   //#ifdef EXT_TCU_ENABLE
     , tensor_unit_(core->tensor_unit())
-    , warpgroup_collectives_(arch.num_warpgroups())
   //#endif
   #ifdef EXT_V_ENABLE
     , vec_unit_(core->vec_unit())
@@ -163,12 +125,6 @@ void Emulator::reset() {
   vec_unit_->reset();
 #endif
 
-//#ifdef EXT_TCU_ENABLE
-  for (auto& collective : warpgroup_collectives_) {
-    collective = {};
-  }
-//#endif
-
   startup_arg_ = startup_arg;
   csr_mscratch_ = startup_arg;
 
@@ -192,84 +148,6 @@ void Emulator::attach_ram(RAM* ram) {
   mmu_.attach(*ram, 0, 0xFFFFFFFF);
 #endif
 }
-
-//#ifdef EXT_TCU_ENABLE
-WarpMask Emulator::warpgroup_active_mask(uint32_t wgid) const {
-  WarpMask mask;
-  auto first = arch_.warpgroup_first_wid(wgid);
-  for (uint32_t lane = 0; lane < arch_.warpgroup_size(); ++lane) {
-    auto wid = first + lane;
-    if (wid < arch_.num_warps() && active_warps_.test(wid)) {
-      mask.set(wid);
-    }
-  }
-  return mask;
-}
-
-uint32_t Emulator::first_active_thread(uint32_t wid) const {
-  auto& warp = warps_.at(wid);
-  for (uint32_t t = 0; t < warp.tmask.size(); ++t) {
-    if (warp.tmask.test(t)) {
-      return t;
-    }
-  }
-  return 0;
-}
-
-uint32_t Emulator::read_collective_scalar_operand(uint32_t wid, const RegOpd& reg) const {
-  if (reg.type != RegType::Integer || reg.idx == 0) {
-    return 0;
-  }
-  auto thread = first_active_thread(wid);
-  return warps_.at(wid).ireg_file.at(reg.idx).at(thread);
-}
-
-bool Emulator::collective_state_matches(const WarpGroupCollectiveState& state,
-                                        TcuType type,
-                                        Word pc,
-                                        const IntrTcuArgs& args,
-                                        uint32_t src0,
-                                        uint32_t src1,
-                                        uint32_t src2) const {
-  return state.valid
-      && state.type == type
-      && state.pc == pc
-      && state.src0 == src0
-      && state.src1 == src1
-      && state.src2 == src2
-      && collective_args_match(type, state.args, args);
-}
-
-void Emulator::clear_warpgroup_collective(uint32_t wgid) {
-  warpgroup_collectives_.at(wgid) = {};
-}
-
-instr_trace_t* Emulator::retire_warpgroup_collective_nop(const Instr& instr, uint32_t wid, uint32_t rd_value, bool rd_valid) {
-  auto& warp = warps_.at(wid);
-  auto trace_alloc = core_->trace_pool().allocate(1);
-  auto trace = new (trace_alloc) instr_trace_t(instr.getUUID(), arch_);
-  trace->fu_type  = instr.getFUType();
-  trace->op_type  = instr.getOpType();
-  trace->cid      = core_->id();
-  trace->wid      = wid;
-  trace->PC       = warp.PC;
-  trace->tmask    = warp.tmask;
-  trace->dst_reg  = instr.getDestReg();
-  trace->src_regs = {instr.getSrcReg(0), instr.getSrcReg(1), instr.getSrcReg(2)};
-
-  if (rd_valid && trace->dst_reg.type == RegType::Integer && trace->dst_reg.idx != 0) {
-    for (uint32_t t = 0; t < arch_.num_threads(); ++t) {
-      if (warp.tmask.test(t)) {
-        warp.ireg_file.at(trace->dst_reg.idx).at(t) = rd_value;
-      }
-    }
-  }
-
-  warp.PC += 4;
-  last_instr_retired_ = true;
-  return trace;
-}
-//#endif
 
 uint32_t Emulator::fetch(uint32_t wid, uint64_t uuid) {
   auto& warp = warps_.at(wid);
@@ -326,24 +204,7 @@ instr_trace_t* Emulator::step() {
        && std::holds_alternative<IntrTcuArgs>(instr.getArgs())) {
         saw_tensor_candidate = true;
         auto tcu_type = std::get<TcuType>(instr.getOpType());
-        auto tcu_args = std::get<IntrTcuArgs>(instr.getArgs());
-        bool collective_follower_consume = false;
-        if (is_warpgroup_collective_tcu(tcu_type)) {
-          auto src0 = read_collective_scalar_operand(wid, instr.getSrcReg(0));
-          auto src1 = read_collective_scalar_operand(wid, instr.getSrcReg(1));
-          auto src2 = read_collective_scalar_operand(wid, instr.getSrcReg(2));
-          auto wgid = arch_.warpgroup_id(wid);
-          const auto& collective = warpgroup_collectives_.at(wgid);
-          collective_follower_consume = collective.issued
-                                     && !collective.consumed_mask.test(wid)
-                                     && collective_state_matches(collective, tcu_type, warp.PC,
-                                                                 tcu_args, src0, src1, src2);
-        }
-        if (collective_follower_consume) {
-          score = std::numeric_limits<uint32_t>::max();
-        } else {
-          score = tensor_unit_->scheduler_score(wid, tcu_type);
-        }
+        score = tensor_unit_->scheduler_score(wid, tcu_type);
         if (score == 0 && best_tcu_block == TensorUnit::IssueBlockReason::None) {
           best_tcu_block = tensor_unit_->classify_issue_block(wid, tcu_type);
         }
@@ -402,202 +263,10 @@ instr_trace_t* Emulator::step() {
 
   auto instr = warp.ibuffer.front();
 
-//#ifdef EXT_TCU_ENABLE
-  bool collective_leader_issue = false;
-  uint32_t collective_wgid = 0;
-  if (std::holds_alternative<TcuType>(instr->getOpType())) {
-    auto collective_type = std::get<TcuType>(instr->getOpType());
-    if (is_warpgroup_collective_tcu(collective_type)) {
-      auto collective_args = std::get<IntrTcuArgs>(instr->getArgs());
-      auto collective_src0 = read_collective_scalar_operand(scheduled_warp, instr->getSrcReg(0));
-      auto collective_src1 = read_collective_scalar_operand(scheduled_warp, instr->getSrcReg(1));
-      auto collective_src2 = read_collective_scalar_operand(scheduled_warp, instr->getSrcReg(2));
-      collective_wgid = arch_.warpgroup_id(scheduled_warp);
-      auto leader_wid = arch_.warpgroup_leader(collective_wgid);
-      auto active_mask = warpgroup_active_mask(collective_wgid);
-      auto& collective = warpgroup_collectives_.at(collective_wgid);
-      bool wg_debug = warpgroup_debug_enabled(warp.PC);
-      auto resume_collective_group = [&](const WarpMask& mask) {
-        for (uint32_t wid = 0; wid < arch_.num_warps(); ++wid) {
-          if (!mask.test(wid)) {
-            continue;
-          }
-          if (stalled_warps_.test(wid) && stall_reasons_.at(wid) == WarpStallReason::WarpGroup) {
-            resume(wid);
-          }
-        }
-      };
-      if (wg_debug) {
-        std::cerr << "[wg] visit wgid=" << collective_wgid
-                  << " wid=" << scheduled_warp
-                  << " pc=0x" << std::hex << warp.PC << std::dec
-                  << " type=" << collective_type
-                  << " issued=" << collective.issued
-                  << " valid=" << collective.valid
-                  << " arrived=0x" << std::hex << collective.arrived_mask.to_ulong()
-                  << " consumed=0x" << collective.consumed_mask.to_ulong()
-                  << " active=0x" << active_mask.to_ulong() << std::dec
-                  << std::endl;
-      }
-
-      if (collective.issued && collective_state_matches(collective, collective_type, warp.PC,
-                                                        collective_args, collective_src0,
-                                                        collective_src1, collective_src2)) {
-        if (!collective.consumed_mask.test(scheduled_warp)) {
-          if (wg_debug) {
-            std::cerr << "[wg] follower-consume wgid=" << collective_wgid
-                      << " wid=" << scheduled_warp
-                      << " pc=0x" << std::hex << warp.PC << std::dec
-                      << " type=" << collective_type
-                      << std::endl;
-          }
-          auto trace = retire_warpgroup_collective_nop(*instr, scheduled_warp, collective.rd_value, collective.rd_valid);
-          collective.consumed_mask.set(scheduled_warp);
-          if ((collective.consumed_mask & active_mask) == active_mask) {
-            if (warpgroup_debug_enabled(collective.pc)) {
-              std::cerr << "[wg] collective-complete wgid=" << collective_wgid
-                        << " pc=0x" << std::hex << collective.pc << std::dec
-                        << " type=" << collective.type
-                        << std::endl;
-            }
-            resume_collective_group(active_mask);
-            clear_warpgroup_collective(collective_wgid);
-          }
-          if (last_instr_retired_) {
-            warp.ibuffer.pop_front();
-            warp.ibuffer_needs_rewind = !warp.ibuffer.empty();
-          } else {
-            warp.ibuffer_needs_rewind = false;
-          }
-          return trace;
-        }
-      } else {
-        if (!collective.valid) {
-          collective.valid = true;
-          collective.type = collective_type;
-          collective.pc = warp.PC;
-          collective.leader_wid = leader_wid;
-          collective.args = collective_args;
-          collective.src0 = collective_src0;
-          collective.src1 = collective_src1;
-          collective.src2 = collective_src2;
-          collective.rd_valid = false;
-          collective.rd_value = 0;
-          collective.arrived_mask.reset();
-          collective.consumed_mask.reset();
-        } else if (collective.issued && collective.consumed_mask.test(scheduled_warp)) {
-          if (wg_debug) {
-            std::cerr << "[wg] stall-after-consume wgid=" << collective_wgid
-                      << " wid=" << scheduled_warp
-                      << " pending followers before next collective"
-                      << std::endl;
-          }
-          if (!stalled_warps_.test(scheduled_warp)) {
-            suspend(scheduled_warp, WarpStallReason::WarpGroup);
-          } else {
-            stall_reasons_.at(scheduled_warp) = WarpStallReason::WarpGroup;
-          }
-          return nullptr;
-        } else if (!collective_state_matches(collective, collective_type, warp.PC,
-                                             collective_args, collective_src0,
-                                             collective_src1, collective_src2)) {
-          std::cerr << "warpgroup collective mismatch: wgid=" << collective_wgid
-                    << ", leader_wid=" << collective.leader_wid
-                    << ", expected_type=" << collective.type
-                    << ", actual_type=" << collective_type
-                    << ", expected_pc=0x" << std::hex << collective.pc
-                    << ", actual_pc=0x" << warp.PC << std::dec
-                    << ", expected_srcs=(" << collective.src0 << "," << collective.src1 << "," << collective.src2 << ")"
-                    << ", actual_srcs=(" << collective_src0 << "," << collective_src1 << "," << collective_src2 << ")"
-                    << std::endl;
-          std::abort();
-        }
-
-        collective.arrived_mask.set(scheduled_warp);
-        auto arrived_mask = collective.arrived_mask & active_mask;
-        if (arrived_mask != active_mask || scheduled_warp != leader_wid) {
-          if (wg_debug) {
-            std::cerr << "[wg] arrive-stall wgid=" << collective_wgid
-                      << " wid=" << scheduled_warp
-                      << " leader=" << leader_wid
-                      << " arrived=0x" << std::hex << arrived_mask.to_ulong()
-                      << " active=0x" << active_mask.to_ulong() << std::dec
-                      << std::endl;
-          }
-          if (arrived_mask == active_mask) {
-            if (wg_debug) {
-              std::cerr << "[wg] leader-ready wgid=" << collective_wgid
-                        << " leader=" << leader_wid
-                        << std::endl;
-            }
-            resume(leader_wid);
-          }
-          if (!stalled_warps_.test(scheduled_warp)) {
-            suspend(scheduled_warp, WarpStallReason::WarpGroup);
-          } else {
-            stall_reasons_.at(scheduled_warp) = WarpStallReason::WarpGroup;
-          }
-          return nullptr;
-        }
-        collective_leader_issue = true;
-      }
-    }
-  }
-//#endif
-
   // Execute
+  // Tensor ISA operations issue per scheduled warp; cross-warp rendezvous is
+  // modeled only by explicit ISA mechanisms such as mbarrier.
   auto trace = this->execute(*instr, scheduled_warp);
-
-//#ifdef EXT_TCU_ENABLE
-  if (collective_leader_issue && last_instr_retired_) {
-    auto active_mask = warpgroup_active_mask(collective_wgid);
-    auto& collective = warpgroup_collectives_.at(collective_wgid);
-    collective.issued = true;
-    collective.consumed_mask.reset();
-    collective.consumed_mask.set(scheduled_warp);
-
-    auto rdest = instr->getDestReg();
-    collective.rd_valid = (rdest.type == RegType::Integer && rdest.idx != 0);
-    if (collective.rd_valid) {
-      for (uint32_t t = 0; t < arch_.num_threads(); ++t) {
-        if (warp.tmask.test(t)) {
-          collective.rd_value = warp.ireg_file.at(rdest.idx).at(t);
-          break;
-        }
-      }
-    }
-    if (warpgroup_debug_enabled(warp.PC)) {
-      std::cerr << "[wg] leader-retire wgid=" << collective_wgid
-                << " wid=" << scheduled_warp
-                << " pc=0x" << std::hex << warp.PC << std::dec
-                << " type=" << collective.type
-                << " rd_valid=" << collective.rd_valid
-                << " rd_value=" << collective.rd_value
-                << std::endl;
-    }
-
-    for (uint32_t wid = 0; wid < arch_.num_warps(); ++wid) {
-      if (wid == static_cast<uint32_t>(scheduled_warp) || !active_mask.test(wid)) {
-        continue;
-      }
-      if (stalled_warps_.test(wid) && stall_reasons_.at(wid) == WarpStallReason::WarpGroup) {
-        resume(wid);
-      }
-    }
-
-    if ((collective.consumed_mask & active_mask) == active_mask) {
-      clear_warpgroup_collective(collective_wgid);
-    }
-  } else if (collective_leader_issue && warpgroup_debug_enabled(warp.PC)) {
-    auto& collective = warpgroup_collectives_.at(collective_wgid);
-    std::cerr << "[wg] leader-stall wgid=" << collective_wgid
-              << " wid=" << scheduled_warp
-              << " pc=0x" << std::hex << warp.PC << std::dec
-              << " type=" << collective.type
-              << " stall_reason=" << static_cast<int>(stall_reasons_.at(scheduled_warp))
-              << std::endl;
-  }
-//#endif
 
   if (last_instr_retired_) {
     warp.ibuffer.pop_front();

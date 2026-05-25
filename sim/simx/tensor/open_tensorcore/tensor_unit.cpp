@@ -82,7 +82,8 @@ public:
   static constexpr uint32_t kTileK = 16;
   static constexpr uint32_t kPrimitiveDim = 8;
   static constexpr uint32_t kSubtiles = 4;
-  static constexpr uint32_t kKPhases = 2;
+  static constexpr uint32_t kDenseAccumPhases = 4;
+  static constexpr uint32_t kSparseAccumPhases = 2;
   static constexpr uint32_t kSparseMetaPacketBytes = Tmem::kPacketBytes;
   static constexpr uint32_t kSparseMetaPacketBaseByteOffset = 512;
 
@@ -106,7 +107,6 @@ public:
   struct MmaOp {
     TcDecodedMmaCmd cmd = {};
     uint32_t wid = 0;
-    uint32_t wgid = 0;
     uint32_t async_id = 0;
     bool initialized = false;
     MmaStage stage = MmaStage::FillA;
@@ -131,7 +131,7 @@ public:
     uint32_t pending_packet_index = 0;
 
     uint32_t issue_subtile = 0;
-    uint32_t issue_k_phase = 0;
+    uint32_t issue_accum_phase = 0;
     uint32_t final_retired_subtiles = 0;
   };
 
@@ -212,7 +212,6 @@ public:
     MmaOp op{};
     op.cmd = cmd;
     op.wid = wid;
-    op.wgid = arch_.warpgroup_id(wid);
 
     if (!resolve_taddr(cmd.a_taddr, &op.a_region)
      || !resolve_taddr(cmd.d_taddr, &op.d_region)) {
@@ -351,7 +350,7 @@ public:
          << " c_pkt=" << op.next_c_packet << "/" << op.c_packets.size()
          << " d_pkt=" << op.next_d_packet << "/" << op.d_store_packets.size()
          << " subtile=" << op.issue_subtile
-         << " k_phase=" << op.issue_k_phase
+         << " accum_phase=" << op.issue_accum_phase
          << " final_retired=" << op.final_retired_subtiles
          << "\n";
     }
@@ -653,11 +652,28 @@ private:
   }
 
   // Check whether the next 8x8 primitive can be accepted by TensorCore.
+  static uint32_t accum_phase_count(uint32_t sparsity_kind) {
+    if (sparsity_kind == tensor::sparse_none) {
+      return kDenseAccumPhases;
+    }
+    if (sparsity_kind == tensor::sparse_2_4
+     || sparsity_kind == tensor::sparse_1_4) {
+      return kSparseAccumPhases;
+    }
+    std::abort();
+  }
+
+  static uint32_t mem_k_phase_for_accum_phase(uint32_t sparsity_kind,
+                                              uint32_t accum_phase) {
+    return (sparsity_kind == tensor::sparse_none) ? (accum_phase / 2)
+                                                  : accum_phase;
+  }
+
   bool current_compute_ready(const MmaOp& op) const {
     if (op.issue_subtile >= kSubtiles) {
       return false;
     }
-    if (op.issue_k_phase == 0 && op.cmd.enable_input_d != 0
+    if (op.issue_accum_phase == 0 && op.cmd.enable_input_d != 0
      && !cmem_.subtile_valid(op.issue_subtile)) {
       return false;
     }
@@ -667,69 +683,52 @@ private:
   // Build one primitive from AMem/BMem/CMem and push it into TensorCore.
   void issue_current_primitive(MmaOp& op) {
     uint32_t subtile = op.issue_subtile;
-    uint32_t k_phase = op.issue_k_phase;
+    uint32_t accum_phase = op.issue_accum_phase;
+    uint32_t mem_k_phase = mem_k_phase_for_accum_phase(op.cmd.sparsity_kind,
+                                                       accum_phase);
     uint32_t storage_m = subtile / 2;
     uint32_t storage_n = subtile % 2;
 
     uint16_t a[kPrimitiveDim][kPrimitiveDim] = {};
     uint16_t b[kPrimitiveDim][kPrimitiveDim] = {};
     uint32_t c[kPrimitiveDim][kPrimitiveDim] = {};
-    amem_.read_primitive(k_phase * 2 + storage_m, a, false);
-    bmem_.read_primitive(k_phase * 2 + storage_n, b, false);
-    uint8_t sparse_meta[16] = {};
+    amem_.read_primitive(mem_k_phase * 2 + storage_m, a, false);
+    bmem_.read_primitive(mem_k_phase * 2 + storage_n, b, false);
+    uint16_t sparse_row_meta[kPrimitiveDim] = {};
     if (op.cmd.sparsity_kind != tensor::sparse_none) {
       if (op.meta_packets.empty()) {
         std::cerr << "TensorUnit error: sparse metadata packet not loaded"
                   << std::endl;
         std::abort();
       }
-      uint32_t meta_line = storage_m * 2 + k_phase;
-      std::copy_n(op.meta_packets.front().bytes.begin() + meta_line * 16,
-                  16,
-                  sparse_meta);
-      uint16_t a_routed[kPrimitiveDim][kPrimitiveDim] = {};
-      uint16_t b_routed[kPrimitiveDim][kPrimitiveDim] = {};
-      if (!vortex::sparse::route_sparse_primitive(op.cmd.sparsity_kind,
-                                                  sparse_meta,
-                                                  a,
-                                                  b,
-                                                  a_routed,
-                                                  b_routed)) {
-        std::cerr << "TensorUnit error: sparse routing failed"
-                  << " mode=" << static_cast<uint32_t>(op.cmd.sparsity_kind)
-                  << std::endl;
-        std::abort();
+      uint32_t meta_line = storage_m * 2 + mem_k_phase;
+      const uint8_t* meta_base =
+          op.meta_packets.front().bytes.data() + meta_line * 16;
+      for (uint32_t row = 0; row < kPrimitiveDim; ++row) {
+        sparse_row_meta[row] = vortex::sparse::row_meta_bits(meta_base, row);
       }
-      std::memcpy(a, a_routed, sizeof(a));
-      std::memcpy(b, b_routed, sizeof(b));
     }
-    if (k_phase == 0 && op.cmd.enable_input_d != 0) {
+    if (accum_phase == 0 && op.cmd.enable_input_d != 0) {
       cmem_.read_subtile_fp22(subtile, c);
     }
 
     TensorCoreMeta meta{};
-    meta.wgid = op.wgid;
+    meta.wid = op.wid;
     meta.async_id = op.async_id;
     meta.c_subtile_id = subtile;
-    meta.k_phase_id = k_phase;
-    meta.in_prec = PREC_FP9;
-    meta.out_prec = fmt_to_precision(op.cmd.fmt_d);
-    meta.c_prec = fmt_to_precision(op.cmd.fmt_c);
-    meta.c_bypass_is_fp22 = 1;
-    meta.sparse_mode = op.cmd.sparsity_kind;
-    std::copy_n(sparse_meta, sizeof(meta.sparse_meta), meta.sparse_meta);
+    meta.accum_phase_id = accum_phase;
     meta.valid = true;
 
-    tensorcore_.push_uop(a, b, c, meta);
+    tensorcore_.push_uop(a, b, c, meta, op.cmd.sparsity_kind, sparse_row_meta);
     ++perf_stats_.issued_primitive_tiles;
     if (perf_stats_.setup_end_cycle == 0) {
       perf_stats_.setup_end_cycle = perf_stats_.latency;
     }
 
-    if (op.issue_k_phase + 1 < kKPhases) {
-      ++op.issue_k_phase;
+    if (op.issue_accum_phase + 1 < accum_phase_count(op.cmd.sparsity_kind)) {
+      ++op.issue_accum_phase;
     } else {
-      op.issue_k_phase = 0;
+      op.issue_accum_phase = 0;
       ++op.issue_subtile;
     }
   }
@@ -746,14 +745,15 @@ private:
     TensorCoreRetire retired{};
     if (tensorcore_.pop_retired(&retired)) {
       uint32_t subtile = retired.meta.c_subtile_id;
-      if (retired.meta.k_phase_id == 0) {
+      if (retired.meta.accum_phase_id == 0) {
         dmem_.write_subtile_fp22(subtile, retired.fp22_out);
       } else {
         dmem_.accumulate_subtile_fp22(subtile, retired.fp22_out);
       }
       ++perf_stats_.retired_primitive_tiles;
       perf_stats_.epilogue_begin_cycle = perf_stats_.latency;
-      if (retired.meta.k_phase_id == (kKPhases - 1)) {
+      if (retired.meta.accum_phase_id
+          == (accum_phase_count(op.cmd.sparsity_kind) - 1)) {
         ++op.final_retired_subtiles;
       }
     }

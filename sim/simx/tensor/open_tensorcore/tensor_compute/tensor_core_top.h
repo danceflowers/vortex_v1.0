@@ -4,6 +4,7 @@
 #include "config_register.h"
 #include "tc_mul_add.h"
 #include "fp_types.h"
+#include "tensor_cfg.h"
 
 // Retired output for one 8x8 primitive.
 struct TensorCoreRetire {
@@ -25,9 +26,9 @@ struct TensorCoreRetire {
 
 // Top-level 8x8 TensorCore primitive array.
 //
-// One m16n16k16 macro MMA is decomposed into four 8x8 subtiles and two K
-// phases. TensorCoreTop accepts one 8x8 A/B/C primitive, broadcasts it to 64
-// scalar tc_mul_add lanes, and retires one 8x8 FP22 subtile result.
+// Accepts one 8x8 A/B/C primitive, broadcasts it to 64 scalar tc_mul_add lanes,
+// and retires one 8x8 FP22 subtile result. C is carried through the pipeline as
+// passthrough data alongside the dot-product reduction.
 struct TensorCoreTop {
     static constexpr int M = 8, K = 8, N = 8;
 
@@ -42,15 +43,14 @@ struct TensorCoreTop {
     int set_jobs = 0;
     bool input_loaded = false;
     int cycle_count = 0;
-    bool circulating = false;       // Output-resident circulating accumulation mode.
-    bool resident_tail_to_dmem_valid = false;
-    uint32_t resident_tail_to_dmem_async_id = 0;
 
     // 8x8 compute array.
     tc_mul_add tc_dot_product[M][N];
 
     // One-cycle input metadata staging.
     TensorCoreMeta staged_meta;
+    uint32_t staged_sparsity_kind = vortex::tensor::sparse_none;
+    uint16_t staged_sparse_row_meta[M] = {};
     bool staged_valid = false;
 
     // Retire buffer.
@@ -72,15 +72,15 @@ struct TensorCoreTop {
             for (int j = 0; j < N; ++j)
                 b_in[k][j] = 0;
         staged_meta = {};
+        staged_sparsity_kind = vortex::tensor::sparse_none;
+        for (int i = 0; i < M; ++i)
+            staged_sparse_row_meta[i] = 0;
         staged_valid = false;
         retired.reset();
         input_loaded = false;
         cycle_count = 0;
         set_jobs = 1;
         jobs_completed = 0;
-        circulating = false;
-        resident_tail_to_dmem_valid = false;
-        resident_tail_to_dmem_async_id = 0;
     }
 
     bool ready(bool out_ready = true) const {
@@ -101,64 +101,21 @@ struct TensorCoreTop {
         return false;
     }
 
-    bool pipeline_active() const {
-        if (staged_valid || retired.valid) return true;
-        for (int i = 0; i < M; ++i)
-            for (int j = 0; j < N; ++j)
-                if (tc_dot_product[i][j].pipeline_active())
-                    return true;
-        return false;
-    }
-
-    bool fifo_empty() const {
-        for (int i = 0; i < M; ++i)
-            for (int j = 0; j < N; ++j)
-                if (!tc_dot_product[i][j].accum_fifo.empty())
-                    return false;
-        return true;
-    }
-
-    // True when the resident feedback path consumed one FIFO value this tick.
-    bool resident_turnover_pulse() const {
-        return tc_dot_product[0][0].resident_turnover_pulse;
-    }
-
-    // Load the output-resident FIFO with prefetched C values.
-    bool load_fifo_element(int i, int j, uint32_t fp22_val) {
-        return tc_dot_product[i][j].load_fifo(fp22_val);
-    }
-
-    bool load_fifo_subtile(const uint32_t c[M][N]) {
-        for (int i = 0; i < M; ++i)
-            for (int j = 0; j < N; ++j)
-                if (!tc_dot_product[i][j].load_fifo(c[i][j]))
-                    return false;
-        return true;
-    }
-
-    // Drain one output-resident FIFO element for writeback.
-    bool pop_fifo_element(int i, int j, uint32_t* out) {
-        auto& fifo = tc_dot_product[i][j].accum_fifo;
-        if (!fifo.can_pop()) return false;
-        if (out) *out = fifo.peek();
-        fifo.advance(true, false, 0);
-        return true;
-    }
-
-    void set_circulating(bool enable) {
-        circulating = enable;
-    }
-
-    void set_resident_tail_to_dmem(bool valid, uint32_t async_id) {
-        resident_tail_to_dmem_valid = valid;
-        resident_tail_to_dmem_async_id = async_id;
-    }
-
-    // Stage one primitive input. c_in is passed through for non-resident mode.
+    // Stage one primitive input.
     void push_uop(const uint16_t a[M][K],
                   const uint16_t b[K][N],
                   const uint32_t c[M][N],
                   const TensorCoreMeta& meta) {
+        uint16_t sparse_row_meta[M] = {};
+        push_uop(a, b, c, meta, vortex::tensor::sparse_none, sparse_row_meta);
+    }
+
+    void push_uop(const uint16_t a[M][K],
+                  const uint16_t b[K][N],
+                  const uint32_t c[M][N],
+                  const TensorCoreMeta& meta,
+                  uint32_t sparsity_kind,
+                  const uint16_t sparse_row_meta[M]) {
         for (int i = 0; i < M; ++i)
             for (int k = 0; k < K; ++k)
                 a_in[i][k] = a[i][k];
@@ -170,17 +127,12 @@ struct TensorCoreTop {
                 c_in[i][j] = c[i][j];
         staged_meta = meta;
         staged_meta.valid = true;
+        staged_sparsity_kind = sparsity_kind;
+        for (int i = 0; i < M; ++i)
+            staged_sparse_row_meta[i] = sparse_row_meta[i];
         staged_valid = true;
         input_loaded = true;
     }
-
-    // // Simplified resident-mode overload: C is supplied by the FIFO.
-    // void push_uop(const uint16_t a[M][K],
-    //               const uint16_t b[K][N],
-    //               const TensorCoreMeta& meta) {
-    //     uint32_t zero_c[M][N] = {};
-    //     push_uop(a, b, zero_c, meta);
-    // }
 
     bool pop_retired(TensorCoreRetire* out) {
         if (!retired.valid) return false;
@@ -202,33 +154,30 @@ struct TensorCoreTop {
                     tc_dot_product[i][j].mul_add_input.b_in[k] = b_in[k][j];
                 }
                 tc_dot_product[i][j].mul_add_input.c_in = c_in[i][j];
-                tc_dot_product[i][j].mul_add_input.prec =
-                    staged_valid ? staged_meta.in_prec : PREC_FP9;
+                tc_dot_product[i][j].mul_add_input.sparsity_kind =
+                    staged_valid ? staged_sparsity_kind : vortex::tensor::sparse_none;
+                tc_dot_product[i][j].mul_add_input.sparse_row_meta =
+                    staged_valid ? staged_sparse_row_meta[i] : 0;
                 tc_dot_product[i][j].mul_add_input.input_valid = staged_valid;
                 tc_dot_product[i][j].mul_add_input.meta =
                     staged_valid ? staged_meta : TensorCoreMeta{};
             }
         }
 
-        // Stage 2: advance all lanes; circulating selects the final-add input.
+        // Stage 2: advance all 64 lanes by one cycle.
         for (int i = 0; i < M; i++)
             for (int j = 0; j < N; j++)
-                tc_dot_product[i][j].tick(out_ready,
-                                          g_cfg,
-                                          circulating,
-                                          resident_tail_to_dmem_valid,
-                                          resident_tail_to_dmem_async_id);
+                tc_dot_product[i][j].tick(out_ready, g_cfg);
 
         // Stage 3: clear the one-cycle staging registers.
         staged_valid = false;
         input_loaded = false;
         staged_meta = {};
+        staged_sparsity_kind = vortex::tensor::sparse_none;
+        for (int i = 0; i < M; ++i)
+            staged_sparse_row_meta[i] = 0;
 
         // Stage 4: retire once every lane produced a valid result.
-        //
-        // Non-resident mode retires a materialized subtile. Resident mode only
-        // means the primitive has entered the circulating accumulator state;
-        // final C visibility still waits for FIFO drain.
         bool all_done = true;
         for (int i = 0; i < M && all_done; i++)
             for (int j = 0; j < N && all_done; j++)

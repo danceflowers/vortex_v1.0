@@ -328,13 +328,11 @@ void TmemSystem::consume_request_grant(uint64_t request_tag) { tmem_.consume_req
 
 bool TmemSystem::issue_shift(uint32_t async_id,
                              uint32_t wid,
-                             uint32_t wgid,
                              uint32_t taddr,
                              uint64_t issue_cycle) {
   ShiftTransaction transaction{};
   transaction.async_id = async_id;
   transaction.wid = wid;
-  transaction.wgid = wgid;
   transaction.taddr = taddr;
   transaction.issue_cycle = issue_cycle;
   transaction.first_service_cycle = SimPlatform::instance().cycles() + 1;
