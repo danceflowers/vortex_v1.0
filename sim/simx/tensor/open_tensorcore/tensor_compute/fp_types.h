@@ -392,31 +392,7 @@ inline uint8_t fp22_to_fp8_e5m2(uint32_t fp22, RoundingMode rm = RNE) {
     return (s << 7) | (ne << 2) | (o & 3);
 }
 
-// inline uint16_t fp22_to_fp16(uint32_t fp22, RoundingMode rm = RNE) {
-//     bool s = (fp22 >> 21) & 1; int e = (fp22 >> 13) & 0xFF; int m = fp22 & 0x1FFF;
-//     if (e == 0xFF) { if (m) return (s << 15) | (0x1F << 10) | 0x200; return (s << 15) | (0x1F << 10); }
-//     if (e == 0) return (s << 15);
-//     int ne = (int)e - 112;
-//     if (ne >= 31) { bool rmin = (rm==RTZ)||(rm==RDN&&!s)||(rm==RUP&&s); return rmin ? ((s<<15)|(30<<10)|0x3FF) : ((s<<15)|(0x1F<<10)); }
-//     uint32_t fm = (1u << 13) | m;
-//     if (ne <= 0) {
-//         int sh = 1 - ne; if (sh > 14) return (s << 15);
-//         fm >>= sh;
-//         int o = (fm >> 3) & 0x3FF;
-//         bool g = (fm >> 2) & 1, r = (fm >> 1) & 1, st = fm & 1;
-//         bool up = false;
-//         switch(rm) { case RNE: up = g && (r||st||(o&1)); break; case RTZ: break; case RDN: up = s&&(g||r||st); break; case RUP: up = !s&&(g||r||st); break; case RMM: up = g; break; }
-//         if (up) { o++; if (o >= 1024) { o = 0; ne = 1; } else ne = 0; }
-//         else ne = 0;
-//         return (s << 15) | (ne << 10) | (o & 0x3FF);
-//     }
-//     int o = (m >> 3) & 0x3FF;
-//     bool g = (m >> 2) & 1, r = (m >> 1) & 1, st = m & 1;
-//     bool up = false;
-//     switch(rm) { case RNE: up = g && (r||st||(o&1)); break; case RTZ: break; case RDN: up = s&&(g||r||st); break; case RUP: up = !s&&(g||r||st); break; case RMM: up = g; break; }
-//     if (up) { o++; if (o >= 1024) { o = 0; ne++; if (ne >= 31) { bool rmin=(rm==RTZ)||(rm==RDN&&!s)||(rm==RUP&&s); return rmin?((s<<15)|(30<<10)|0x3FF):((s<<15)|(0x1F<<10)); } } }
-//     return (s << 15) | (ne << 10) | (o & 0x3FF);
-// }
+// fp22_to_fp16 is defined in fp22_to_fp16.h (single-argument version).
 
 inline uint32_t fp22_to_fp32(uint32_t fp22) {
     bool s = (fp22 >> 21) & 1; int e = (fp22 >> 13) & 0xFF; int m = fp22 & 0x1FFF;
@@ -434,3 +410,4 @@ inline uint32_t convert_c_to_fp22(uint32_t raw_bits, PrecisionType prec) {
         default: return 0;
     }
 }
+
