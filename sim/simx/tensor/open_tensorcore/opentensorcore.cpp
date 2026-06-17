@@ -70,17 +70,17 @@ feed_mma_traces();
   stage2a_->tick();
   stage1_->tick();
 
-  while (!stage3_->Output.empty()) {
+  if (!stage3_->Output.empty()) {
     auto done = stage3_->Output.front(); stage3_->Output.pop();
     auto it = pending_traces_.find(done.uuid);
-    if (it == pending_traces_.end()) {
+    if (it != pending_traces_.end()) {
+      auto trace = it->second.trace;
+      uint32_t lane = it->second.lane;
+      pending_traces_.erase(it);
+      Outputs.at(lane).push(trace, 0);
+    } else {
       DT(1, "OpenTensorCore: completed uuid=#" << done.uuid << " not found");
-      continue;
     }
-    auto trace = it->second.trace;
-    uint32_t lane = it->second.lane;
-    pending_traces_.erase(it);
-    Outputs.at(lane).push(trace, 0);
   }
 }
 
