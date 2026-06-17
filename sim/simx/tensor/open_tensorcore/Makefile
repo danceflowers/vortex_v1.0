@@ -28,7 +28,7 @@ HDRS := $(wildcard tensor_top/*.h) \
         $(wildcard tensor_helper/*.h) \
         $(wildcard tensor_helper/test/*.h)
 
-CPPFLAGS   ?= -I. -I./tensor_top -I./tensor_control -I./local_memory -I./tensor_compute -I./tensor_helper -I./tensor_helper/test -I..
+CPPFLAGS   ?= -I. -I./tensor_top -I./tensor_control -I./local_memory -I./tensor_compute -I./tensor_helper -I./tensor_helper/test -I.. -I../../../common
 CXXFLAGS   ?= -std=c++17 -Wall -Wextra -Wpedantic
 LDFLAGS    ?=
 LDLIBS     ?=

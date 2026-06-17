@@ -28,7 +28,7 @@ OpenTensorCore::OpenTensorCore(const SimContext& ctx, const char* name,
   snprintf(sname, sizeof(sname), "%s_stage2a", name);
   stage2a_ = std::make_unique<OperandFetchStage>(ctx, sname, core, config.stage2);
   snprintf(sname, sizeof(sname), "%s_stage2b", name);
-  stage2b_ = std::make_unique<TCU_LDST_Stage>(ctx, sname, core, &dmem_);
+  stage2b_ = std::make_unique<LdstStage>(ctx, sname, core, &dmem_);
   snprintf(sname, sizeof(sname), "%s_stage3", name);
   stage3_ = std::make_unique<ComputePipeline>(ctx, sname, core, &dmem_, config.stage3);
 

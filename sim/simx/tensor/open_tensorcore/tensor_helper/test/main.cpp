@@ -25,6 +25,7 @@ constexpr uint32_t kSparse1To4 = 2;
 
 using PrimitiveFp9 = std::array<std::array<uint16_t, kPrimitiveDim>, kPrimitiveDim>;
 using PrimitiveFp22 = std::array<std::array<uint32_t, kPrimitiveDim>, kPrimitiveDim>;
+using SparseRowMeta = std::array<uint16_t, kPrimitiveDim>;
 
 static uint32_t rng_state = 1;
 
@@ -163,14 +164,6 @@ double decode_raw(uint32_t bits, PrecisionType prec) {
     std::fprintf(stderr, "decode_raw: unsupported precision %s\n", prec_name(prec));
     std::exit(1);
   }
-}
-
-double effective_ab_value(uint32_t bits, PrecisionType prec) {
-  return fp9_to_double(convert_to_fp9(bits, prec));
-}
-
-double effective_c_value(uint32_t bits, PrecisionType prec) {
-  return fp22_to_double(convert_c_to_fp22(bits, prec));
 }
 
 double fp22_to_output_double(uint32_t fp22, PrecisionType out_prec) {
@@ -373,21 +366,22 @@ PrimitiveFp9 dense_b_primitive(const QuantMatrix& b,
   return out;
 }
 
-void build_sparse_routed_primitive(const QuantMatrix& a,
-                                   const QuantMatrix& b,
-                                   uint32_t sparse_mode,
-                                   uint32_t m_base,
-                                   uint32_t n_base,
-                                   uint32_t k_base,
-                                   PrimitiveFp9* a_routed,
-                                   PrimitiveFp9* b_routed) {
-  if (a_routed == nullptr || b_routed == nullptr) {
+void build_sparse_compact_primitive(const QuantMatrix& a,
+                                    const QuantMatrix& b,
+                                    uint32_t sparse_mode,
+                                    uint32_t m_base,
+                                    uint32_t n_base,
+                                    uint32_t k_base,
+                                    PrimitiveFp9* a_compact_out,
+                                    PrimitiveFp9* b_dense_out,
+                                    SparseRowMeta* row_meta_out) {
+  if (a_compact_out == nullptr || b_dense_out == nullptr || row_meta_out == nullptr) {
     return;
   }
 
   PrimitiveFp9 a_compact = {};
   PrimitiveFp9 b_dense = dense_b_primitive(b, k_base, n_base);
-  std::array<uint8_t, 16> meta_line = {};
+  SparseRowMeta row_meta_by_row = {};
 
   for (uint32_t row = 0; row < kPrimitiveDim; ++row) {
     uint16_t row_meta = 0;
@@ -431,35 +425,78 @@ void build_sparse_routed_primitive(const QuantMatrix& a,
       }
     }
 
-    meta_line[row * 2 + 0] = static_cast<uint8_t>(row_meta & 0xffu);
-    meta_line[row * 2 + 1] = static_cast<uint8_t>((row_meta >> 8) & 0xffu);
+    row_meta_by_row[row] = row_meta;
   }
 
-  auto* a_compact_ptr =
-      reinterpret_cast<const uint16_t (*)[kPrimitiveDim]>(a_compact.data());
-  auto* b_dense_ptr =
-      reinterpret_cast<const uint16_t (*)[kPrimitiveDim]>(b_dense.data());
-  auto* a_routed_ptr =
-      reinterpret_cast<uint16_t (*)[kPrimitiveDim]>(a_routed->data());
-  auto* b_routed_ptr =
-      reinterpret_cast<uint16_t (*)[kPrimitiveDim]>(b_routed->data());
+  *a_compact_out = a_compact;
+  *b_dense_out = b_dense;
+  *row_meta_out = row_meta_by_row;
+}
 
-  if (!vortex::sparse::route_sparse_primitive(sparse_mode,
-                                              meta_line.data(),
-                                              a_compact_ptr,
-                                              b_dense_ptr,
-                                              a_routed_ptr,
-                                              b_routed_ptr)) {
-    std::fprintf(stderr, "Failed to route sparse primitive: mode=%s\n", sparse_name(sparse_mode));
-    std::exit(1);
+uint32_t reference_mul_fp9_to_fp22(uint16_t a_fp9, uint16_t b_fp9) {
+  auto s1 = fmul_s1(a_fp9, b_fp9, 8, 14, g_cfg.rm);
+  auto s2 = fmul_s2(a_fp9, b_fp9, 8, 14, s1);
+  return fmul_s3(s2, 8, 14);
+}
+
+PrimitiveFp22 reference_primitive(const PrimitiveFp9& a,
+                                  const PrimitiveFp9& b,
+                                  const PrimitiveFp22& c,
+                                  uint32_t sparse_mode,
+                                  const SparseRowMeta& row_meta,
+                                  uint32_t accum_phase) {
+  PrimitiveFp22 out = {};
+
+  for (uint32_t i = 0; i < kPrimitiveDim; ++i) {
+    for (uint32_t j = 0; j < kPrimitiveDim; ++j) {
+      uint32_t a_src[kPrimitiveDim] = {};
+      uint32_t b_src[kPrimitiveDim] = {};
+      for (uint32_t k = 0; k < kPrimitiveDim; ++k) {
+        a_src[k] = a[i][k];
+        b_src[k] = b[k][j];
+      }
+
+      uint32_t a4[4] = {};
+      uint32_t b4[4] = {};
+      if (sparse_mode == kSparseNone) {
+        uint32_t base = (accum_phase & 0x1u) * 4u;
+        for (uint32_t lane = 0; lane < 4; ++lane) {
+          a4[lane] = a_src[base + lane];
+          b4[lane] = b_src[base + lane];
+        }
+      } else if (sparse_mode == kSparse2To4) {
+        vortex::sparse::select_sparse_2_4_lane(row_meta[i], a_src, b_src, a4, b4);
+      } else if (sparse_mode == kSparse1To4) {
+        vortex::sparse::select_sparse_1_4_lane(row_meta[i], a_src, b_src, a4, b4);
+      } else {
+        std::fprintf(stderr, "reference_primitive: unsupported sparse mode %u\n", sparse_mode);
+        std::exit(1);
+      }
+
+      uint32_t products[4] = {};
+      for (uint32_t lane = 0; lane < 4; ++lane) {
+        products[lane] = reference_mul_fp9_to_fp22(static_cast<uint16_t>(a4[lane]),
+                                                   static_cast<uint16_t>(b4[lane]));
+      }
+      uint32_t dot = add4_fp22_rtl::add4_reference(products[0],
+                                                   products[1],
+                                                   products[2],
+                                                   products[3],
+                                                   g_cfg.rm);
+      out[i][j] = fp22_add_bits(dot, c[i][j], g_cfg.rm);
+    }
   }
+
+  return out;
 }
 
 PrimitiveFp22 run_primitive(TensorCoreTop* sim,
                             const PrimitiveFp9& a,
                             const PrimitiveFp9& b,
                             const PrimitiveFp22& c,
-                            const TestCaseDef& tc,
+                            uint32_t sparse_mode,
+                            const SparseRowMeta& row_meta,
+                            uint32_t accum_phase,
                             uint32_t* elapsed_cycles) {
   if (sim == nullptr) {
     std::fprintf(stderr, "run_primitive: null simulator\n");
@@ -481,8 +518,14 @@ PrimitiveFp22 run_primitive(TensorCoreTop* sim,
 
   TensorCoreMeta meta{};
   meta.valid = true;
+  meta.accum_phase_id = accum_phase;
 
-  sim->push_uop(a_in, b_in, c_in, meta);
+  uint16_t sparse_row_meta[kPrimitiveDim] = {};
+  for (uint32_t row = 0; row < kPrimitiveDim; ++row) {
+    sparse_row_meta[row] = row_meta[row];
+  }
+
+  sim->push_uop(a_in, b_in, c_in, meta, sparse_mode, sparse_row_meta);
 
   TensorCoreRetire retired{};
   for (uint32_t guard = 0; guard < 1024; ++guard) {
@@ -506,24 +549,88 @@ PrimitiveFp22 run_primitive(TensorCoreTop* sim,
   std::exit(1);
 }
 
+void accumulate_fp22_subtile(PrimitiveFp22* accum,
+                             const PrimitiveFp22& phase_out,
+                             bool first_phase) {
+  if (accum == nullptr) {
+    return;
+  }
+
+  if (first_phase) {
+    *accum = phase_out;
+    return;
+  }
+
+  for (uint32_t i = 0; i < kPrimitiveDim; ++i) {
+    for (uint32_t j = 0; j < kPrimitiveDim; ++j) {
+      (*accum)[i][j] = fp22_add_bits((*accum)[i][j], phase_out[i][j], g_cfg.rm);
+    }
+  }
+}
+
 std::vector<double> build_golden(const TestCaseDef& tc,
                                  const QuantMatrix& a,
                                  const QuantMatrix& b,
                                  const QuantMatrix& c) {
   std::vector<double> golden(tc.m * tc.n, 0.0);
-  for (uint32_t row = 0; row < tc.m; ++row) {
-    for (uint32_t col = 0; col < tc.n; ++col) {
-      float acc = tc.include_c
-                ? static_cast<float>(effective_c_value(c.at(row, col), c.prec))
-                : 0.0f;
-      for (uint32_t k = 0; k < tc.k; ++k) {
-        float av = static_cast<float>(effective_ab_value(a.at(row, k), a.prec));
-        float bv = static_cast<float>(effective_ab_value(b.at(k, col), b.prec));
-        acc += av * bv;
+
+  for (uint32_t m_base = 0; m_base < tc.m; m_base += kPrimitiveDim) {
+    for (uint32_t n_base = 0; n_base < tc.n; n_base += kPrimitiveDim) {
+      PrimitiveFp22 partial = {};
+      bool first_phase = true;
+
+      for (uint32_t macro_k = 0; macro_k < tc.k; macro_k += tc.macro_k_tile) {
+        uint32_t macro_k_end = std::min<uint32_t>(macro_k + tc.macro_k_tile, tc.k);
+        for (uint32_t k_base = macro_k; k_base < macro_k_end; k_base += kPrimitiveDim) {
+          if (tc.sparse_mode == kSparseNone) {
+            PrimitiveFp9 a_prim = dense_a_primitive(a, m_base, k_base);
+            PrimitiveFp9 b_prim = dense_b_primitive(b, k_base, n_base);
+            SparseRowMeta row_meta = {};
+
+            for (uint32_t half = 0; half < 2; ++half) {
+              PrimitiveFp22 c_input = first_phase ? initial_c_subtile(c, m_base, n_base)
+                                                  : PrimitiveFp22{};
+              uint32_t accum_phase = (((k_base / kPrimitiveDim) & 0x1u) * 2u) + half;
+              PrimitiveFp22 phase_out = reference_primitive(a_prim,
+                                                            b_prim,
+                                                            c_input,
+                                                            tc.sparse_mode,
+                                                            row_meta,
+                                                            accum_phase);
+              accumulate_fp22_subtile(&partial, phase_out, first_phase);
+              first_phase = false;
+            }
+          } else {
+            PrimitiveFp9 a_prim = {};
+            PrimitiveFp9 b_prim = {};
+            SparseRowMeta row_meta = {};
+            build_sparse_compact_primitive(a, b, tc.sparse_mode, m_base, n_base, k_base,
+                                           &a_prim, &b_prim, &row_meta);
+
+            PrimitiveFp22 c_input = first_phase ? initial_c_subtile(c, m_base, n_base)
+                                                : PrimitiveFp22{};
+            uint32_t accum_phase = (k_base / kPrimitiveDim) & 0x1u;
+            PrimitiveFp22 phase_out = reference_primitive(a_prim,
+                                                          b_prim,
+                                                          c_input,
+                                                          tc.sparse_mode,
+                                                          row_meta,
+                                                          accum_phase);
+            accumulate_fp22_subtile(&partial, phase_out, first_phase);
+            first_phase = false;
+          }
+        }
       }
-      golden[row * tc.n + col] = static_cast<double>(acc);
+
+      for (uint32_t i = 0; i < kPrimitiveDim; ++i) {
+        for (uint32_t j = 0; j < kPrimitiveDim; ++j) {
+          golden[(m_base + i) * tc.n + (n_base + j)] =
+              fp22_to_output_double(partial[i][j], tc.d_prec);
+        }
+      }
     }
   }
+
   return golden;
 }
 
@@ -540,21 +647,53 @@ std::vector<double> run_macro_case(const TestCaseDef& tc,
 
   for (uint32_t m_base = 0; m_base < tc.m; m_base += kPrimitiveDim) {
     for (uint32_t n_base = 0; n_base < tc.n; n_base += kPrimitiveDim) {
-      PrimitiveFp22 partial = initial_c_subtile(c, m_base, n_base);
+      PrimitiveFp22 partial = {};
+      bool first_phase = true;
 
       for (uint32_t macro_k = 0; macro_k < tc.k; macro_k += tc.macro_k_tile) {
         uint32_t macro_k_end = std::min<uint32_t>(macro_k + tc.macro_k_tile, tc.k);
         for (uint32_t k_base = macro_k; k_base < macro_k_end; k_base += kPrimitiveDim) {
-          PrimitiveFp9 a_prim = {};
-          PrimitiveFp9 b_prim = {};
           if (tc.sparse_mode == kSparseNone) {
-            a_prim = dense_a_primitive(a, m_base, k_base);
-            b_prim = dense_b_primitive(b, k_base, n_base);
+            PrimitiveFp9 a_prim = dense_a_primitive(a, m_base, k_base);
+            PrimitiveFp9 b_prim = dense_b_primitive(b, k_base, n_base);
+            SparseRowMeta row_meta = {};
+
+            for (uint32_t half = 0; half < 2; ++half) {
+              PrimitiveFp22 c_input = first_phase ? initial_c_subtile(c, m_base, n_base)
+                                                  : PrimitiveFp22{};
+              uint32_t accum_phase = (((k_base / kPrimitiveDim) & 0x1u) * 2u) + half;
+              PrimitiveFp22 phase_out = run_primitive(&sim,
+                                                      a_prim,
+                                                      b_prim,
+                                                      c_input,
+                                                      tc.sparse_mode,
+                                                      row_meta,
+                                                      accum_phase,
+                                                      &cycles);
+              accumulate_fp22_subtile(&partial, phase_out, first_phase);
+              first_phase = false;
+            }
           } else {
-            build_sparse_routed_primitive(a, b, tc.sparse_mode, m_base, n_base, k_base,
-                                          &a_prim, &b_prim);
+            PrimitiveFp9 a_prim = {};
+            PrimitiveFp9 b_prim = {};
+            SparseRowMeta row_meta = {};
+            build_sparse_compact_primitive(a, b, tc.sparse_mode, m_base, n_base, k_base,
+                                           &a_prim, &b_prim, &row_meta);
+
+            PrimitiveFp22 c_input = first_phase ? initial_c_subtile(c, m_base, n_base)
+                                                : PrimitiveFp22{};
+            uint32_t accum_phase = (k_base / kPrimitiveDim) & 0x1u;
+            PrimitiveFp22 phase_out = run_primitive(&sim,
+                                                    a_prim,
+                                                    b_prim,
+                                                    c_input,
+                                                    tc.sparse_mode,
+                                                    row_meta,
+                                                    accum_phase,
+                                                    &cycles);
+            accumulate_fp22_subtile(&partial, phase_out, first_phase);
+            first_phase = false;
           }
-          partial = run_primitive(&sim, a_prim, b_prim, partial, tc, &cycles);
         }
       }
 

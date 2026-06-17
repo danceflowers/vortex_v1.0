@@ -14,9 +14,14 @@
 #pragma once
 
 #include <cstdint>
-#include "tmem.h"
+#include <array>
 
 namespace vortex {
+
+struct TmemPacket {
+  std::array<uint8_t, 64> bytes;
+  TmemPacket() { bytes.fill(0); }
+};
 
 // Packet-level messages between TMEM clients and TmemSystem.
 //
@@ -27,23 +32,22 @@ namespace vortex {
 // One packet-level request crossing the TensorUnit/Core -> TmemSystem boundary.
 // arbitration_age orders all clients inside the shared TMEM request FIFO.
 struct TensorMemPortReq {
-  enum class AccessType : uint8_t {
-    Read = 0,
-    Write,
-  };
+  enum class AccessType : uint8_t { Read = 0, Write };
 
-  uint64_t request_id = 0;          // Globally unique request/response key.
-  uint64_t arbitration_age = 0;     // Lower values win shared-port arbitration.
-  AccessType access_type = AccessType::Read;  // Read or write transaction.
-  Tmem::PortRequestDesc port_request = {};    // TMEM packet address descriptor.
-  TmemPacket write_packet = {};               // Write payload; ignored for reads.
+  uint64_t request_id = 0;
+  uint32_t tag = 0;
+  AccessType access_type = AccessType::Read;
+  uint32_t taddr      = 0;                     // new flat field (replaces port_request.taddr)
+  uint32_t packet_idx = 0;                     // new flat field (replaces port_request.packet_idx)
+  TmemPacket write_packet = {};
 };
 
 // Response for one granted TMEM packet request after the SRAM access completes.
 struct TensorMemPortRsp {
-  uint64_t request_id = 0;          // Matching request ID.
+  uint64_t request_id = 0;
+  uint32_t tag = 0;                              // Routing tag (required by TxRxCrossBar).
   TensorMemPortReq::AccessType access_type = TensorMemPortReq::AccessType::Read;
-  TmemPacket read_packet = {};      // Read payload; zero for writes.
+  TmemPacket read_packet = {};
 };
 
 // Completion notice for an architecture-visible async tensor macro operation.
@@ -54,5 +58,13 @@ struct TensorAsyncOpCompletion {
   uint32_t tx_bytes = 0;            // Optional completed TMA byte count.
   uint32_t payload_size_bytes = 0;  // Optional completed payload size.
 };
+
+enum class TmemTaddrBlockReason : uint8_t {
+  None = 0, Invalid, BusyTmemShift, PayloadNotReady, MetaNotReady,
+};
+
+// Deprecated stubs for old Core API compat.
+struct TmemAllocation { bool valid = false; uint32_t payload_col_base = 0; };
+struct PortRequestDesc { uint32_t packet_idx = 0; };
 
 } // namespace vortex

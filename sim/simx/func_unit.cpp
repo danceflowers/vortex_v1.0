@@ -431,14 +431,44 @@ void VpuUnit::tick() {
 TcuUnit::TcuUnit(const SimContext& ctx, Core* core)
 	: FuncUnit(ctx, core, "tcu-unit")
 {
-	// bind tensor unit
+	// Self-pass-through initially; bound to TensorSocket OTC in bind_tensor_ports().
 	for (uint32_t iw = 0; iw < ISSUE_WIDTH; ++iw) {
-		this->Inputs.at(iw).bind(&core_->tensor_unit()->Inputs.at(iw));
-		core_->tensor_unit()->Outputs.at(iw).bind(&this->Outputs.at(iw));
+		this->Inputs.at(iw).bind(&this->Outputs.at(iw));
 	}
 }
 
 void TcuUnit::tick() {
-	// use tensor_unit
+	// forwarded
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+TmemUnit::TmemUnit(const SimContext& ctx, Core* core)
+    : FuncUnit(ctx, core, "tmem-unit")
+{
+    // TODO: Bind to Tmem instruction port once TensorSocket is integrated.
+    // For now, pass-through traces directly with pipeline delay.
+    for (uint32_t iw = 0; iw < ISSUE_WIDTH; ++iw) {
+        this->Inputs.at(iw).bind(&this->Outputs.at(iw));
+    }
+}
+
+void TmemUnit::tick() {
+    // forwarded
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+TmaUnit::TmaUnit(const SimContext& ctx, Core* core)
+    : FuncUnit(ctx, core, "tma-unit")
+{
+    // TODO: Bind to TMA instruction port once TensorSocket is integrated.
+    for (uint32_t iw = 0; iw < ISSUE_WIDTH; ++iw) {
+        this->Inputs.at(iw).bind(&this->Outputs.at(iw));
+    }
+}
+
+void TmaUnit::tick() {
+    // forwarded
 }
 //#endif

@@ -25,7 +25,7 @@
 #include "tensor_mem_port_types.h"
 #include "stage1_tcdecode.h"
 #include "stage2_operandfetch.h"
-#include "TCU_LDST_Stage.h"
+#include "LdstStage.h"
 #include "stage3_compute.h"
 
 namespace vortex {
@@ -83,7 +83,7 @@ private:
 
   std::unique_ptr<TcDecodeStage>     stage1_;
   std::unique_ptr<OperandFetchStage> stage2a_;
-  std::unique_ptr<TCU_LDST_Stage>    stage2b_;
+  std::unique_ptr<LdstStage>    stage2b_;
   std::unique_ptr<ComputePipeline>   stage3_;
 
   std::unordered_map<uint64_t, PendingTrace> pending_traces_;

@@ -10,7 +10,6 @@ CXXFLAGS += -std=c++17 -Wall -Wextra -Wfatal-errors
 CXXFLAGS += -fPIC -Wno-maybe-uninitialized
 CXXFLAGS += -I$(SRC_DIR) -I$(SRC_DIR)/common -I$(SRC_DIR)/tensor
 CXXFLAGS += -I$(SRC_DIR)/tensor/open_tensorcore -I$(SRC_DIR)/tensor/open_tensorcore/tensor_compute
-CXXFLAGS += -I$(SRC_DIR)/tensor/open_tensorcore/tensor_control
 CXXFLAGS += -I$(SRC_DIR)/tensor/open_tensorcore/tensor_helper
 CXXFLAGS += -I$(SW_COMMON_DIR) -I$(ROOT_DIR)/hw
 CXXFLAGS += -I$(THIRD_PARTY_DIR)/softfloat/source/include
@@ -41,13 +40,16 @@ else
 endif
 # Add TCU extension sources
 ifneq ($(findstring -DEXT_TCU_ENABLE, $(CONFIGS)),)
-	SRCS += $(SRC_DIR)/tensor/tma.cpp
-	SRCS += $(SRC_DIR)/tensor/tmem_utils.cpp
-	SRCS += $(SRC_DIR)/tensor/tmem_math_packet.cpp
-	SRCS += $(SRC_DIR)/tensor/tmem.cpp $(SRC_DIR)/tensor/tmem_system.cpp
-	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_control/tc_decode.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tc_decode.cpp
 	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_helper/tensor_debug_utils.cpp
-	SRCS += $(SRC_DIR)/tensor/open_tensorcore/tensor_unit.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/stage1_tcdecode.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/stage2_operandfetch.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/LdstStage.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/stage3_compute.cpp
+	SRCS += $(SRC_DIR)/tensor/open_tensorcore/opentensorcore.cpp
+	SRCS += $(SRC_DIR)/tensor/tmem_module.cpp
+	SRCS += $(SRC_DIR)/tensor/tma_module.cpp
+	SRCS += $(SRC_DIR)/tensor/tensor_socket.cpp
 endif
 
 # Debugging

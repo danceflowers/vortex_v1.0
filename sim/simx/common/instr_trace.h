@@ -43,6 +43,48 @@ struct SfuTraceData : public ITraceData {
   SfuTraceData(Word arg1, Word arg2) : arg1(arg1), arg2(arg2) {}
 };
 
+// TCU_WMMA trace payload filled by execute stage and consumed by OpenTensorCore Stage1 (TcDecode).
+// Carries raw register values and qualifier bits; semantic decoding is deferred to Stage1.
+struct TcuTraceData : public ITraceData {
+  using Ptr = std::shared_ptr<TcuTraceData>;
+  uint32_t idesc;                  // i_descriptor_t from rs1
+  uint32_t operand_block_lmem_ptr; // LMEM pointer to operand_block_t from rs2
+  uint32_t qualifier;              // raw funct7 bits (ws/sp/enable_input_d/cta_group/collector/multicast)
+};
+
+// TMEM trace payload for TMEM_* / MBAR_* instructions.
+// Filled by execute stage; consumed by the TMEM module (vortex::tensor::Tmem).
+struct TmemTraceData : public ITraceData {
+  using Ptr = std::shared_ptr<TmemTraceData>;
+  uint32_t rs1_value;    // first register operand
+  uint32_t rs2_value;    // second register operand
+  uint32_t funct3;       // raw funct3 (identifies the TMEM sub-op)
+  uint32_t raw_funct7;   // raw funct7 qualifier bits
+  uint32_t rd;           // destination register (for writeback, 0 = x0)
+};
+
+// TCU_LD/ST trace payload: DMem ↔ register file.
+// LD: DMem → convert → 32 threads × 8 regs. ST: 32 threads × 8 regs → convert → DMem.
+struct TcuLdStTraceData : public ITraceData {
+  using Ptr = std::shared_ptr<TcuLdStTraceData>;
+  bool     is_load = true;          // true=LD, false=ST
+  uint32_t fmt     = 0;             // output format (LD) / input format (ST)
+  uint32_t rd      = 0;             // destination register (LD only)
+  // For ST: 32 threads × 8 registers = 256 values. Row-major, thread t gets [t*8..t*8+7].
+  std::array<uint32_t, 256> values = {};
+};
+
+// TMA trace payload for cp.async.bulk.tensor load/store instructions.
+// Filled by execute stage; consumed by the TMA module (vortex::tensor::Tma).
+struct TmaTraceData : public ITraceData {
+  using Ptr = std::shared_ptr<TmaTraceData>;
+  uint32_t tensor_map_addr;  // rs1: DRAM address of tensor_map_t (128 B)
+  uint32_t args_lmem_ptr;    // rs2: LMEM pointer to cpabulk_transfer_args_t (32 B)
+  uint32_t funct3;           // raw funct3 (LD vs ST)
+  uint32_t raw_funct7;       // raw funct7 qualifier bits
+  uint32_t rd;               // destination register (for writeback, 0 = x0)
+};
+
 struct instr_trace_t {
 public:
   //--

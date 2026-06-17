@@ -86,7 +86,6 @@ Emulator::Emulator(const Arch &arch, const DCRS &dcrs, Core* core)
     , barriers_(arch.num_barriers(), 0)
     , ipdom_size_(arch.num_threads()-1)
   //#ifdef EXT_TCU_ENABLE
-    , tensor_unit_(core->tensor_unit())
   //#endif
   #ifdef EXT_V_ENABLE
     , vec_unit_(core->vec_unit())
@@ -181,8 +180,6 @@ instr_trace_t* Emulator::step() {
   uint32_t best_score = 0;
   const auto nw = arch_.num_warps();
 //#ifdef EXT_TCU_ENABLE
-  TensorUnit::IssueBlockReason best_tcu_block = TensorUnit::IssueBlockReason::None;
-  bool saw_tensor_candidate = false;
 //#endif
   bool saw_runnable_warp = false;
 
@@ -202,12 +199,8 @@ instr_trace_t* Emulator::step() {
       const auto& instr = *warp.ibuffer.front();
       if (std::holds_alternative<TcuType>(instr.getOpType())
        && std::holds_alternative<IntrTcuArgs>(instr.getArgs())) {
-        saw_tensor_candidate = true;
         auto tcu_type = std::get<TcuType>(instr.getOpType());
-        score = tensor_unit_->scheduler_score(wid, tcu_type);
-        if (score == 0 && best_tcu_block == TensorUnit::IssueBlockReason::None) {
-          best_tcu_block = tensor_unit_->classify_issue_block(wid, tcu_type);
-        }
+        (void)tcu_type;
       }
     }
 //#endif
@@ -219,11 +212,6 @@ instr_trace_t* Emulator::step() {
 
 //#ifdef EXT_TCU_ENABLE
   if (best_score <= 1) {
-    if (best_tcu_block != TensorUnit::IssueBlockReason::None) {
-      tensor_unit_->record_issue_stall(best_tcu_block);
-    } else if (saw_runnable_warp && !saw_tensor_candidate) {
-      tensor_unit_->record_no_tensor_instr_candidate_stall();
-    }
   }
 //#endif
 
@@ -362,13 +350,7 @@ void Emulator::dump_warp_front_state(std::ostream& os, uint32_t wid) const {
   }
 
   auto tcu_type = std::get<TcuType>(instr.getOpType());
-  os << " front_tcu=" << tcu_type;
-
-  auto score = tensor_unit_->scheduler_score(wid, tcu_type);
-  auto block = tensor_unit_->classify_issue_block(wid, tcu_type);
-  os << " score=" << score
-     << " block=" << static_cast<uint32_t>(block)
-     << "\n";
+  os << " front_tcu=" << tcu_type << "\n";
 }
 
 bool Emulator::wspawn(uint32_t num_warps, Word nextPC) {
@@ -565,7 +547,36 @@ void Emulator::cout_flush() {
 Word Emulator::get_csr(uint32_t addr, uint32_t wid, uint32_t tid) {
   auto core_perf = core_->perf_stats();
 //#ifdef EXT_TCU_ENABLE
-  auto tensor_perf = core_->tensor_unit()->perf_stats();
+  // TCU perf counters are not yet wired into the OpenTensorCore/TensorSocket
+  // architecture; return zeroed values so MPM CSR reads compile and report 0.
+  static const struct TcuPerfStub {
+    uint64_t tc_active_cycles = 0;
+    uint64_t setup_end_cycle = 0;
+    uint64_t epilogue_begin_cycle = 0;
+    uint64_t issued_primitive_tiles = 0;
+    uint64_t retired_primitive_tiles = 0;
+    uint64_t stall_a_not_ready = 0;
+    uint64_t stall_b_not_ready = 0;
+    uint64_t stall_c_not_ready = 0;
+    uint64_t stall_tc_busy = 0;
+    uint64_t stall_taddr_reuse = 0;
+    uint64_t stall_slot_busy = 0;
+    uint64_t stall_no_tensor_instr_candidate = 0;
+    uint64_t stall_mma_load_taddr_not_ready = 0;
+    uint64_t stall_taddr_busy_due_to_tma_load = 0;
+    uint64_t stall_taddr_busy_due_to_tma_store_or_shift = 0;
+    uint64_t stall_no_wmma_job_builder_empty = 0;
+    uint64_t stall_no_wmma_waiting_for_mma_load = 0;
+    uint64_t stall_no_wmma_waiting_for_taddr_alloc = 0;
+    uint64_t stall_no_wmma_waiting_for_slot_release = 0;
+    uint64_t issued_macro_wmma = 0;
+    uint64_t retired_macro_wmma = 0;
+    uint64_t pending_wmma_jobs_max = 0;
+    uint64_t stall_a_meta_not_ready = 0;
+    uint64_t stall_no_wmma_job_ready = 0;
+    uint64_t stall_tmem_read_port_busy = 0;
+    uint64_t stall_tmem_write_port_busy = 0;
+  } tensor_perf;
 //#endif
   switch (addr) {
   case VX_CSR_SATP:

@@ -18,6 +18,7 @@
 #include "constants.h"
 #include "dcrs.h"
 #include "cluster.h"
+#include "tensor/tensor_socket.h"
 
 namespace vortex {
 
@@ -25,6 +26,7 @@ class ProcessorImpl {
 public:
   struct PerfStats {
     CacheSim::PerfStats l3cache;
+    CacheSim::PerfStats tcache;
     MemSim::PerfStats memsim;
     uint64_t mem_reads;
     uint64_t mem_writes;
@@ -52,9 +54,11 @@ private:
 
   const Arch& arch_;
   std::vector<std::shared_ptr<Cluster>> clusters_;
+  std::vector<std::shared_ptr<TensorSocket>> tensor_sockets_;
   DCRS dcrs_;
   MemSim::Ptr memsim_;
   CacheSim::Ptr l3cache_;
+  CacheSim::Ptr tcache_;  // tensor cluster cache
   uint64_t perf_mem_reads_;
   uint64_t perf_mem_writes_;
   uint64_t perf_mem_latency_;

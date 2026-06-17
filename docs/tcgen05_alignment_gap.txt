@@ -1,0 +1,543 @@
+================================================================================
+Vortex CModel — tcgen05 PTX 对齐状态盘点
+生成时间: 2026-04-27 (Phase-2 完成时)
+适用范围: sim/simx/ + kernel/include/vx_tensor.h + 相关 docs
+================================================================================
+
+一、严格对齐项（编码 / 数据布局 / 核心语义）
+--------------------------------------------------------------------------------
+
+1. ISA opcode 分组
+   - custom-1 (EXT2, opcode=0x2B): tcgen05 TMEM 管理 + cp.async.bulk.tensor
+   - custom-2 (EXT3, opcode=0x5B): tcgen05 sync + 完整 mbarrier 族
+   - custom-3 (EXT4, opcode=0x7B): tcgen05 计算 (mma/ld/st/wait::ld/wait::st)
+   按 RISC-V.docx 三组 opcode 严格分配。
+
+2. funct3 + qualifier 编码哲学
+   funct7 = 7-bit qualifier 承载 PTX `.modifier` 后缀；funct3 区分指令变体；
+   每个变体只由 funct3 承载（用户硬性要求）。
+
+3. idescriptor_t (32-bit)
+   PTX §9.7.16.5.4 字段位段一一对应：
+     [1:0]   sparsity_meta_sel
+     [2]     sparsity_kind
+     [7:4]   kind (8 种精度族)
+     [15:8]  shape_m
+     [23:16] shape_n
+     [25:24] a_storage_layout
+     [27:26] b_storage_layout
+     [28]    output_negate
+     [29]    saturate
+     [30]    transpose_a
+     [31]    transpose_b
+   sizeof = 4 (static_assert).
+
+4. tensor_map_t (128B)
+   CUtensorMap 形态对齐：global_address / box_size[5] / global_stride[5] /
+   element_strides[5] / element_type / interleave / swizzle / l2_promotion /
+   oob_fill / rank。sizeof = 128 (static_assert).
+
+5. mbarrier_state_t (8B)
+   PTX §7.6.1 位段：
+     [63:62] phase parity
+     [61:32] pending_arrival_count (30b)
+     [31:20] pending_tx_count (12b, 字节单位)
+     [19:0]  expected_arrival_count (20b)
+   sizeof = 8 (static_assert).
+
+6. pending_tx 字节单位
+   PTX §7.6.4 expect_tx / complete_tx 单位 = 字节。Core::mbarrier_expect_tx /
+   mbarrier_complete_tx 直接接收 tx_bytes。
+
+7. tcgen05.commit 语义修正（Plan §10.1.7 corrigendum）
+   注册到 mbar 的 expected_arrival_count + pending_arrival_count（NOT
+   pending_tx_count）。每个 tcgen05.async op 完成时
+   on_async_tensor_op_completed() 调 mbarrier_arrive。
+
+8. mbarrier phase parity 协议
+   mbarrier_wait / test_wait / try_wait 全部用 phase parity bit 比较；phase
+   advance 在 (pending_arrival_count == 0 && pending_tx_count >= expected_tx_count)
+   时翻转 phase[63:62] 并重置计数器。LMEM mirror 在每次状态变更后写回。
+
+9. TCU_MMA 5 操作数布局
+   rd = d_taddr / rs1 = idesc (32-bit) / rs2 = operand_block_lmem_ptr (32B)。
+   operand_block_t 容纳 a_taddr / b_sdesc(64-bit) / lanes_off。
+
+10. d_taddr R-M-W 语义
+    enable_input_d=1 时 d_taddr 同时是 C 输入和 D 输出（PTX 无独立 c_taddr）。
+
+11. collector_a_state 编码到 qualifier
+    qualifier[5:4] 表示 4 状态 fill/use/lastuse/discard。
+    collector_b_state 不编码（B 在 .ws 永远 streaming，无 lifecycle）。
+
+12. ordering 位 (.relaxed / .release / .acquire) 编码就位
+    MBAR_ARRIVE / EXPECT_TX / COMPLETE_TX / WAIT / TEST_TRY_WAIT 各自的
+    qualifier 中都有 ordering 位段。Vortex 当前 fence 模型 strong-only，
+    .relaxed 退化为 strong（不破坏正确性）。
+
+13. multicast::cluster / cta_group::2
+    qualifier 位编码就位；单 cluster 单 CTA 模型行为退化为 cta-scope。
+
+14. 描述符存放位置
+    operand_block_t 在 LMEM；mbarrier_state_t 在 LMEM；tensor_map_t 在 DRAM
+    constant 区；64-bit b_sdesc / s_desc 走 LMEM 中转（rs2 = LMEM 指针）。
+
+15. tc_decode 范围收窄
+    只解 TCU_MMA / TCU_LD / TCU_ST 三个 tensor 计算指令；其他全部由 Core 直接
+    处理，不经 tc_decode。
+
+================================================================================
+二、未严格对齐项（编码就位 / 行为占位 或简化）
+--------------------------------------------------------------------------------
+
+GAP-1: DRAM↔LMEM 真实数据通路 (Phase-3.2 完成)
+  现状: cpabulk_tensor_load/store 现在按 args_lmem_ptr 范围分两条路径:
+        (a) args_lmem_ptr 在 LMEM 范围 [LMEM_BASE_ADDR, +LMEM_SIZE) →
+            直接 DRAM↔LMEM: tensor_map_addr 是真实 128B tensor_map_t 指针，
+            从 args.smem_addr / args.coords / global_address+stride 计算
+            源/目地址，64B 流式拷贝
+        (b) 否则 → 旧 desc_id+TmaFrontend 兼容路径 (legacy 9 个 kernel 用)
+  剩余: 64B chunk 当前是同步完成模型(op.completed=true issue 时)；后续可
+        改为多周期推进真实 LMEM bank 仲裁
+
+GAP-2: mbarrier::complete_tx::bytes 链路 (Phase-3.2 完成)
+  现状: AsyncTensorOp 增 tx_bound_mbar / tx_bytes 字段；
+        cpabulk_tensor_load 在 (complete_tx && args.mbar_addr != 0) 时填字段；
+        on_async_tensor_op_completed 路径头部检查并调
+        mbarrier_complete_tx(addr, bytes)，完成后清 0 防止重复触发
+
+GAP-3: tmem_cp 数据通路 (Phase-3.2 部分完成)
+  现状: 实现 LMEM→TMEM 按 shape 编码计算字节数 (4096/128/2048/1024/512B)；
+        从 s_desc[13:0]*16 解出 LMEM 源地址；调 Tmem::copy_in() 写入 TMEM
+  剩余: decompress != 0 (b6x16_p32 / b4x16_p64) 暂当作 1:1 拷贝；
+        s_desc 高位 (leading dim stride / swizzle bit pattern) 暂未参与寻址
+
+GAP-4: tcu_ld / tcu_st (tcgen05.ld/st) — Phase-3.3.1 完成
+  现状: per-thread 字节级 RF↔TMEM 数据通路真实化; shape=32x32b/num=1
+        子集已端到端 PASS (tests/regression/tcu_ldst smoke 32 lanes 全通过)
+  实现:
+    - sim/simx/tensor/tmem.{h,cpp}: handle_region_read_bytes / write_bytes
+    - sim/simx/tensor/tmem_system.h: 同名 inline forward 到内部 Tmem
+    - sim/simx/core.{h,cpp}: tmem_region_read_bytes / write_bytes 路由 (优先 TmemSystem)
+    - sim/simx/execute.cpp: TCU_LD / TCU_ST per-thread case 实现
+    - sim/simx/decode.cpp: TMEM_ALLOC 补 setDestReg(rd) (关键 bugfix:
+      之前 alloc handle 没有写回 RF, 导致所有 TCU_LD/ST 用了 stale taddr)
+  剩余: shape>=16x32b 多字 warp-collective 模式 (Phase-3.4)
+
+GAP-5: try_wait 真实超时
+  现状: timeout_bucket 解码但行为 = test_wait（不真挂起）
+  类型: 行为简化
+  需要: Core 内排程 wakeup 在 +(1 << timeout_bucket) cycle 后唤醒
+
+GAP-6: tcgen05.wait::ld vs wait::st 拆分
+  现状: 两者共用 wait_for_all_inflight_tcgen05_async()（无 per-kind 跟踪）
+  类型: 行为简化
+  需要: AsyncTensorOpType 已有 MmaLoad/MmaStore/Wmma 区分；wait 时按 ld/st 过滤
+
+GAP-7: lanes_off (cta_group::2)
+  现状: operand_block_t 字段就位但单 CTA 模型不消费
+  类型: 行为占位（编码就位）
+  需要: cluster 多 CTA 模型支持
+
+GAP-8: 9 个 tcu_* 测试 kernel 迁移
+  现状 (Phase-3.1 完成): 9 个 kernel 全部使用新 ISA (tcu_mma + cpabulk_tensor_ld
+        + mbar_* + tmem_dealloc) 重写并 clang++ 编译通过 (kernel.elf 全部生成)。
+        语义层面: 所有 kernel 切换为 single-instruction TCU_MMA + cpabulk
+        producer/consumer + mbarrier sync 路径。
+  剩余 (P1 依赖): 数据通路正确性依赖 GAP-1/2/3/4 (DRAM↔LMEM、complete_tx::bytes、
+        tmem_cp、tcu_ld/st)；目前仅保证 ISA encoding 与控制流编译通过。
+  涉及测试:
+    - tests/regression/sgemm_tcu/kernel.cpp                  ✓ 编译通过
+    - tests/regression/sgemm_tcu_tmem/kernel.cpp             ✓ 编译通过
+    - tests/regression/tcu_mbarrier_async/kernel.cpp         ✓ 编译通过
+    - tests/regression/tcu_tmem_chain/kernel.cpp             ✓ 编译通过
+    - tests/regression/tcu_tmem_shift_fence/kernel.cpp       ✓ 编译通过
+    - tests/regression/tcu_tmem_shift_refill/kernel.cpp      ✓ 编译通过
+    - tests/regression/tcu_tmem_window_d/kernel.cpp          ✓ 编译通过
+    - tests/regression/tcu_warpgroup_collective/kernel.cpp   ✓ 编译通过
+    - tests/regression/tcu_wmma_overlap/kernel.cpp           ✓ 编译通过
+  新增 smoke:
+    - tests/regression/tcu_mbarrier_pending_tx/              ✓ 编译通过
+      用于 P1 阶段 GAP-2 验证 (expect_tx → cpabulk_tensor_ld(complete_tx) →
+      wait 链路；当前 phase-parity 翻转 assertion 因 GAP-2 未关而推迟)。
+
+GAP-9: kernel 端 make_idescriptor / make_operand_block 工厂
+  现状 (Phase-3.1 完成): kernel/include/vx_tensor.h 已加：
+    - struct idescriptor_t (32-bit, PTX §9.7.16.5.4)
+    - struct operand_block_t (32B, LMEM)
+    - struct cpabulk_transfer_args_t (32B, LMEM)
+    - struct mbarrier_state_t (8B, PTX §7.6.1)
+    - struct tensor_map_t (128B, CUtensorMap)
+    - constexpr uint32_t make_idescriptor<At,Bt,Ct,Dt>(M, N, ...)
+    - constexpr operand_block_t make_operand_block(a_taddr, b_sdesc, lanes_off)
+    - constexpr cpabulk_transfer_args_t make_cpabulk_args(smem, mbar, coords...)
+    - typed overloads: tcu_mma(d_taddr, idesc, operand_block_t*),
+      cpabulk_tensor_ld/st(tensor_map_t*, cpabulk_transfer_args_t*),
+      tmem_cp(taddr, uint64_t* s_desc_ptr)
+  全部 static_assert 通过，与 sim/simx/tensor/idescriptor.h 字段位段一一对齐
+  (host runtime 与 kernel 共用 byte-for-byte 兼容布局)。
+
+GAP-10: TensorAsyncFrontend 内部 5-stage 仍走旧结构
+  现状: enqueue_async_tcu_mma 调用 enqueue_async_mma_load/store/wmma 私有
+        helpers；fan-out 仍按 4×fill_a + 4×fill_b + 4×fill_c + wmma_job +
+        store_d 老结构走
+  类型: 架构残留
+  需要: 是否真要消除 stage helper 层（架构清晰 vs 代码量）由后续决定
+
+GAP-11: fill C from CMem vs PTX D 原位 R-M-W 验证
+  现状: 内部 microarch 仍有 CMem 阶段；Phase-2 dispatch_tcu_mma 把 c_handle
+        设为 d_taddr 但 DMem 是否真做原位累加（read-modify-write 同一 TMEM
+        位置）未深度跑过端到端验证
+  类型: 可能存在语义 gap
+  需要: 写一个针对 enable_input_d=1 + 多次连续 mma 的回归测试，验证 D
+        累加结果与参考模型一致
+
+GAP-12: tcgen05 kind::i8 / mxf* 计算路径
+  现状: idesc kind 字段解码到 (8 种)，但 simx 计算阵列只实现
+        F16/BF16/TF32/F8F6F4 (4 种)；I8 / MXF8F6F4 / MXF4 / MXF4NVF4 都是
+        kind_to_fmt() 中 fmt=0 占位
+  类型: 行为占位
+  需要: 计算阵列扩展支持整数 / mx 浮点
+
+GAP-13: tcgen05.cp shape × decompress 矩阵
+  现状: qualifier 解出 5 种 shape × 3 种 decompress = 15 种组合；但 tmem_cp
+        Core 实现是单一 no-op stub
+  类型: 行为占位
+  需要: 实现 15 种 SMEM 布局 → TMEM 写入的 swizzle / decompress 数据通路
+
+GAP-14: try_wait phase_token 跨代复用
+  现状: phase parity 单 bit 比较；caller 传入旧 phase 立即返回 ready，但
+        phase token 跨多代 (parity 翻转两次回到旧值) 时存在歧义（理论上
+        PTX 也是用 phase parity 单 bit）
+  类型: PTX 一致 / 但语义边角
+  需要: 不修（PTX 行为本身如此），但要在文档说明
+
+GAP-15: cta_mask multicast 广播
+  现状: mbar_commit / cpabulk_tensor_load 接收 cta_mask / multicast 位但都是
+        no-op
+  类型: 行为占位（单 CTA 模型）
+  需要: cluster 多 CTA 支持时一并处理
+
+================================================================================
+三、关键不变量
+--------------------------------------------------------------------------------
+
+- grep -rn "TcuType::WMMA\|TcuType::MMA_LOAD\|TcuType::MMA_STORE\|TcuType::TC_*\|
+  TcuType::TMA_*\|TcuType::TMEM_FREE" sim/ → 0 行
+- grep -rn "TcuCommitScope\|tcu_commit_scope_from_u32" sim/ → 0 行
+- grep -rn "Core::tma_load\|Core::tma_store\|Core::tma_wait\|Core::tc_commit\|
+  Core::tc_fence\|Core::tc_wait" sim/ → 0 行
+- grep -rn "args\.barrier_id\|args\.commit_scope\|args\.macro_op\|args\.step_\|
+  args\.bank_span\|args\.meta_col_span\|args\.packet_count" sim/ → 0 行
+  (注: args.descriptor 仍保留，被 frontend / issue_policy / mem_manager 用作
+   状态匹配 key —— 它是按 idesc value 匹配的合法用途)
+- static_assert(sizeof(idescriptor_t) == 4)            ✓
+- static_assert(sizeof(operand_block_t) == 32)         ✓
+- static_assert(sizeof(cpabulk_transfer_args_t) == 32) ✓
+- static_assert(sizeof(tensor_map_t) == 128)           ✓
+- static_assert(sizeof(mbarrier_state_t) == 8)         ✓
+- 全部 simx C++ 文件 g++ -fsyntax-only 通过
+
+================================================================================
+四、总评
+--------------------------------------------------------------------------------
+
+ISA encoding / 描述符 binary 布局: ✅ 严格对齐 PTX (可 byte-for-byte 移植 RTL)
+核心 PTX 语义:                       ✅ 严格对齐
+                                       (mbarrier phase 协议 / commit→arrive /
+                                        expect_tx-complete_tx 字节计数 /
+                                        d_taddr R-M-W)
+数据通路实际行为:                    ⚠️ 10 个占位/简化项（GAP-1/2/3 已关）
+测试覆盖:                            ⚠️ 9 个 tcu_* + 1 smoke 已编译通过；
+                                       端到端正确性: P1 三 GAP 已关，剩
+                                       GAP-4 (tcu_ld/st)、GAP-11 (D R-M-W
+                                       回归测试) 阻塞
+
+整体符合用户当时指示:
+  "编码严格按 PTX 文档来，但是具体功能可以只实现必要的和目前硬件已有的功能，
+   其他的可以暂时作为占位"
+
+================================================================================
+五、修复优先级建议（自上而下）
+--------------------------------------------------------------------------------
+
+P0 — 解锁回归（已完成）
+  GAP-9  kernel 端 make_idescriptor / make_operand_block 工厂              ✓
+  GAP-8  9 个 tcu_* 测试 kernel 迁移 + tcu_mbarrier_pending_tx smoke       ✓
+         所有 kernel 切到新 ISA，clang++ 编译通过。数据通路正确性依赖 P1。
+
+P1 — 数据通路真实化 (Phase-3.2 完成)
+  GAP-1  DRAM↔LMEM 真实数据通路                                              ✓
+  GAP-2  mbarrier::complete_tx::bytes 链路                                   ✓
+  GAP-3  tmem_cp 数据通路 (5 种 shape × 1 种 decompress=NONE)               ✓
+         decompress != NONE (b6x16_p32 / b4x16_p64) 推迟到 P4
+
+P2 — 计算族补全
+  GAP-4  tcu_ld / tcu_st 真实数据通路
+  GAP-11 fill C → D 原位 R-M-W 端到端回归
+         理由: GAP-11 是 PTX d_taddr R-M-W 的正确性验证；写一个针对
+         enable_input_d=1 多次累加的测试即可。
+
+P3 — 同步族细节
+  GAP-5  try_wait 真实超时
+  GAP-6  wait::ld vs wait::st 拆分
+         理由: 单 warp 模型下行为简化不影响功能正确性；按需推进。
+
+P4 — 多 CTA / cluster 模型（推迟到硬件支持时）
+  GAP-7  lanes_off (cta_group::2)
+  GAP-13 tcgen05.cp shape × decompress 15 种组合
+  GAP-15 cta_mask multicast 广播
+         理由: 依赖 cluster 多 CTA 模型；硬件未到位，行为占位即可。
+
+P5 — 计算精度扩展（按需）
+  GAP-12 kind::i8 / mxf* 计算路径
+         理由: 计算阵列扩展工作量大；需先确认 workload 实际需要哪些精度。
+
+P6 — 架构清理（可选）
+  GAP-10 TensorAsyncFrontend 5-stage helper 结构合并
+  GAP-14 try_wait phase_token 跨代复用文档化
+         理由: 不影响功能，纯架构 / 文档侧整理。
+
+================================================================================
+六、关键文件路径速查
+--------------------------------------------------------------------------------
+
+ISA encoding / 描述符:
+  sim/simx/tensor/idescriptor.h           — idescriptor_t / operand_block_t /
+                                            cpabulk_transfer_args_t / tensor_map_t /
+                                            mbarrier_state_t 全部 PTX-aligned struct
+  sim/simx/common/types.h                 — TcuType (20 值) / IntrTcuArgs / 各
+                                            qualifier enum (TcuMbarVariant /
+                                            TcuWaitVariant / TcuCpShape /
+                                            TcuCpDecompress / ...)
+  sim/simx/common/instr.h                 — Opcode::EXT2/EXT3/EXT4 常量
+  kernel/include/vx_intrinsics.h          — RISCV_CUSTOM1/2/3 宏
+
+decode / dispatch / execute:
+  sim/simx/decode.cpp                     — EXT2/EXT3/EXT4 三段顶层 dispatch +
+                                            qualifier 位段抽取
+  sim/simx/execute.cpp                    — TcuType case 全部新 ISA 分支
+  sim/simx/core.{h,cpp}                   — mbarrier 完整接口 / cpabulk_tensor_*
+                                            / tmem_cp / mbar_commit/fence /
+                                            tcgen05_wait_ld/st / lmem_read|write
+
+TensorUnit 内部:
+  sim/simx/tensor/open_tensorcore/tensor_top/tensor_unit.{h,cpp}
+                                          — dispatch_tcu_mma() public
+  sim/simx/tensor/open_tensorcore/tensor_control/tc_decode.{h,cpp}
+                                          — TcDecodedMmaCmd / TcDecodedLdStCmd
+                                            decode_tcu_mma / decode_tcu_ld_st
+  sim/simx/tensor/open_tensorcore/tensor_control/tensor_async_frontend.{h,cpp}
+                                          — enqueue_async_tcu_mma() 编排器
+  sim/simx/tensor/open_tensorcore/tensor_control/tensor_issue_policy.cpp
+                                          — TCU_MMA 单 case issue 调度
+  sim/simx/tensor/open_tensorcore/tensor_top/tensor_tick_utils.cpp
+                                          — MemUop kind 分支 retire/tick
+
+kernel intrinsic:
+  kernel/include/vx_tensor.h              — tcu_mma / tmem_alloc / mbar_* /
+                                            cpabulk_tensor_ld/st intrinsic;
+                                            legacy mma_sync 在 #if 0 块内
+
+测试（待迁移）:
+  tests/regression/sgemm_tcu/kernel.cpp
+  tests/regression/sgemm_tcu_tmem/kernel.cpp
+  tests/regression/tcu_mbarrier_async/kernel.cpp
+  tests/regression/tcu_tmem_chain/kernel.cpp
+  tests/regression/tcu_tmem_shift_fence/kernel.cpp
+  tests/regression/tcu_tmem_shift_refill/kernel.cpp
+  tests/regression/tcu_tmem_window_d/kernel.cpp
+  tests/regression/tcu_warpgroup_collective/kernel.cpp
+  tests/regression/tcu_wmma_overlap/kernel.cpp
+
+================================================================================
+七、PTX §段落 ↔ Vortex 实现位置对照
+--------------------------------------------------------------------------------
+
+PTX §6.4.10 cp.async.bulk.tensor 描述符 (CUtensorMap)
+  → sim/simx/tensor/idescriptor.h::tensor_map_t (128B)
+
+PTX §7.6.1 mbarrier object 8B 布局
+  → sim/simx/tensor/idescriptor.h::mbarrier_state_t (8B)
+
+PTX §7.6.2 phase parity 协议
+  → sim/simx/core.cpp::Core::try_advance_mbarrier_phase()
+  → sim/simx/core.cpp::Core::mbarrier_wait/test_wait/try_wait()
+
+PTX §7.6.4 expect_tx / complete_tx 字节单位
+  → Core::mbarrier_expect_tx(addr, tx_bytes)
+  → Core::mbarrier_complete_tx(addr, tx_bytes)
+
+PTX §9.7.16.2 shared memory descriptor (64-bit s_desc / b_sdesc)
+  → operand_block_t::b_sdesc_lo/hi
+  → tmem_cp 的 rs2 = LMEM 8B s_desc 指针
+
+PTX §9.7.16.5.4 tcgen05.mma 指令描述符 (idesc 32-bit)
+  → idescriptor_t (32-bit packed bitfield)
+
+PTX §9.7.16.5.5 collector buffer 状态机
+  → qualifier[5:4] (fill/use/lastuse/discard)
+
+PTX §9.7.16.5.6 multicast::cluster
+  → qualifier[6] (TCU_MMA) / qualifier[4] (CPABULK_TENSOR_LD)
+
+PTX §9.7.16.5.7 tcgen05.commit (arrival count 路径)
+  → Core::mbar_commit(): 注册 inflight async ops 到 mbar 的
+    expected_arrival_count + pending_arrival_count；on_async_tensor_op_completed
+    每完成一次 mbarrier_arrive(mbar)。
+  ★ 与 cp.async.bulk.tensor.mbarrier::complete_tx::bytes 路径(走 pending_tx_count
+    字节计数)严格区分；同一 mbar 可以同时被两条路径推进，phase 完成条件 =
+    (pending_arrival_count == 0 AND pending_tx_count >= expected_tx_count)。
+
+================================================================================
+八、kernel 迁移参考片段（GAP-8 / GAP-9 实施时使用）
+--------------------------------------------------------------------------------
+
+旧 mma_sync 风格 → 新 tcu_mma 风格
+
+[旧]
+  mma_sync<float, half, half, float, M, N, K>(
+      d_handle, a_handle, b_handle, c_handle, desc_id);
+
+[新]
+  // 1) 构造 idesc（caller 现场 32-bit 寄存器值）
+  uint32_t idesc = make_idescriptor<half, half, float, float, M, N, K>(
+      /*saturate=*/0, /*transpose_a=*/0, /*transpose_b=*/0, /*output_negate=*/0);
+
+  // 2) 准备 operand_block 在 LMEM
+  __shared__ operand_block_t op_block;
+  op_block.a_taddr     = a_handle;
+  op_block.b_sdesc_lo  = (uint32_t)(b_sdesc & 0xFFFFFFFF);
+  op_block.b_sdesc_hi  = (uint32_t)(b_sdesc >> 32);
+  op_block.lanes_off   = 0;
+
+  // 3) 单条指令触发 fill→compute→drain
+  tcu_mma(/*d_taddr=*/d_handle,
+          /*idesc=*/idesc,
+          /*op_block_ptr=*/&op_block,
+          /*qualifier=*/TCU_QUAL(.enable_input_d=1, .collector_a_state=FILL));
+
+旧 TMA 融合 → 两步 PTX 标准
+
+[旧]
+  tma_load(handle, desc_id, window_id);
+  tc_wait();
+
+[新]
+  __shared__ cpabulk_transfer_args_t args;
+  args.smem_addr = lmem_smem_offset;        // LMEM 中转区
+  args.mbar_addr = (uint32_t)&mbar_obj;
+  args.coords[0] = tile_x; args.coords[1] = tile_y;
+
+  mbar_expect_tx(&mbar_obj, /*tx_bytes=*/tile_bytes);
+  cpabulk_tensor_ld(/*async_id=*/aid,
+                    /*tensor_map=*/&tensor_map,
+                    /*args_lmem_ptr=*/&args,
+                    /*qualifier=*/TCU_QUAL(.dim_count=2, .complete_tx=1));
+  mbar_wait(&mbar_obj, phase_token);
+  tmem_cp(/*taddr=*/tmem_dst, /*s_desc_lmem_ptr=*/&s_desc_storage,
+          /*qualifier=*/TCU_QUAL(.shape=S128x256b, .decompress=NONE));
+
+旧 tc_fence/tc_commit/tc_wait → mbar_*
+
+[旧]                                  [新]
+  tc_fence_before();             →    mbar_fence(/*mode=*/BEFORE_THREAD_SYNC);
+  tc_commit();                   →    mbar_commit(&mbar_obj, cta_mask);
+  tc_wait();                     →    tcu_wait_ld();  // 或 tcu_wait_st
+  tmem_free(handle, ncols);      →    tmem_dealloc(handle, ncols);
+
+================================================================================
+九、Phase-3 入口建议
+--------------------------------------------------------------------------------
+
+按上述 P0→P6 顺序推进：
+
+Phase-3.1 (P0) — 已完成 (2026-04-27)
+  ✓ kernel make_idescriptor / make_operand_block / make_cpabulk_args 工厂
+  ✓ kernel 端 idescriptor_t / operand_block_t / cpabulk_transfer_args_t /
+    tensor_map_t / mbarrier_state_t struct (与 simx/tensor/idescriptor.h 一一对齐)
+  ✓ 9 个 tcu_* test kernel 重写 + tcu_mbarrier_pending_tx smoke (新增)
+  ✓ 全部 10 个 kernel.elf clang++ 编译通过
+  剩余出口: make -C tests/regression && simx 端到端 PASS — 取决于 Phase-3.2 P1
+
+Phase-3.3 (P2) — Phase-3.3.1/3/7/8 完成 (2026-04-27)
+  ✓ Phase-3.3.1 (GAP-4 tcu_ld/tcu_st): per-thread byte 路径; tests/regression/
+     tcu_ldst smoke 32 lanes PASS; 包括关键 bugfix decode.cpp TMEM_ALLOC
+     setDestReg 缺失导致 alloc handle 无法回写 GPR 的问题
+  ✓ Phase-3.3.3 (TMEM 128 lanes × 512 cols): kPayloadCols 64→128, kLogicalLines
+     128→512, kPhysicalRows 自动派生 (= kLogicalLines/2 = 256), 1-byte cell
+     保留, 总容量 8 KB→64 KB; 全部回归 PASS
+  ✓ Phase-3.3.7 (idesc.M/N 16×16 tile loop): dispatch_tcu_mma 用
+     mma_cmd.shape_m/shape_n 驱动外层 (M/16 × N/16) sub-tile 循环
+  ✓ Phase-3.3.8 (window/tile MMA 编码下线): types.h 删除
+     tcu_mma_mem_make_control / tcu_mma_mem_ctl_target / tcu_mma_mem_ctl_tile_id
+     / tcu_mma_mem_ctl_window_id_from_target 等 dead helpers + kTcuMmaMemCtl*
+     常量。args.window_id/tile_id 保留为内部 microarch 路由字段 (always 0
+     in TCU_MMA path)
+  Phase-3.4 整体设计 (2026-04-28 锁定, per user 严格 PTX + cycle-accurate):
+    - TMEM: 128 lanes × 512 1-byte cells = 64 KB (1B cell 是 Vortex 偏离;
+      其他严格 PTX)
+    - taddr 编码 (PTX 8.7 §9.7.16.1): bits[15:0]=lane (0..127),
+      bits[31:16]=col_byte_idx (0..511, byte 单位)
+    - tmem_alloc 返回 (col_base << 16) | 0 (PTX taddr with lane=0)
+    - allocations_ map keyed by taddr value (= col_base << 16)
+    - Vortex 内部 logical_col / logical_line 轴语义需重新对齐 PTX:
+      Vortex's logical_col 当前 = lane axis (kPayloadCols=128),
+      但 read_region_byte 用 col_base/byte_offset 把 col_base 当 col-axis
+      base, 与 PTX (col_base 应是 lane-axis base) 反; 需 axes-transposition
+    - enqueue_async_mma_load 全 rewrite: byte-range fill from TMEM
+      (per (m,n,k) sub-tile derived from idesc.M/N) into AMem/BMem/CMem
+    - dispatch_tcu_mma 三层 fan-out: (M/16) × (N/16) × K_phase
+      - 进 (m,n) sub-tile: enable_input_d=1 时 fill_c (TMEM[d_taddr+sub_off]→CMem)
+      - K-phase 1..N: A_kp × B_kp 累加进 DMem (CMem-init only first kp)
+      - 退 (m,n) sub-tile: store_d (DMem→TMEM[d_taddr+sub_off])
+    - 删除 ABI: IntrTcuArgs.window_id/tile_id; AsyncTensorOp.window_id/tile_idx
+    - 保留: TmemWindowPlan 数据结构 (合理抽象), region_packet 仲裁路径
+    - 工作量估算: 13-18 hours, 5 stages (0-4); Stage 0 是 prerequisite
+    - 状态: 设计锁定, 实施分多 session 推进; 详见
+      /home/chenbangyu/.claude-max/plans/synchronous-wibbling-sparkle.md
+
+  Phase-3.3.2 (D output-resident 端到端回归) 部分完成:
+    - tests/regression/tcu_d_resident/ Makefile/common.h/kernel.cpp/main.cpp 全套已编译通过
+    - 16x16x16 fp16 GEMM K_ITERS=4 累加, host fp32 reference 比对, ULP 容差 1%
+    - **运行时 hang**: kernel 调 tcu_mma 时 enqueue_async_mma_load 路径走
+       lookup_tmem_window/ensure_tmem_window_bound, 需要 TmemWindowPlan
+       绑定 (legacy 路径), 而本测试用 tcu_st 直接字节写 A/B 不建立 window.
+       enqueue_async_mma_load 的"window-not-bound retry"逻辑在 tcu_st-seeded
+       TMEM 上无限循环
+    - 出口: 需要 Phase-3.3.9 — 把 enqueue_async_mma_load 的 window 依赖
+       下线 (改为直接走 byte-range copy 类似 Phase-3.3.1 的 byte 路径)
+       或改用 cpabulk_tensor_ld(desc_id) legacy 路径填充 A/B 让 window
+       binding 自然发生
+
+Phase-3.2 (P1) — 端到端验证完成 (2026-04-27)
+  ✓ cpabulk_tensor_load/store 双模式 dispatch (LMEM 直接 / 旧 desc_id 兼容)
+  ✓ on_async_tensor_op_completed 接 mbarrier_complete_tx(byte_count)
+  ✓ tmem_cp 5 种 shape (S128x256b 等)，decompress=NONE 数据通路
+  ✓ AsyncTensorOp 增 tx_bound_mbar / tx_bytes 字段
+  ✓ kernel 新增 cpabulk_tensor_ld_complete_tx (qualifier[5]=1 变体)
+  ✓ simx Makefile 修复 (新增 tensor/ + tensor/open_tensorcore/* include)
+  ✓ libsimx.so / libvortex-simx.so 重链
+  ✓ tcu_mbarrier_pending_tx smoke PASS: 端到端验证 expect_tx →
+     cpabulk DRAM→LMEM → complete_tx::bytes → phase 翻转 → wait 解阻塞
+  端到端验证状态:
+    - tcu_mbarrier_pending_tx smoke 已升级 (host 准备 tensor_map_t 在 DRAM,
+      kernel 在 LMEM 构造 cpabulk_transfer_args_t + mbarrier_state_t,
+      调用 cpabulk_tensor_ld_complete_tx (qualifier[5]=1))
+      ✓ PASS: simx 跑通完整链路 expect_tx → cpabulk DRAM→LMEM →
+        mbarrier_complete_tx(N_bytes) → phase 翻转 → mbarrier_wait 解阻塞 →
+        kernel 从 LMEM 读首 word 写回 DRAM, host 验证 0xCAFE0000 一致
+      验证项: GAP-1 (DRAM→LMEM 真实搬运), GAP-2 (complete_tx::bytes wiring)
+    - 现有 9 个 tcu_* kernel 仍传 desc_id (小整数), 走 legacy path; 升级为
+      新 typed overload 路径留给 Phase-3.3
+
+Phase-3.3 (P2)
+  - 9 kernel + smoke 改用 typed overload (cpabulk_tensor_ld(&tensor_map, &args))
+    并在 LMEM 构造 cpabulk_transfer_args_t；host runtime 在 DRAM 准备
+    tensor_map_t (替代 legacy tma_descriptor_t) 真正驱动 GAP-1/2 路径
+  - tcu_ld / tcu_st 数据通路实现 (GAP-4)
+  - GAP-11 enable_input_d=1 D 原位 R-M-W 端到端回归
+
+Phase-3.4 起按需推进 P3+。
+
+================================================================================

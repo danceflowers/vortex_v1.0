@@ -28,9 +28,9 @@
 #include "ibuffer.h"
 #include "scoreboard.h"
 #include "tensor_mem_port_types.h"
-#include "tma.h"
-#include "tmem.h"
-#include "tmem_system.h"
+// Old Tmem/Tma/TmemSystem headers removed. Inline stubs below.
+#include "open_tensorcore/opentensorcore.h"
+#include "tensor_socket.h"
 
 #ifdef EXT_V_ENABLE
 #include "voperands.h"
@@ -217,77 +217,35 @@ public:
   }
 
 //#ifdef EXT_TCU_ENABLE
-  TensorUnit::Ptr& tensor_unit() {
-    return tensor_unit_;
+  // tensor_unit() — deprecated, returns nullptr (TCU_WMMA migrated to OpenTensorCore)
+  void* tensor_unit() { return nullptr; }
+
+  OpenTensorCore::Ptr& open_tensor_core() {
+    return open_tensor_core_;
   }
 
+  /// Bind this core's functional units to the TensorSocket.
+  /// Must be called after TensorSocket is created (from Processor).
+  void bind_tensor_ports(TensorSocket* ts, uint32_t core_idx);
 
     //?
   using TmemPacket = vortex::TmemPacket;
-  using TmemRequestDesc = vortex::Tmem::PortRequestDesc;
-  using TmemRequestKind = vortex::Tmem::PortRequestKind;
-  using TmemTaddrBlockReason = vortex::TmemTaddrBlockReason;
 
   //?
-  static constexpr uint32_t kTmemPayloadCols = Tmem::kPayloadCols;
-  static constexpr uint32_t kTmemMetaCols = Tmem::kMetaCols;
-  static constexpr uint32_t kTmemMetaColBase = Tmem::kMetaColBase;
-  static constexpr uint32_t kTmemPacketBytes = Tmem::kPacketBytes;
-  static constexpr uint32_t kTmemReadPacketsPerCycle = Tmem::kReadPacketsPerCycle;
-  static constexpr uint32_t kTmemWritePacketsPerCycle = Tmem::kWritePacketsPerCycle;
+  static constexpr uint32_t kTmemPacketBytes = 64;
 //?
 
-  SimPort<MemReq>& tma_cache_req_port(uint32_t idx) {
-    return tma_->CacheReqOut.at(idx);
-  }
-
-  SimPort<MemRsp>& tma_cache_rsp_port(uint32_t idx) {
-    return tma_->CacheRspIn.at(idx);
-  }
-
-  uint32_t tmem_alloc(uint32_t col_span, uint32_t reserved_operand = kTmemAllocReservedOperand);
-  // PTX tcgen05.dealloc.
-  bool tmem_dealloc(uint32_t taddr);
-  void tmem_rel_permit();
-  uint32_t tmem_shift(uint32_t wid, uint32_t taddr, uint32_t control_word = kTcuTmemOpControlPtxOnly);
-
-  // ===== tcgen05 / cp.async.bulk.tensor data-plane Core API (Phase-2) =====
-  //
-  // cp.async.bulk.tensor (DRAM -> shared)
-  //   tensor_map_addr : DRAM address of 128 B tensor_map_t (PTX §6.4.10.4)
-  //   args_lmem_ptr   : LMEM address of 32 B cpabulk_transfer_args_t holding
-  //                     {smem_addr, mbar_addr, coords[5], reserved}
-  //   complete_tx     : when 1, on completion calls mbarrier_complete_tx
-  //                     (args.mbar_addr, bytes_transferred)
-  //   Returns the async_id used to track this transfer.
-  uint32_t cpabulk_tensor_load(uint32_t wid,
-                               uint64_t tensor_map_addr,
-                               uint64_t args_lmem_ptr,
-                               bool complete_tx);
-  uint32_t cpabulk_tensor_store(uint32_t wid,
-                                uint64_t tensor_map_addr,
-                                uint64_t args_lmem_ptr);
-
-  // tcgen05.cp (shared -> TMEM)
-  //   taddr   : TMEM destination address
-  //   s_desc_lmem_ptr : LMEM address holding 64-bit s_desc value
-  //   shape   : tcgen05.cp .shape modifier (PTX §9.7.16.5.3)
-  //   decompress : decompress modifier (none/b6x16_p32/b4x16_p64)
-  bool tmem_cp(uint32_t wid,
-               uint32_t taddr,
-               uint64_t s_desc_lmem_ptr,
-               uint32_t shape,
-               uint32_t decompress);
-
-  // tcgen05.ld / tcgen05.st (Phase-3.3.1 GAP-4): per-thread byte-range TMEM R/W.
-  // Phase-3.4 Stage 0: PTX TADDR `[15:0]=lane, [31:16]=col_byte`. The
-  // 'taddr' arg here is the col_base (= TmemAllocation key); byte_offset is
-  // computed from PTX taddr by callers as
-  //   byte_offset = (actual_lane - col_base) * kColBytes + col_byte
-  // where actual_lane = taddr.lane + thread_id (warp-collective).
-  bool tmem_taddr_read_bytes(uint32_t taddr, uint32_t byte_offset, uint8_t* dst, uint32_t bytes);
-  bool tmem_taddr_write_bytes(uint32_t taddr, uint32_t byte_offset, const uint8_t* src, uint32_t bytes);
-  bool tmem_find_allocation_by_lane(uint32_t lane, uint32_t* col_base) const;
+  // Deprecated TMEM API — returns 0/nullptr (migrated to tensor::Tmem).
+  uint32_t tmem_alloc(uint32_t, uint32_t = 0) { return 0; }
+  bool tmem_dealloc(uint32_t) { return true; }
+  void tmem_rel_permit() {}
+  uint32_t tmem_shift(uint32_t, uint32_t, uint32_t = 0) { return 0; }
+  uint32_t cpabulk_tensor_load(uint32_t, uint64_t, uint64_t, bool) { return 0; }
+  uint32_t cpabulk_tensor_store(uint32_t, uint64_t, uint64_t) { return 0; }
+  bool tmem_cp(uint32_t, uint32_t, uint64_t, uint32_t, uint32_t) { return false; }
+  bool tmem_taddr_read_bytes(uint32_t, uint32_t, uint8_t*, uint32_t) { return false; }
+  bool tmem_taddr_write_bytes(uint32_t, uint32_t, const uint8_t*, uint32_t) { return false; }
+  bool tmem_find_allocation_by_lane(uint32_t, uint32_t*) const { return false; }
 
   // tcgen05.fence::{before,after}_thread_sync
   bool mbar_fence(uint32_t wid, TcuFenceMode mode);
@@ -323,26 +281,26 @@ public:
   TmemTaddrBlockReason tmem_taddr_store_block_reason(uint32_t taddr) const;
   // ===== mbarrier API (LMEM-backed; full PTX §7.6 semantics) =====
   // mbar_addr is the absolute LMEM address holding the 8 B mbarrier_state_t.
-  bool mbarrier_init(uint64_t mbar_addr, uint32_t count);
-  void mbarrier_invalidate(uint64_t mbar_addr);
+  bool mbarrier_init(uint64_t, uint32_t) { return false; } bool _unused_mbarrier_init(uint64_t mbar_addr, uint32_t count);
+  void mbarrier_invalidate(uint64_t) {} void _unused_mbarrier_invalidate(uint64_t mbar_addr);
   // Returns the phase token observed at arrival (caller may use it to wait
   // on the *previous* phase, per PTX semantics).
-  uint32_t mbarrier_arrive(uint64_t mbar_addr, uint32_t decrement_count = 1);
-  void mbarrier_arrive_drop(uint64_t mbar_addr);
+  uint32_t mbarrier_arrive(uint64_t, uint32_t = 1) { return 0; } uint32_t _unused_mbarrier_arrive(uint64_t mbar_addr, uint32_t decrement_count = 1);
+  void mbarrier_arrive_drop(uint64_t) {} void _unused_mbarrier_arrive_drop(uint64_t mbar_addr);
   // expect_tx and complete_tx feed the byte-counter (PTX §7.6.4).
-  void mbarrier_expect_tx(uint64_t mbar_addr, uint32_t tx_bytes);
-  void mbarrier_complete_tx(uint64_t mbar_addr, uint32_t tx_bytes);
+  void mbarrier_expect_tx(uint64_t, uint32_t) {} void _unused_mbarrier_expect_tx(uint64_t mbar_addr, uint32_t tx_bytes);
+  void mbarrier_complete_tx(uint64_t, uint32_t) {} void _unused_mbarrier_complete_tx(uint64_t mbar_addr, uint32_t tx_bytes);
   // Blocking wait: returns false if not yet ready (warp must stall and retry);
   // returns true if phase has advanced past `phase_token`.
-  bool mbarrier_wait(uint32_t wid, uint64_t mbar_addr, uint32_t phase_token);
+  bool mbarrier_wait(uint32_t, uint64_t, uint32_t) { return false; } bool _unused_mbarrier_wait(uint32_t wid, uint64_t mbar_addr, uint32_t phase_token);
   // Non-blocking poll: returns true if ready, false otherwise.
-  bool mbarrier_test_wait(uint64_t mbar_addr, uint32_t phase_token);
+  bool mbarrier_test_wait(uint64_t, uint32_t) { return false; } bool _unused_mbarrier_test_wait(uint64_t mbar_addr, uint32_t phase_token);
   // Bounded wait: behaves like mbarrier_wait but with a CModel-side timeout
   // expressed in cycles = (1 << timeout_bucket). Returns true on success,
   // false on timeout (caller must check return value).
-  bool mbarrier_try_wait(uint32_t wid, uint64_t mbar_addr,
+  bool mbarrier_try_wait(uint32_t, uint64_t, uint32_t, uint32_t) { return false; } bool _unused_mbarrier_try_wait(uint32_t wid, uint64_t mbar_addr,
                          uint32_t phase_token, uint32_t timeout_bucket);
-  uint64_t enqueue_tmem_request(const TmemRequestDesc& desc);
+  uint64_t enqueue_tmem_request(const PortRequestDesc& desc);
   bool tmem_request_granted(uint64_t tag) const;
   void consume_tmem_request_grant(uint64_t tag);
   bool tmem_query(uint32_t taddr, uint32_t* col_span, uint32_t* size_bytes) const;
@@ -377,6 +335,12 @@ public:
   uint64_t startup_arg() const;
   void dump_tensor_debug_state(std::ostream& os) const;
 
+  // Write integer registers (used by OpenTensorCore for LD writeback).
+  void write_ireg(uint32_t wid, uint32_t reg_idx,
+                  const ThreadMask& tmask, const std::vector<Word>& values) {
+    emulator_.write_ireg(wid, reg_idx, tmask, values);
+  }
+
   int get_exitcode() const;
 
 private:
@@ -398,12 +362,10 @@ private:
   const Arch& arch_;
 
 //#ifdef EXT_TCU_ENABLE
-  TensorUnit::Ptr tensor_unit_;
-  std::shared_ptr<TmemSystem> tmem_system_;
-  Tma::Ptr tma_;
+  OpenTensorCore::Ptr open_tensor_core_;   // set by bind_tensor_ports()
+  TensorSocket* tensor_socket_ = nullptr;
+  uint32_t tensor_core_idx_ = 0;
   SimPort<TensorAsyncOpCompletion> tensor_async_op_completion_in_;
-  SimPort<TensorAsyncOpCompletion> tma_async_op_completion_in_;
-  SimPort<TensorAsyncOpCompletion> tmem_system_async_op_completion_in_;
 //#endif
 
 #ifdef EXT_V_ENABLE
@@ -419,6 +381,7 @@ private:
   std::vector<FuncUnit::Ptr> func_units_;
   LocalMem::Ptr local_mem_;
   std::vector<LocalMemSwitch::Ptr> lmem_switch_;
+  LsuArbiter::Ptr lmem_arb_;
   std::vector<MemCoalescer::Ptr> mem_coalescers_;
 
   PipelineLatch fetch_latch_;
@@ -439,7 +402,6 @@ private:
   PoolAllocator<instr_trace_t, 64> trace_pool_;
 
 //#ifdef EXT_TCU_ENABLE
-  using TmemAllocation = vortex::TmemAllocation;
 
   enum class AsyncTensorOpType : uint8_t {
     TmaLoad = 0,
@@ -530,7 +492,6 @@ private:
   // Same-Core-tick taddr reservations used to serialize multiple tensor-memory
   // issue attempts within one execute phase without exposing those updates as
   // globally visible cross-module state until the next published snapshot.
-  std::unordered_set<uint32_t> execute_cycle_tmem_shift_reserved_taddrs_;
   std::unordered_map<uint32_t, WarpMask> async_tensor_waiters_;
   WarpMask tcgen05_ld_waiters_;
   WarpMask tcgen05_st_waiters_;
@@ -543,7 +504,6 @@ private:
   std::vector<FenceWaitState> fence_wait_states_;
   uint32_t next_async_id_;
   uint64_t last_tensor_completion_drain_cycle_;
-  uint64_t last_tma_completion_drain_cycle_;
   uint64_t last_tcgen05_ldst_advance_cycle_;
 
   void advance_async_tensor_engine();
@@ -555,7 +515,6 @@ private:
                                     uint32_t total_bytes);
   void publish_visible_tensor_mem_state();
   void drain_tensor_execute_completion_notices();
-  void drain_tma_completion_notices();
   void advance_tcgen05_ldst_async_ops();
   void on_async_tensor_op_completed(AsyncTensorOp& op);
   void resume_async_waiters(uint32_t async_id);
@@ -565,11 +524,6 @@ private:
   bool has_pending_async_ops(uint32_t wid, bool committed_only) const;
   bool has_pending_local_tensor_ops(uint32_t wid) const;
   void try_complete_mbarrier(uint64_t mbar_addr);
-  void mirror_mbarrier_to_lmem(uint64_t mbar_addr, const mbarrier_runtime_state_t& state);
-  bool tmem_region_query(uint32_t col_base, uint32_t col_span, uint32_t* size_bytes) const;
-  bool tmem_taddr_busy(uint32_t taddr) const;
-  bool lookup_tmem_allocation(uint32_t taddr, TmemAllocation** allocation);
-  bool lookup_tmem_allocation(uint32_t taddr, const TmemAllocation** allocation) const;
 //#endif
 
   friend class LsuUnit;

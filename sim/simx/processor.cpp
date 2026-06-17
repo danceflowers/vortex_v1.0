@@ -85,6 +85,64 @@ ProcessorImpl::ProcessorImpl(const Arch& arch)
     });
   }
 
+  // --- Tensor subsystem ---
+  // Create one TensorSocket per hardware Socket, then bind each Core.
+  {
+    char sname[128];
+    uint32_t core_idx = 0;
+
+    for (auto& cluster : clusters_) {
+      for (uint32_t s = 0; s < cluster->num_sockets(); ++s) {
+        auto& sock = cluster->socket(s);
+        std::vector<Core*> core_ptrs;
+        for (uint32_t c = 0; c < sock->num_cores(); ++c) {
+          core_ptrs.push_back(sock->core(c).get());
+        }
+        snprintf(sname, sizeof(sname), "tsock_c%u_s%u", cluster->id(), s);
+        auto ts = TensorSocket::Create(sname, core_ptrs);
+        tensor_sockets_.push_back(ts);
+
+        // Bind each Core in this socket to its OpenTensorCore / TMEM / TMA.
+        for (uint32_t c = 0; c < sock->num_cores(); ++c) {
+          sock->core(c)->bind_tensor_ports(ts.get(), c);
+          ++core_idx;
+        }
+      }
+    }
+
+    // Create TCache shared by all TensorSockets.
+    uint32_t ts_count = static_cast<uint32_t>(tensor_sockets_.size());
+    tcache_ = CacheSim::Create("tcache", CacheSim::Config{
+      !L3_ENABLED,
+      log2ceil(L3_CACHE_SIZE),
+      log2ceil(MEM_BLOCK_SIZE),
+      log2ceil(L2_LINE_SIZE),
+      log2ceil(L3_NUM_WAYS),
+      log2ceil(L3_NUM_BANKS),
+      XLEN,
+      ts_count,                  // num_inputs = N TensorSockets
+      ts_count > 0 ? ts_count : 1, // mem_ports
+      L3_WRITEBACK,
+      false,                     // write response
+      L3_MSHR_SIZE,
+      2,
+    });
+
+    // Connect each TensorSocket's CacheReq port to TCache.
+    for (uint32_t i = 0; i < ts_count; ++i) {
+      tensor_sockets_[i]->CacheReqPorts.at(0).bind(
+          &tcache_->CoreReqPorts.at(i));
+      tcache_->CoreRspPorts.at(i).bind(
+          &tensor_sockets_[i]->CacheRspPorts.at(0));
+    }
+
+    // Connect TCache to RAM.
+    for (uint32_t i = 0; i < tcache_->MemReqPorts.size(); ++i) {
+      tcache_->MemReqPorts.at(i).bind(&memsim_->MemReqPorts.at(i));
+      memsim_->MemRspPorts.at(i).bind(&tcache_->MemRspPorts.at(i));
+    }
+  }
+
 #ifndef NDEBUG
   // dump device configuration
   std::cout << "CONFIGS:"

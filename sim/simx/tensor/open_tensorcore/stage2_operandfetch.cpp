@@ -469,24 +469,33 @@ std::shared_ptr<ConvertedTile> OperandFetchStage::build_converted_tile(
   tile->b_chunk_idx  = f.b_chunk_idx;
   tile->total_b_chunks = f.total_b_chunks;
 
+  uint8_t  cb  = f.job.collector_buffer;
+  int8_t   bbi = f.job.bbuf_idx;
+  bool use_abuf = (bbi < 0) && (cb != 0x3);          // ws=0, not DISCARD
+  bool use_bbuf = (bbi >= 0) && (cb != 0x3);          // ws=1, not DISCARD
+
   if (is_sop) {
     // A: 4 lines, each 8×8 → FP9 (only in SOP tile).
-    uint32_t ppl = AMem::packets_per_fill_line(f.job.fmt_a);
-    for (uint32_t line = 0; line < AMem::kDepth; ++line) {
-      std::vector<AMem::packet_t> line_pkts;
-      line_pkts.reserve(ppl);
-      for (uint32_t p = 0; p < ppl; ++p) {
-        uint32_t idx = line * ppl + p;
-        if (idx >= f.a_packets.size()) return nullptr;
-        line_pkts.push_back(f.a_packets.at(idx).bytes);
+    // Skip when USE/LASTUSE reads A from abuf — packets are empty.
+    bool skip_a = use_abuf && (cb == 0x1 || cb == 0x2);
+    if (!skip_a) {
+      uint32_t ppl = AMem::packets_per_fill_line(f.job.fmt_a);
+      for (uint32_t line = 0; line < AMem::kDepth; ++line) {
+        std::vector<AMem::packet_t> line_pkts;
+        line_pkts.reserve(ppl);
+        for (uint32_t p = 0; p < ppl; ++p) {
+          uint32_t idx = line * ppl + p;
+          if (idx >= f.a_packets.size()) return nullptr;
+          line_pkts.push_back(f.a_packets.at(idx).bytes);
+        }
+        uint16_t converted[8][8];
+        if (!AMem::convert_fill_packets(f.job.fmt_a, line_pkts, converted))
+          return nullptr;
+        uint32_t k_phase = line / 2, m_block = line % 2;
+        for (uint32_t i = 0; i < 8; ++i)
+          for (uint32_t k = 0; k < 8; ++k)
+            tile->a_fp9[m_block * 8 + i][k_phase * 8 + k] = converted[i][k];
       }
-      uint16_t converted[8][8];
-      if (!AMem::convert_fill_packets(f.job.fmt_a, line_pkts, converted))
-        return nullptr;
-      uint32_t k_phase = line / 2, m_block = line % 2;
-      for (uint32_t i = 0; i < 8; ++i)
-        for (uint32_t k = 0; k < 8; ++k)
-          tile->a_fp9[m_block * 8 + i][k_phase * 8 + k] = converted[i][k];
     }
 
     // C: 4 subtiles → FP22 (only in SOP tile).
@@ -518,7 +527,9 @@ std::shared_ptr<ConvertedTile> OperandFetchStage::build_converted_tile(
   }
 
   // B: 4 lines → FP9 (every tile carries B data).
-  {
+  // Skip when USE/LASTUSE reads B from bbuf — packets are empty.
+  bool skip_b = use_bbuf && (cb == 0x1 || cb == 0x2);
+  if (!skip_b) {
     uint32_t ppl = BMem::packets_per_fill_line(f.job.fmt_b);
     for (uint32_t line = 0; line < BMem::kDepth; ++line) {
       std::vector<BMem::packet_t> line_pkts;

@@ -92,8 +92,6 @@ Socket::Socket(const SimContext& ctx,
         if ((c % L1_MEM_PORTS) != i) {
           continue;
         }
-        cores_.at(c)->tma_cache_req_port(0).bind(&tma_l2_arb->ReqIn.at(1 + c));
-        tma_l2_arb->RspIn.at(1 + c).bind(&cores_.at(c)->tma_cache_rsp_port(0));
       }
       tma_l2_arb->ReqOut.at(0).bind(&this->mem_req_ports.at(i));
       this->mem_rsp_ports.at(i).bind(&tma_l2_arb->RspOut.at(0));

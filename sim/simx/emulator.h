@@ -22,7 +22,6 @@
 #include "types.h"
 #include "instr.h"
 //#ifdef EXT_TCU_ENABLE
-#include "open_tensorcore/tensor_unit.h"
 //#endif
 #ifdef EXT_V_ENABLE
 #include "vec_unit.h"
@@ -191,7 +190,7 @@ private:
   uint32_t    next_warp_rr_;
 
 //#ifdef EXT_TCU_ENABLE
-  TensorUnit::Ptr tensor_unit_;
+  // Old tensor_unit_ removed
 //#endif
 
 #ifdef EXT_V_ENABLE

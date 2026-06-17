@@ -31,6 +31,8 @@
 #include "core.h"
 #include "debug.h"
 #include "constants.h"
+#include "tmem_module.h"
+#include "tma_module.h"
 
 using namespace vortex;
 
@@ -58,15 +60,10 @@ Core::Core(const SimContext& ctx,
   , dcache_req_ports(DCACHE_NUM_REQS, this)
   , dcache_rsp_ports(DCACHE_NUM_REQS, this)
   , core_id_(core_id)
+  , tensor_async_op_completion_in_(this)
   , socket_(socket)
   , arch_(arch)
 //#ifdef EXT_TCU_ENABLE
-  , tensor_unit_(TensorUnit::Create("tcu", arch, this))
-  , tmem_system_(TmemSystem::Create("tmem_system", this))
-  , tma_(Tma::Create("tma", this))
-  , tensor_async_op_completion_in_(this)
-  , tma_async_op_completion_in_(this)
-  , tmem_system_async_op_completion_in_(this)
 // #endif
 #ifdef EXT_V_ENABLE
   , vec_unit_(VecUnit::Create("vpu", arch, this))
@@ -83,21 +80,13 @@ Core::Core(const SimContext& ctx,
   , commit_arbs_(ISSUE_WIDTH)
   , ibuffer_arbs_(ISSUE_WIDTH, {ArbiterType::RoundRobin, PER_ISSUE_WARPS})
 //#ifdef EXT_TCU_ENABLE
-  , mbarrier_wait_targets_(arch.num_warps())
-  , fence_wait_states_(arch.num_warps())
   , next_async_id_(1)
 // #endif
 {
   char sname[100];
 
 //#ifdef EXT_TCU_ENABLE
-  tensor_unit_->TensorMemReqOut.bind(&tmem_system_->TensorExecuteReqIn);
-  tmem_system_->TensorExecuteRspOut.bind(&tensor_unit_->TensorMemRspIn);
-  tma_->TmemReqOut.bind(&tmem_system_->CoreTransferReqIn);
-  tmem_system_->CoreTransferRspOut.bind(&tma_->TmemRspIn);
-  tensor_unit_->TensorAsyncOpCompletionOut.bind(&tensor_async_op_completion_in_);
-  tma_->AsyncOpCompletionOut.bind(&tma_async_op_completion_in_);
-  tmem_system_->AsyncOpCompletionOut.bind(&tmem_system_async_op_completion_in_);
+  // Old TMA/TmemSystem kept for TCU_LD/ST path only (no OTC MMA data goes here).
 //#endif
 
   for (uint32_t iw = 0; iw < ISSUE_WIDTH; ++iw) {
@@ -133,9 +122,10 @@ Core::Core(const SimContext& ctx,
     lsu_dcache_adapter.at(b) = LsuMemAdapter::Create(sname, DCACHE_CHANNELS, 1);
   }
 
-  // create lmem arbiter
+  // create lmem arbiter (NUM_LSU_BLOCKS LSU blocks + 2 OTC LMEM ports).
   snprintf(sname, 100, "%s-lmem_arb", this->name().c_str());
-  auto lmem_arb = LsuArbiter::Create(sname, ArbiterType::RoundRobin, NUM_LSU_BLOCKS, 1);
+  lmem_arb_ = LsuArbiter::Create(sname, ArbiterType::RoundRobin,
+                                 NUM_LSU_BLOCKS + 2, 1);
 
   // create lmem adapter
   snprintf(sname, 100, "%s-lsu_lmem_adapter", this->name().c_str());
@@ -144,15 +134,15 @@ Core::Core(const SimContext& ctx,
   // connect lmem switch
   for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
     lmem_switch_.at(b)->ReqDC.bind(&mem_coalescers_.at(b)->ReqIn);
-    lmem_switch_.at(b)->ReqLmem.bind(&lmem_arb->ReqIn.at(b));
+    lmem_switch_.at(b)->ReqLmem.bind(&lmem_arb_->ReqIn.at(b));
 
     mem_coalescers_.at(b)->RspIn.bind(&lmem_switch_.at(b)->RspDC);
-    lmem_arb->RspIn.at(b).bind(&lmem_switch_.at(b)->RspLmem);
+    lmem_arb_->RspIn.at(b).bind(&lmem_switch_.at(b)->RspLmem);
   }
 
   // connect lmem arbiter
-  lmem_arb->ReqOut.at(0).bind(&lsu_lmem_adapter->ReqIn);
-  lsu_lmem_adapter->RspIn.bind(&lmem_arb->RspOut.at(0));
+  lmem_arb_->ReqOut.at(0).bind(&lsu_lmem_adapter->ReqIn);
+  lsu_lmem_adapter->RspIn.bind(&lmem_arb_->RspOut.at(0));
 
   // connect lmem adapter
   for (uint32_t c = 0; c < LSU_CHANNELS; ++c) {
@@ -185,6 +175,8 @@ Core::Core(const SimContext& ctx,
 #endif
 //#ifdef EXT_TCU_ENABLE
   dispatchers_.at((int)FUType::TCU) = SimPlatform::instance().create_object<Dispatcher>(this, 2, NUM_TCU_BLOCKS, NUM_TCU_LANES);
+  dispatchers_.at((int)FUType::TMEM) = SimPlatform::instance().create_object<Dispatcher>(this, 2, 1, 1);
+  dispatchers_.at((int)FUType::TMA) = SimPlatform::instance().create_object<Dispatcher>(this, 2, 1, 1);
 //#endif
 
   // initialize execute units
@@ -197,6 +189,8 @@ Core::Core(const SimContext& ctx,
 #endif
 //#ifdef EXT_TCU_ENABLE
   func_units_.at((int)FUType::TCU) = SimPlatform::instance().create_object<TcuUnit>(this);
+  func_units_.at((int)FUType::TMEM) = SimPlatform::instance().create_object<TmemUnit>(this);
+  func_units_.at((int)FUType::TMA) = SimPlatform::instance().create_object<TmaUnit>(this);
 //#endif
 
   // bind commit arbiters
@@ -241,9 +235,6 @@ void Core::reset() {
   pending_ifetches_ = 0;
 
 //#ifdef EXT_TCU_ENABLE
-  tensor_unit_->reset();
-  tmem_system_->reset();
-  tma_->reset();
   async_tensor_ops_.clear();
   pending_tcgen05_ldst_ops_.clear();
   async_tensor_waiters_.clear();
@@ -259,7 +250,7 @@ void Core::reset() {
   }
   next_async_id_ = 1;
   last_tensor_completion_drain_cycle_ = std::numeric_limits<uint64_t>::max();
-  last_tma_completion_drain_cycle_ = std::numeric_limits<uint64_t>::max();
+  last_tensor_completion_drain_cycle_ = std::numeric_limits<uint64_t>::max();
   last_tcgen05_ldst_advance_cycle_ = std::numeric_limits<uint64_t>::max();
 //#endif
 
@@ -268,15 +259,10 @@ void Core::reset() {
 
 void Core::tick() {
 //#ifdef EXT_TCU_ENABLE
-  execute_cycle_tmem_shift_reserved_taddrs_.clear();
   drain_tensor_execute_completion_notices();
-  drain_tma_completion_notices();
   advance_tcgen05_ldst_async_ops();
-  if (!tmem_system_async_op_completion_in_.empty()) {
-    auto completion = tmem_system_async_op_completion_in_.front();
-    async_tensor_complete(completion.async_id);
-    tmem_system_async_op_completion_in_.pop();
   }
+  // OTC/TMEM/TMA ticked by TensorSocket, not here.
 // #endif
   this->commit();
   this->execute();
@@ -297,7 +283,6 @@ void Core::tick() {
 }
 
 void Core::publish_visible_tensor_mem_state() {
-  tmem_system_->publish_visible_state();
 }
 
 uint64_t Core::startup_arg() const {
@@ -360,12 +345,9 @@ void Core::dump_tensor_debug_state(std::ostream& os) const {
        << " waiters=" << mbar.waiters_bitmap.to_string()
        << "\n";
   }
-  tmem_system_->dump_debug_state(os);
   if (nullptr != tma_) {
-    tma_->dump_debug_state(os);
   }
   if (nullptr != tensor_unit_) {
-    tensor_unit_->dump_debug_state(os);
   }
   os << "==== tensor-debug-state end ====\n";
 //#else
@@ -602,6 +584,45 @@ void Core::commit() {
   }
 }
 
+void Core::bind_tensor_ports(TensorSocket* ts, uint32_t core_idx) {
+  tensor_socket_   = ts;
+  tensor_core_idx_ = core_idx;
+  auto& otc = ts->tensor_core(core_idx);
+  open_tensor_core_ = otc;  // for backward compat
+
+  // Re-bind TcuUnit to this core's OpenTensorCore.
+  for (uint32_t iw = 0; iw < ISSUE_WIDTH; ++iw) {
+    func_units_.at((int)FUType::TCU)->Inputs.at(iw).bind(&otc->Inputs.at(iw));
+    otc->Outputs.at(iw).bind(&func_units_.at((int)FUType::TCU)->Outputs.at(iw));
+  }
+
+  // Bind TmemUnit → TMEM's instruction ports.
+  auto* tmem = ts->tmem();
+  for (uint32_t iw = 0; iw < ISSUE_WIDTH; ++iw) {
+    func_units_.at((int)FUType::TMEM)->Inputs.at(iw).bind(&tmem->Inputs.at(iw));
+    tmem->Outputs.at(iw).bind(&func_units_.at((int)FUType::TMEM)->Outputs.at(iw));
+  }
+
+  // Bind TmaUnit → TMA's instruction ports.
+  auto* tma = ts->tma();
+  if (tma) {
+    for (uint32_t iw = 0; iw < ISSUE_WIDTH; ++iw) {
+      func_units_.at((int)FUType::TMA)->Inputs.at(iw).bind(&tma->Inputs.at(iw));
+      tma->Outputs.at(iw).bind(&func_units_.at((int)FUType::TMA)->Outputs.at(iw));
+    }
+  }
+
+  // Bind OTC LMEM read ports into the core's lmem_arb.
+  //   ReqIn[NUM_LSU_BLOCKS + 0] → Stage2a B-matrix reads
+  //   ReqIn[NUM_LSU_BLOCKS + 1] → Stage1 operand_block_t reads
+  otc->LmemReadReq.bind(&lmem_arb_->ReqIn.at(NUM_LSU_BLOCKS));
+  lmem_arb_->RspIn.at(NUM_LSU_BLOCKS).bind(&otc->LmemReadRsp);
+  otc->DecodeLmemReadReq.bind(&lmem_arb_->ReqIn.at(NUM_LSU_BLOCKS + 1));
+  lmem_arb_->RspIn.at(NUM_LSU_BLOCKS + 1).bind(&otc->DecodeLmemReadRsp);
+
+  DT(2, "Core" << core_id_ << ": bound to TensorSocket tc_idx=" << core_idx);
+}
+
 int Core::get_exitcode() const {
   return emulator_.get_exitcode();
 }
@@ -660,11 +681,9 @@ void Core::set_satp(uint64_t satp) {
 //#ifdef EXT_TCU_ENABLE
 
 bool Core::lookup_tmem_allocation(uint32_t taddr, TmemAllocation** allocation) {
-  return tmem_system_->lookup_allocation(taddr, allocation);
 }
 
 bool Core::lookup_tmem_allocation(uint32_t taddr, const TmemAllocation** allocation) const {
-  return tmem_system_->lookup_allocation(taddr, allocation);
 }
 
 bool Core::has_pending_async_ops(uint32_t wid, bool committed_only) const {
@@ -733,11 +752,9 @@ void Core::try_resume_fence_waiters() {
 }
 
 bool Core::tmem_region_query(uint32_t col_base, uint32_t col_span, uint32_t* size_bytes) const {
-  return tmem_system_->region_query(col_base, col_span, size_bytes);
 }
 
 bool Core::tmem_query(uint32_t taddr, uint32_t* col_span, uint32_t* size_bytes) const {
-  return tmem_system_->query(taddr, col_span, size_bytes);
 }
 
 bool Core::tmem_lookup_allocation(uint32_t taddr, const TmemAllocation** allocation) const {
@@ -759,35 +776,27 @@ bool Core::tmem_transfer_region(uint32_t taddr, uint32_t* col_base, uint32_t* co
 }
 
 uint64_t Core::enqueue_tmem_request(const TmemRequestDesc& desc) {
-  return tmem_system_->enqueue_port_request(desc, desc.age);
 }
 
 bool Core::tmem_request_granted(uint64_t tag) const {
-  return tmem_system_->request_granted(tag);
 }
 
 void Core::consume_tmem_request_grant(uint64_t tag) {
-  tmem_system_->consume_request_grant(tag);
 }
 
 void Core::tmem_set_payload_ready(uint32_t taddr, bool ready) {
-  tmem_system_->set_payload_ready(taddr, ready);
 }
 
 void Core::tmem_set_meta_ready(uint32_t taddr, bool ready) {
-  tmem_system_->set_meta_ready(taddr, ready);
 }
 
 void Core::tmem_set_meta_region(uint32_t taddr, uint32_t meta_col_base, uint32_t meta_col_span) {
-  tmem_system_->set_meta_region(taddr, meta_col_base, meta_col_span);
 }
 
 bool Core::tmem_set_row_bytes(uint32_t taddr, uint32_t row_bytes) {
-  return tmem_system_->set_row_bytes(taddr, row_bytes);
 }
 
 bool Core::tmem_taddr_busy(uint32_t taddr) const {
-  return tmem_system_->visible_shift_busy(taddr);
 }
 
 bool Core::tmem_taddr_ready_for_mma_load(uint32_t taddr, TcuTarget target, uint32_t sparse_mode) const {
@@ -803,19 +812,15 @@ Core::TmemTaddrBlockReason Core::tmem_taddr_load_block_reason(uint32_t taddr, Tc
   if (!lookup_tmem_allocation(taddr, &allocation)) {
     return TmemTaddrBlockReason::Invalid;
   }
-  if (execute_cycle_tmem_shift_reserved_taddrs_.count(taddr) != 0) {
     return TmemTaddrBlockReason::BusyTmemShift;
   }
-  if (tmem_system_->visible_shift_busy(taddr)) {
     return TmemTaddrBlockReason::BusyTmemShift;
   }
-  bool payload_ready = tmem_system_->visible_payload_ready(taddr);
   if (!payload_ready) {
     return TmemTaddrBlockReason::PayloadNotReady;
   }
   bool needs_meta = (target == TcuTarget::A || target == TcuTarget::None)
                  && (sparse_mode != vortex::tensor::sparse_none);
-  bool meta_ready = tmem_system_->visible_meta_ready(taddr);
   if (needs_meta && !meta_ready) {
     return TmemTaddrBlockReason::MetaNotReady;
   }
@@ -827,13 +832,10 @@ Core::TmemTaddrBlockReason Core::tmem_taddr_store_block_reason(uint32_t taddr) c
   if (!lookup_tmem_allocation(taddr, &allocation)) {
     return TmemTaddrBlockReason::Invalid;
   }
-  if (execute_cycle_tmem_shift_reserved_taddrs_.count(taddr) != 0) {
     return TmemTaddrBlockReason::BusyTmemShift;
   }
-  if (tmem_system_->visible_shift_busy(taddr)) {
     return TmemTaddrBlockReason::BusyTmemShift;
   }
-  bool payload_ready = tmem_system_->visible_payload_ready(taddr);
   if (!payload_ready) {
     return TmemTaddrBlockReason::PayloadNotReady;
   }
@@ -928,42 +930,32 @@ void Core::on_async_tensor_op_completed(AsyncTensorOp& op) {
 }
 
 void Core::drain_tensor_execute_completion_notices() {
-  if (tensor_async_op_completion_in_.empty()) {
     return;
   }
   auto cycle = SimPlatform::instance().cycles();
   if (last_tensor_completion_drain_cycle_ == cycle) {
     return;
   }
-  auto completion = tensor_async_op_completion_in_.front();
-  async_tensor_complete(completion.async_id);
-  tensor_async_op_completion_in_.pop();
   last_tensor_completion_drain_cycle_ = cycle;
 }
 
-void Core::drain_tma_completion_notices() {
-  if (tma_async_op_completion_in_.empty()) {
     return;
   }
   auto cycle = SimPlatform::instance().cycles();
-  if (last_tma_completion_drain_cycle_ == cycle) {
+  if (last_tensor_completion_drain_cycle_ == cycle) {
     return;
   }
-  auto completion = tma_async_op_completion_in_.front();
   auto it = async_tensor_ops_.find(completion.async_id);
   if (it != async_tensor_ops_.end()) {
     it->second.payload_size_bytes = completion.payload_size_bytes;
     it->second.tx_bound_mbar = completion.tx_bound_mbar;
     it->second.tx_bytes = completion.tx_bytes;
   }
-  async_tensor_complete(completion.async_id);
-  tma_async_op_completion_in_.pop();
-  last_tma_completion_drain_cycle_ = cycle;
+  last_tensor_completion_drain_cycle_ = cycle;
 }
 
 void Core::advance_async_tensor_engine() {
   drain_tensor_execute_completion_notices();
-  drain_tma_completion_notices();
   try_resume_fence_waiters();
 }
 
@@ -993,8 +985,6 @@ uint32_t Core::launch_lmem_to_tmem_copy(uint32_t wid,
   async_op.payload_size_bytes = total_bytes;
   async_tensor_ops_[async_id] = async_op;
 
-  tmem_system_->set_payload_ready(col_base, false, true);
-  if (!tma_->issue_lmem_to_tmem_copy(async_id,
                                      wid,
                                      col_base,
                                      col_span,
@@ -1002,7 +992,6 @@ uint32_t Core::launch_lmem_to_tmem_copy(uint32_t wid,
                                      byte_offset,
                                      total_bytes)) {
     async_tensor_ops_.erase(async_id);
-    tmem_system_->set_payload_ready(col_base, true, true);
     return 0;
   }
   return async_id;
@@ -1014,7 +1003,7 @@ uint32_t Core::tmem_alloc(uint32_t col_span, uint32_t reserved_operand) {
   if (reserved_operand != kTmemAllocReservedOperand) {
     throw std::runtime_error(
       "TMEM_ALLOC rs2 is reserved in the PTX-only model; "
-      "pass 0xffffffff and provide tcgen05.mma idesc through TCU_MMA rs1");
+      "pass 0xffffffff and provide tcgen05.mma idesc through TCU_WMMA rs1");
   }
 
   // col_span 必须是 {16, 32, 64} 之一 (16 × 2^n)
@@ -1024,16 +1013,13 @@ uint32_t Core::tmem_alloc(uint32_t col_span, uint32_t reserved_operand) {
       + " invalid, must be 16, 32, or 64");
   }
 
-  return tmem_system_->alloc(col_span);
 }
 
 bool Core::tmem_dealloc(uint32_t taddr) {
   advance_async_tensor_engine();
-  return tmem_system_->free(taddr);
 }
 
 void Core::tmem_rel_permit() {
-  tmem_system_->seal_allocator();
 }
 
 uint32_t Core::tmem_shift(uint32_t wid, uint32_t taddr, uint32_t control_word) {
@@ -1046,7 +1032,6 @@ uint32_t Core::tmem_shift(uint32_t wid, uint32_t taddr, uint32_t control_word) {
   if (!lookup_tmem_allocation(taddr, &allocation)) {
     return 0;
   }
-  tmem_system_->set_payload_ready(taddr, false);
   auto async_id = next_async_id_++;
   AsyncTensorOp op{};
   op.async_id = async_id;
@@ -1055,8 +1040,6 @@ uint32_t Core::tmem_shift(uint32_t wid, uint32_t taddr, uint32_t control_word) {
   op.taddr = taddr;
   op.issue_cycle = perf_stats_.cycles;
   async_tensor_ops_[async_id] = std::move(op);
-  execute_cycle_tmem_shift_reserved_taddrs_.insert(taddr);
-  (void)tmem_system_->issue_shift(async_id, wid, taddr, perf_stats_.cycles);
   return async_id;
 }
 
@@ -1528,7 +1511,6 @@ uint32_t Core::cpabulk_tensor_load(uint32_t wid,
 
   advance_async_tensor_engine();
   auto async_id = next_async_id_++;
-  auto result = tma_->cpabulk_tensor_load(async_id,
                                           tensor_map_addr,
                                           args_lmem_ptr,
                                           complete_tx);
@@ -1558,7 +1540,6 @@ uint32_t Core::cpabulk_tensor_store(uint32_t wid,
 
   advance_async_tensor_engine();
   auto async_id = next_async_id_++;
-  auto result = tma_->cpabulk_tensor_store(async_id, tensor_map_addr, args_lmem_ptr);
   AsyncTensorOp op{};
   op.async_id = async_id;
   op.type = AsyncTensorOpType::TmaStore;
@@ -1572,15 +1553,12 @@ uint32_t Core::cpabulk_tensor_store(uint32_t wid,
 
 // Phase-3.3.1 GAP-4: TMEM byte-range R/W backing tcgen05.ld / tcgen05.st.
 bool Core::tmem_taddr_read_bytes(uint32_t taddr, uint32_t byte_offset, uint8_t* dst, uint32_t bytes) {
-  return tmem_system_->taddr_read_bytes(taddr, byte_offset, dst, bytes);
 }
 
 bool Core::tmem_taddr_write_bytes(uint32_t taddr, uint32_t byte_offset, const uint8_t* src, uint32_t bytes) {
-  return tmem_system_->taddr_write_bytes(taddr, byte_offset, src, bytes);
 }
 
 bool Core::tmem_find_allocation_by_lane(uint32_t lane, uint32_t* col_base) const {
-  return tmem_system_->find_allocation_by_lane(lane, col_base);
 }
 
 bool Core::tmem_cp(uint32_t wid,

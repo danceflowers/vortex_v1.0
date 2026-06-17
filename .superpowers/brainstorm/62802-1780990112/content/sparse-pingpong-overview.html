@@ -1,0 +1,69 @@
+<h2>Sparse TensorCore: Ping-Pong BMem Architecture</h2>
+<p class="subtitle">Current BMem = 4 lines (16×16 FP9 = one m16n16k16 tile). For 2:4 / 1:4 sparsity, K dimension grows 2×/4×, requiring multiple B chunks.</p>
+
+<div class="section">
+  <h3>Current: Dense m16n16k16 (sparse_none)</h3>
+  <div class="mockup">
+    <div class="mockup-header">Single BMem — 4 lines loaded once, compute 4 accum phases</div>
+    <div class="mockup-body">
+      <table style="width:100%; text-align:center; font-size:13px;">
+        <tr style="background:#1a2332;">
+          <th style="padding:8px;">K-dim</th><th style="padding:8px;">BMem Lines</th><th style="padding:8px;">Loads</th><th style="padding:8px;">Accum Phases</th>
+        </tr>
+        <tr>
+          <td style="padding:6px;">K=16</td><td style="padding:6px;">4 (k0m0, k0m1, k1m0, k1m1)</td><td style="padding:6px;">1 round</td><td style="padding:6px;">4</td>
+        </tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Proposed: Sparse 2:4 → m16n16k32 (K=32)</h3>
+  <div class="mockup">
+    <div class="mockup-header">Ping-pong BMem — 2 rounds × 4 lines each. BMem_A computes while BMem_B loads.</div>
+    <div class="mockup-body">
+      <table style="width:100%; text-align:center; font-size:13px;">
+        <tr style="background:#1a2332;">
+          <th style="padding:8px;">Round</th><th style="padding:8px;">K Range</th><th style="padding:8px;">Computing</th><th style="padding:8px;">Loading</th>
+        </tr>
+        <tr><td style="padding:6px;">1</td><td style="padding:6px;">k[0:16]</td><td style="padding:6px; background:#1a3a2a;">BMem_A (k0)</td><td style="padding:6px; background:#3a2a1a;">BMem_B ← k[16:32]</td></tr>
+        <tr><td style="padding:6px;">2</td><td style="padding:6px;">k[16:32]</td><td style="padding:6px; background:#1a3a2a;">BMem_B (k1)</td><td style="padding:6px; background:#2a2a3a;">— (done)</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Proposed: Sparse 1:4 → m16n16k64 (K=64)</h3>
+  <div class="mockup">
+    <div class="mockup-header">Ping-pong BMem — 4 rounds × 4 lines each</div>
+    <div class="mockup-body">
+      <table style="width:100%; text-align:center; font-size:13px;">
+        <tr style="background:#1a2332;">
+          <th style="padding:8px;">Round</th><th style="padding:8px;">K Range</th><th style="padding:8px;">Computing</th><th style="padding:8px;">Loading</th>
+        </tr>
+        <tr><td style="padding:6px;">1</td><td style="padding:6px;">k[0:16]</td><td style="padding:6px; background:#1a3a2a;">BMem_A (k0)</td><td style="padding:6px; background:#3a2a1a;">BMem_B ← k[16:32]</td></tr>
+        <tr><td style="padding:6px;">2</td><td style="padding:6px;">k[16:32]</td><td style="padding:6px; background:#1a3a2a;">BMem_B (k1)</td><td style="padding:6px; background:#3a2a1a;">BMem_A ← k[32:48]</td></tr>
+        <tr><td style="padding:6px;">3</td><td style="padding:6px;">k[32:48]</td><td style="padding:6px; background:#1a3a2a;">BMem_A (k2)</td><td style="padding:6px; background:#3a2a1a;">BMem_B ← k[48:64]</td></tr>
+        <tr><td style="padding:6px;">4</td><td style="padding:6px;">k[48:64]</td><td style="padding:6px; background:#1a3a2a;">BMem_B (k3)</td><td style="padding:6px; background:#2a2a3a;">— (done)</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Key Design Questions</h3>
+  <div class="mockup">
+    <div class="mockup-header">What we need to decide</div>
+    <div class="mockup-body">
+      <ol style="line-height:2; font-size:14px;">
+        <li><strong>Where does ping-pong live?</strong> Inside BMem class, or in ComputePipeline (Stage3)?</li>
+        <li><strong>Who triggers B load?</strong> Does ComputePipeline request B loads mid-compute, or does OperandFetch pre-load all chunks?</li>
+        <li><strong>LMEM bandwidth:</strong> B loads come from LMEM. Does ping-pong loading share the same LmemReadReq port as Stage2a's B fetch?</li>
+        <li><strong>K-phase mapping:</strong> With 2/4 K rounds, how does <code>mem_k_phase()</code> change? Each round's 4 BMem lines map to one logical K-phase.</li>
+        <li><strong>Accum phase count:</strong> 2:4 = 2 accum phases × 2 rounds = 4 total? Or something different?</li>
+      </ol>
+    </div>
+  </div>
+</div>

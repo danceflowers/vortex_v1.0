@@ -69,6 +69,9 @@ public:
 
   void resume(uint32_t core_id);
 
+  Core::Ptr& core(uint32_t idx) { return cores_.at(idx); }
+  uint32_t num_cores() const { return cores_.size(); }
+
   PerfStats perf_stats() const;
 
 private:

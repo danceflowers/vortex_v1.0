@@ -51,12 +51,12 @@ op_string_t op_string(TcuType tcu_type, IntrTcuArgs args) {
     return {"MBAR_COMPLETE_TX", ""};
   case TcuType::MBAR_TEST_TRY_WAIT:
     return {std::string("MBAR_") + (args.test_or_try == TcuTestTryWait::Try ? "TRY_WAIT" : "TEST_WAIT"), ""};
-  case TcuType::TCU_MMA: {
+  case TcuType::TCU_WMMA: {
     std::string suffix;
     if (args.ws) suffix += ".ws";
     if (args.sp) suffix += ".sp";
     if (args.enable_input_d) suffix += ".accum";
-    return {"TCU_MMA" + suffix, ""};
+    return {"TCU_WMMA" + suffix, ""};
   }
   case TcuType::TCU_LD: {
     auto shape = static_cast<uint32_t>(args.ld_shape);

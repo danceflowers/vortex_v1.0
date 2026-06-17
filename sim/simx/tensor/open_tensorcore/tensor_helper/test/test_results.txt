@@ -1,0 +1,62 @@
+make: Entering directory '/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/sim/simx/tensor/open_tensorcore'
+g++ -I. -I./tensor_top -I./tensor_control -I./local_memory -I./tensor_compute -I./tensor_helper -I./tensor_helper/test -I.. -I../../../common -std=c++17 -Wall -Wextra -Wpedantic -O2 -MMD -MP -c tensor_helper/test/main.cpp -o build/tensor_helper/test/main.o
+In file included from ./tensor_compute/tc_mul_pipe.h:6,
+                 from ./tensor_compute/tc_mul_add.h:6,
+                 from ./tensor_compute/tensor_core_top.h:5,
+                 from tensor_helper/test/main.cpp:1:
+./tensor_compute/fmul_s3.h: In function ‘uint32_t fmul_s3(const fmul_s2_out&, int, int)’:
+./tensor_compute/fmul_s3.h:8:15: warning: unused variable ‘PADDINGBITS’ [-Wunused-variable]
+    8 |     const int PADDINGBITS = PRECISION + 2;
+      |               ^~~~~~~~~~~
+./tensor_compute/fmul_s3.h:61:10: warning: unused variable ‘common_ix’ [-Wunused-variable]
+   61 |     bool common_ix  = rr1.inexact | common_of;
+      |          ^~~~~~~~~
+./tensor_compute/fmul_s3.h:64:10: warning: unused variable ‘tininess’ [-Wunused-variable]
+   64 |     bool tininess = (top2 == 0) || (top2 == 1 && !rr1.cout);
+      |          ^~~~~~~~
+In file included from ./tensor_compute/tc_add_pipe.h:4,
+                 from ./tensor_compute/tc_mul_add.h:7,
+                 from ./tensor_compute/tensor_core_top.h:5,
+                 from tensor_helper/test/main.cpp:1:
+./tensor_compute/fadd_s1.h: In function ‘FarPathOut far_path_compute(bool, int, uint32_t, uint32_t, int, bool, bool, int, int, int)’:
+./tensor_compute/fadd_s1.h:17:57: warning: unused parameter ‘EXPWIDTH’ [-Wunused-parameter]
+   17 |                                     bool small_add, int EXPWIDTH, int PRECISION, int OUTPC)
+      |                                                     ~~~~^~~~~~~~
+./tensor_compute/fadd_s1.h: In function ‘NearPathOut near_path_compute(bool, int, uint32_t, bool, uint32_t, bool, int, int, int)’:
+./tensor_compute/fadd_s1.h:86:43: warning: unused parameter ‘EXPWIDTH’ [-Wunused-parameter]
+   86 |                                       int EXPWIDTH, int PRECISION, int OUTPC)
+      |                                       ~~~~^~~~~~~~
+In file included from ./tensor_compute/tc_add_pipe.h:5,
+                 from ./tensor_compute/tc_mul_add.h:7,
+                 from ./tensor_compute/tensor_core_top.h:5,
+                 from tensor_helper/test/main.cpp:1:
+./tensor_compute/fadd_s2.h: In function ‘uint32_t fadd_s2(const fadd_s1_out&, int, int)’:
+./tensor_compute/fadd_s2.h:40:10: warning: unused variable ‘far_ix’ [-Wunused-variable]
+   40 |     bool far_ix = far_rr.inexact || far_of;
+      |          ^~~~~~
+./tensor_compute/fadd_s2.h:59:10: warning: unused variable ‘near_ix’ [-Wunused-variable]
+   59 |     bool near_ix = near_rr.inexact || near_of;
+      |          ^~~~~~~
+g++  build/tensor_helper/test/main.o  -o build/main
+./build/main
+[OTC][case 1] dense_mma_fp8_fp8_to_fp16
+  shape=16x16x16  A=FP8_E4M3  B=FP8_E4M3  C=FP16  D=FP16  sparse=dense  rm=RNE
+  cycles=192  max_abs=0.000000  mean_abs=0.000000  rms=0.000000  threshold=0.010000
+  PASS
+[OTC][case 2] asym_mma_fp16_fp8_to_fp32
+  shape=16x16x16  A=FP16  B=FP8_E4M3  C=FP32  D=FP32  sparse=dense  rm=RNE
+  cycles=192  max_abs=0.000000  mean_abs=0.000000  rms=0.000000  threshold=0.010000
+  PASS
+[OTC][case 3] multi_ktile_accum_fp8_fp8_to_fp16
+  shape=16x16x64  A=FP8_E4M3  B=FP8_E4M3  C=FP16  D=FP16  sparse=dense  rm=RNE
+  cycles=768  max_abs=0.000000  mean_abs=0.000000  rms=0.000000  threshold=0.030000
+  PASS
+[OTC][case 4] sparse_2_4_mma_fp8_fp8_to_fp16
+  shape=16x16x32  A=FP8_E4M3  B=FP8_E4M3  C=FP16  D=FP16  sparse=2:4  rm=RNE
+  cycles=192  max_abs=0.000000  mean_abs=0.000000  rms=0.000000  threshold=0.050000
+  PASS
+[OTC][case 5] sparse_1_4_mma_fp8_fp8_to_fp16
+  shape=16x16x64  A=FP8_E4M3  B=FP8_E4M3  C=FP16  D=FP16  sparse=1:4  rm=RNE
+  cycles=384  max_abs=0.000000  mean_abs=0.000000  rms=0.000000  threshold=0.050000
+  PASS
+make: Leaving directory '/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/sim/simx/tensor/open_tensorcore'

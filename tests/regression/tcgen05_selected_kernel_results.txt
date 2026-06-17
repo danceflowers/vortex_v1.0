@@ -1,0 +1,201 @@
+Generated prerequisite: make -C kernel VORTEX_HOME=/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex
+
+===== tests/regression/tcgen05_mma_minimal =====
+2026-06-17T11:52:34+08:00
+make: Entering directory '/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/tests/regression/tcgen05_mma_minimal'
+/home/chenbangyu/tools/llvm-vortex/bin/clang++ --sysroot=/home/chenbangyu/tools/riscv32-gnu-toolchain/riscv32-unknown-elf --gcc-toolchain=/home/chenbangyu/tools/riscv32-gnu-toolchain -Xclang -target-feature -Xclang +vortex -Xclang -target-feature -Xclang +zicond -mllvm -disable-loop-idiom-all  -march=rv32imaf -mabi=ilp32f -O3 -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -nostdlib -fdata-sections -ffunction-sections -I/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/kernel/include -I/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/hw -I/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/sim/common -DXLEN_32 -DNDEBUG -DEXT_TCU_ENABLE -DNUM_THREADS=32 /mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/tests/regression/tcgen05_mma_minimal/kernel.cpp -Wl,-Bstatic,--gc-sections,-T,/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/kernel/scripts/link32.ld,--defsym=STARTUP_ADDR=0x80000000 /mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/kernel/libvortex.a -L/home/chenbangyu/tools/libc32/lib -lm -lc /home/chenbangyu/tools/libcrt32/lib/baremetal/libclang_rt.builtins-riscv32.a -o kernel.elf
+OBJCOPY=/home/chenbangyu/tools/llvm-vortex/bin/llvm-objcopy /mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/kernel/scripts/vxbin.py kernel.elf kernel.vxbin
+LD_LIBRARY_PATH=/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/runtime:/home/chenbangyu/IC_tools/verdi/X-2025.06/share/PLI/VCS/linux64 VORTEX_DRIVER=simx ./tcgen05_mma_minimal 
+open device connection
+start device
+wait for completion
+PERF: tcu stall launch/setup=29920
+PERF: tcu stall epilogue/store=5884
+PERF: tcu active cycles=5939
+PERF: tcu issued primitive tiles=16
+PERF: tcu retired primitive tiles=16
+PERF: tcu stall a not ready=0
+PERF: tcu stall b not ready=0
+PERF: tcu stall c not ready=0
+PERF: tcu stall tc busy=0
+PERF: tcu stall wait/barrier=3
+PERF: tcu stall handle reuse=0
+PERF: tcu stall slot busy=0
+PERF: tcu stall no wmma ready=0
+PERF: tcu stall tmem read port busy=0
+PERF: tcu stall tmem write port busy=0
+PERF: tcu tma load count=2
+PERF: tcu tma load latency sum=299 (avg=149 cycles)
+PERF: tcu tma store count=0
+PERF: tcu tma store latency sum=0 (avg=0 cycles)
+PERF: tcu tmem read packets=0
+PERF: tcu tmem write packets=8
+PERF: tcu issued macro wmma=1
+PERF: tcu retired macro wmma=1
+PERF: tcu pending wmma max=1
+PERF: tcu stall a meta not ready=0
+PERF: tcu stall no tensor instr candidate=1411
+PERF: tcu stall mma_load handle not ready=0
+PERF: tcu stall handle busy due to tma load=0
+PERF: tcu stall handle busy due to tma store/shift=0
+PERF: tcu stall no wmma job builder empty=0
+PERF: tcu stall no wmma waiting for mma_load=0
+PERF: tcu stall no wmma waiting for handle alloc=0
+PERF: tcu stall no wmma waiting for slot release=0
+PERF: instrs=34098, cycles=35669, IPC=0.955956
+ERROR_METRICS: max_abs_error=0.001875, mean_abs_error=0.000839843, rms_error=0.000990524
+PASSED! minimal tcgen05 descriptor MMA matched reference
+make: Leaving directory '/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/tests/regression/tcgen05_mma_minimal'
+exit_status=0
+
+===== tests/regression/tcgen05_mma_extended =====
+2026-06-17T11:52:35+08:00
+make: Entering directory '/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/tests/regression/tcgen05_mma_extended'
+/home/chenbangyu/tools/llvm-vortex/bin/clang++ --sysroot=/home/chenbangyu/tools/riscv32-gnu-toolchain/riscv32-unknown-elf --gcc-toolchain=/home/chenbangyu/tools/riscv32-gnu-toolchain -Xclang -target-feature -Xclang +vortex -Xclang -target-feature -Xclang +zicond -mllvm -disable-loop-idiom-all  -march=rv32imaf -mabi=ilp32f -O3 -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -nostdlib -fdata-sections -ffunction-sections -I/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/kernel/include -I/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/hw -I/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/sim/common -DXLEN_32 -DNDEBUG -DEXT_TCU_ENABLE -DNUM_THREADS=32 /mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/tests/regression/tcgen05_mma_extended/kernel.cpp -Wl,-Bstatic,--gc-sections,-T,/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/kernel/scripts/link32.ld,--defsym=STARTUP_ADDR=0x80000000 /mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/kernel/libvortex.a -L/home/chenbangyu/tools/libc32/lib -lm -lc /home/chenbangyu/tools/libcrt32/lib/baremetal/libclang_rt.builtins-riscv32.a -o kernel.elf
+OBJCOPY=/home/chenbangyu/tools/llvm-vortex/bin/llvm-objcopy /mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/kernel/scripts/vxbin.py kernel.elf kernel.vxbin
+LD_LIBRARY_PATH=/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/runtime:/home/chenbangyu/IC_tools/verdi/X-2025.06/share/PLI/VCS/linux64 VORTEX_DRIVER=simx ./tcgen05_mma_extended 
+open device connection
+[Vortex][case 1] tcgen05_dense_fp16_fp8_to_fp32
+  GOLDEN1_QUANTIZED_INPUT_ERROR_METRICS: max_abs_error=0, mean_abs_error=0, rms_error=0, threshold=0.01
+  GOLDEN2_RAW_FP32_INPUT_ERROR_METRICS: max_abs_error=0, mean_abs_error=0, rms_error=0, threshold=0.01
+  PASS
+[Vortex][case 2] tcgen05_sparse_2_4_fp8_fp8_to_fp16
+  GOLDEN1_QUANTIZED_INPUT_ERROR_METRICS: max_abs_error=0, mean_abs_error=0, rms_error=0, threshold=0.05
+  GOLDEN2_RAW_FP32_INPUT_ERROR_METRICS: max_abs_error=0, mean_abs_error=0, rms_error=0, threshold=0.05
+  PASS
+[Vortex][case 3] tcgen05_sparse_1_4_fp8_fp8_to_fp16
+  GOLDEN1_QUANTIZED_INPUT_ERROR_METRICS: max_abs_error=0, mean_abs_error=0, rms_error=0, threshold=0.05
+  GOLDEN2_RAW_FP32_INPUT_ERROR_METRICS: max_abs_error=0, mean_abs_error=0, rms_error=0, threshold=0.05
+  PASS
+PERF: tcu stall launch/setup=26940
+PERF: tcu stall epilogue/store=5115
+PERF: tcu active cycles=5162
+PERF: tcu issued primitive tiles=8
+PERF: tcu retired primitive tiles=8
+PERF: tcu stall a not ready=0
+PERF: tcu stall b not ready=0
+PERF: tcu stall c not ready=0
+PERF: tcu stall tc busy=0
+PERF: tcu stall wait/barrier=3
+PERF: tcu stall handle reuse=0
+PERF: tcu stall slot busy=0
+PERF: tcu stall no wmma ready=0
+PERF: tcu stall tmem read port busy=0
+PERF: tcu stall tmem write port busy=0
+PERF: tcu tma load count=4
+PERF: tcu tma load latency sum=7099 (avg=1774 cycles)
+PERF: tcu tma store count=0
+PERF: tcu tma store latency sum=0 (avg=0 cycles)
+PERF: tcu tmem read packets=0
+PERF: tcu tmem write packets=18
+PERF: tcu issued macro wmma=1
+PERF: tcu retired macro wmma=1
+PERF: tcu pending wmma max=1
+PERF: tcu stall a meta not ready=0
+PERF: tcu stall no tensor instr candidate=1563
+PERF: tcu stall mma_load handle not ready=0
+PERF: tcu stall handle busy due to tma load=0
+PERF: tcu stall handle busy due to tma store/shift=0
+PERF: tcu stall no wmma job builder empty=0
+PERF: tcu stall no wmma waiting for mma_load=0
+PERF: tcu stall no wmma waiting for handle alloc=0
+PERF: tcu stall no wmma waiting for slot release=0
+PERF: instrs=38962, cycles=31961, IPC=1.219048
+PASSED! extended tcgen05 MMA cases matched golden1 and golden2
+make: Leaving directory '/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/tests/regression/tcgen05_mma_extended'
+exit_status=0
+
+===== tests/regression/tcu_ldst =====
+2026-06-17T11:52:37+08:00
+make: Entering directory '/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/tests/regression/tcu_ldst'
+/home/chenbangyu/tools/llvm-vortex/bin/clang++ --sysroot=/home/chenbangyu/tools/riscv32-gnu-toolchain/riscv32-unknown-elf --gcc-toolchain=/home/chenbangyu/tools/riscv32-gnu-toolchain -Xclang -target-feature -Xclang +vortex -Xclang -target-feature -Xclang +zicond -mllvm -disable-loop-idiom-all  -march=rv32imaf -mabi=ilp32f -O3 -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -nostdlib -fdata-sections -ffunction-sections -I/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/kernel/include -I/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/hw -I/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/sim/common -DXLEN_32 -DNDEBUG -DEXT_TCU_ENABLE -DNUM_THREADS=32 /mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/tests/regression/tcu_ldst/kernel.cpp -Wl,-Bstatic,--gc-sections,-T,/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/kernel/scripts/link32.ld,--defsym=STARTUP_ADDR=0x80000000 /mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/kernel/libvortex.a -L/home/chenbangyu/tools/libc32/lib -lm -lc /home/chenbangyu/tools/libcrt32/lib/baremetal/libclang_rt.builtins-riscv32.a -o kernel.elf
+OBJCOPY=/home/chenbangyu/tools/llvm-vortex/bin/llvm-objcopy /mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/kernel/scripts/vxbin.py kernel.elf kernel.vxbin
+LD_LIBRARY_PATH=/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/runtime:/home/chenbangyu/IC_tools/verdi/X-2025.06/share/PLI/VCS/linux64 VORTEX_DRIVER=simx ./tcu_ldst 
+open device connection
+start device
+wait for completion
+PERF: tcu stall launch/setup=30965
+PERF: tcu stall epilogue/store=0
+PERF: tcu active cycles=0
+PERF: tcu issued primitive tiles=0
+PERF: tcu retired primitive tiles=0
+PERF: tcu stall a not ready=0
+PERF: tcu stall b not ready=0
+PERF: tcu stall c not ready=0
+PERF: tcu stall tc busy=0
+PERF: tcu stall wait/barrier=2
+PERF: tcu stall handle reuse=0
+PERF: tcu stall slot busy=0
+PERF: tcu stall no wmma ready=0
+PERF: tcu stall tmem read port busy=0
+PERF: tcu stall tmem write port busy=0
+PERF: tcu tma load count=0
+PERF: tcu tma load latency sum=0 (avg=0 cycles)
+PERF: tcu tma store count=0
+PERF: tcu tma store latency sum=0 (avg=0 cycles)
+PERF: tcu tmem read packets=0
+PERF: tcu tmem write packets=0
+PERF: tcu issued macro wmma=0
+PERF: tcu retired macro wmma=0
+PERF: tcu pending wmma max=0
+PERF: tcu stall a meta not ready=0
+PERF: tcu stall no tensor instr candidate=1092
+PERF: tcu stall mma_load handle not ready=0
+PERF: tcu stall handle busy due to tma load=0
+PERF: tcu stall handle busy due to tma store/shift=0
+PERF: tcu stall no wmma job builder empty=0
+PERF: tcu stall no wmma waiting for mma_load=0
+PERF: tcu stall no wmma waiting for handle alloc=0
+PERF: tcu stall no wmma waiting for slot release=0
+PERF: instrs=23890, cycles=30832, IPC=0.774844
+PASSED! tcu_st->tcu_ld round-trip verified across 32 lanes
+make: Leaving directory '/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/tests/regression/tcu_ldst'
+exit_status=0
+
+===== tests/regression/tcu_mbarrier_pending_tx =====
+2026-06-17T11:52:38+08:00
+make: Entering directory '/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/tests/regression/tcu_mbarrier_pending_tx'
+/home/chenbangyu/tools/llvm-vortex/bin/clang++ --sysroot=/home/chenbangyu/tools/riscv32-gnu-toolchain/riscv32-unknown-elf --gcc-toolchain=/home/chenbangyu/tools/riscv32-gnu-toolchain -Xclang -target-feature -Xclang +vortex -Xclang -target-feature -Xclang +zicond -mllvm -disable-loop-idiom-all  -march=rv32imaf -mabi=ilp32f -O3 -mcmodel=medany -fno-rtti -fno-exceptions -nostartfiles -nostdlib -fdata-sections -ffunction-sections -I/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/kernel/include -I/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/hw -I/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/sim/common -DXLEN_32 -DNDEBUG -DEXT_TCU_ENABLE -DNUM_THREADS=32 /mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/tests/regression/tcu_mbarrier_pending_tx/kernel.cpp -Wl,-Bstatic,--gc-sections,-T,/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/kernel/scripts/link32.ld,--defsym=STARTUP_ADDR=0x80000000 /mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/kernel/libvortex.a -L/home/chenbangyu/tools/libc32/lib -lm -lc /home/chenbangyu/tools/libcrt32/lib/baremetal/libclang_rt.builtins-riscv32.a -o kernel.elf
+OBJCOPY=/home/chenbangyu/tools/llvm-vortex/bin/llvm-objcopy /mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/kernel/scripts/vxbin.py kernel.elf kernel.vxbin
+LD_LIBRARY_PATH=/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/runtime:/home/chenbangyu/IC_tools/verdi/X-2025.06/share/PLI/VCS/linux64 VORTEX_DRIVER=simx ./tcu_mbarrier_pending_tx 
+open device connection
+start device
+wait for completion
+PERF: tcu stall launch/setup=34260
+PERF: tcu stall epilogue/store=0
+PERF: tcu active cycles=0
+PERF: tcu issued primitive tiles=0
+PERF: tcu retired primitive tiles=0
+PERF: tcu stall a not ready=0
+PERF: tcu stall b not ready=0
+PERF: tcu stall c not ready=0
+PERF: tcu stall tc busy=0
+PERF: tcu stall wait/barrier=1
+PERF: tcu stall handle reuse=0
+PERF: tcu stall slot busy=0
+PERF: tcu stall no wmma ready=0
+PERF: tcu stall tmem read port busy=0
+PERF: tcu stall tmem write port busy=0
+PERF: tcu tma load count=1
+PERF: tcu tma load latency sum=573 (avg=573 cycles)
+PERF: tcu tma store count=0
+PERF: tcu tma store latency sum=0 (avg=0 cycles)
+PERF: tcu tmem read packets=0
+PERF: tcu tmem write packets=0
+PERF: tcu issued macro wmma=0
+PERF: tcu retired macro wmma=0
+PERF: tcu pending wmma max=0
+PERF: tcu stall a meta not ready=0
+PERF: tcu stall no tensor instr candidate=1190
+PERF: tcu stall mma_load handle not ready=0
+PERF: tcu stall handle busy due to tma load=0
+PERF: tcu stall handle busy due to tma store/shift=0
+PERF: tcu stall no wmma job builder empty=0
+PERF: tcu stall no wmma waiting for mma_load=0
+PERF: tcu stall no wmma waiting for handle alloc=0
+PERF: tcu stall no wmma waiting for slot release=0
+PERF: instrs=27026, cycles=34176, IPC=0.790789
+PASSED! (observed first word = 0xcafe0000 matches DRAM source via LMEM direct path)
+make: Leaving directory '/mnt/d/wode_code_trunk/vortex_back_up/vortex_4_32_v2/vortex/tests/regression/tcu_mbarrier_pending_tx'
+exit_status=0
+

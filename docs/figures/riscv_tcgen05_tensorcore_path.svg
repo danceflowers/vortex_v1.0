@@ -1,0 +1,170 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="980" viewBox="0 0 1800 980">
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#344054"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#15803d"/>
+    </marker>
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="5" stdDeviation="5" flood-color="#101828" flood-opacity="0.13"/>
+    </filter>
+    <style>
+      .bg { fill: #f8fafc; }
+      .title { font-family: "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; font-size: 36px; font-weight: 700; fill: #111827; }
+      .subtitle { font-family: "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; font-size: 18px; fill: #475467; }
+      .box { rx: 14; ry: 14; stroke-width: 2; filter: url(#softShadow); }
+      .boxTitle { font-family: "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; font-size: 22px; font-weight: 700; fill: #111827; }
+      .boxText { font-family: "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; font-size: 15px; fill: #344054; }
+      .smallText { font-family: "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; font-size: 13px; fill: #475467; }
+      .laneText { font-family: "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; font-size: 16px; font-weight: 600; fill: #344054; }
+      .arrow { stroke: #344054; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .blueArrow { stroke: #2563eb; stroke-width: 3; fill: none; marker-end: url(#arrowBlue); }
+      .greenArrow { stroke: #15803d; stroke-width: 3; fill: none; marker-end: url(#arrowGreen); }
+      .dash { stroke-dasharray: 9 7; }
+      .sectionLabel { font-family: "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; font-size: 15px; font-weight: 700; fill: #667085; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1800" height="980"/>
+
+  <text class="title" x="70" y="72">RISC-V 兼容 tcgen05 指令到 TensorCore 执行路径</text>
+  <text class="subtitle" x="70" y="106">Core 侧只做 custom 指令识别与上下文转发；TensorCore 侧 TcDecode 解析 descriptor，TensorUnit 维护 TMEM/LMEM 数据路径、计算流水和异步完成。</text>
+
+  <text class="sectionLabel" x="76" y="156">主执行路径</text>
+
+  <!-- Main path boxes -->
+  <rect class="box" x="70" y="175" width="190" height="175" fill="#ffffff" stroke="#98a2b3"/>
+  <text class="boxTitle" x="92" y="212">RISC-V custom</text>
+  <text class="boxText" x="92" y="246">custom-1: TMEM / bulk</text>
+  <text class="boxText" x="92" y="272">custom-2: mbarrier</text>
+  <text class="boxText" x="92" y="298">custom-3: MMA / ld/st</text>
+  <text class="smallText" x="92" y="326">R-type: rd, rs1, rs2, funct7</text>
+
+  <rect class="box" x="310" y="175" width="210" height="175" fill="#eff6ff" stroke="#60a5fa"/>
+  <text class="boxTitle" x="332" y="212">Core decode / issue</text>
+  <text class="boxText" x="332" y="246">识别 opcode / funct3</text>
+  <text class="boxText" x="332" y="272">保留完整指令上下文</text>
+  <text class="boxText" x="332" y="298">转发 rs1 / rs2 / funct7</text>
+  <text class="smallText" x="332" y="326">不解析 TensorCore 语义</text>
+
+  <rect class="box" x="570" y="175" width="215" height="175" fill="#ecfdf3" stroke="#4ade80"/>
+  <text class="boxTitle" x="592" y="212">TcDecode</text>
+  <text class="boxText" x="592" y="246">解析 idescriptor</text>
+  <text class="boxText" x="592" y="272">读取 operand block</text>
+  <text class="boxText" x="592" y="298">解析 shared descriptor</text>
+  <text class="smallText" x="592" y="326">fmt_a / fmt_b / fmt_c / fmt_d</text>
+
+  <rect class="box" x="835" y="175" width="240" height="175" fill="#fff7ed" stroke="#fb923c"/>
+  <text class="boxTitle" x="857" y="212">TensorUnit</text>
+  <text class="boxText" x="857" y="246">LoadA / LoadB / LoadC</text>
+  <text class="boxText" x="857" y="272">Compute primitive issue</text>
+  <text class="boxText" x="857" y="298">StoreD packet writeback</text>
+  <text class="smallText" x="857" y="326">macro-op 内部进度控制</text>
+
+  <rect class="box" x="1125" y="175" width="245" height="175" fill="#f4f3ff" stroke="#a78bfa"/>
+  <text class="boxTitle" x="1147" y="212">Operand SRAM</text>
+  <text class="boxText" x="1147" y="246">AMem: A tile → FP9</text>
+  <text class="boxText" x="1147" y="272">BMem: B tile → FP9</text>
+  <text class="boxText" x="1147" y="298">CMem: C bypass → FP22</text>
+  <text class="smallText" x="1147" y="326">每个 tile 拆成 8x8 primitive</text>
+
+  <rect class="box" x="1420" y="175" width="260" height="175" fill="#fef3f2" stroke="#fb7185"/>
+  <text class="boxTitle" x="1442" y="212">TensorCore pipeline</text>
+  <text class="boxText" x="1442" y="246">4 个 output subtile</text>
+  <text class="boxText" x="1442" y="272">2 个 K phase</text>
+  <text class="boxText" x="1442" y="298">共 8 个 primitive</text>
+  <text class="smallText" x="1442" y="326">phase 0 可带 C bypass</text>
+
+  <path class="arrow" d="M 260 262 L 310 262"/>
+  <path class="arrow" d="M 520 262 L 570 262"/>
+  <path class="arrow" d="M 785 262 L 835 262"/>
+  <path class="arrow" d="M 1075 262 L 1125 262"/>
+  <path class="arrow" d="M 1370 262 L 1420 262"/>
+
+  <!-- Memory and writeback layer -->
+  <text class="sectionLabel" x="76" y="415">数据搬运与本地存储</text>
+
+  <rect class="box" x="150" y="440" width="290" height="160" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="boxTitle" x="172" y="477">TMEM</text>
+  <text class="boxText" x="172" y="511">TADDR allocation</text>
+  <text class="boxText" x="172" y="537">64B packet / 512-bit port</text>
+  <text class="boxText" x="172" y="563">16-bank SRAM arbitration</text>
+
+  <rect class="box" x="510" y="440" width="270" height="160" fill="#ffffff" stroke="#94a3b8"/>
+  <text class="boxTitle" x="532" y="477">LMEM</text>
+  <text class="boxText" x="532" y="511">operand block</text>
+  <text class="boxText" x="532" y="537">shared-memory descriptor</text>
+  <text class="boxText" x="532" y="563">cpabulk args / mbarrier</text>
+
+  <rect class="box" x="860" y="440" width="265" height="160" fill="#f0f9ff" stroke="#38bdf8"/>
+  <text class="boxTitle" x="882" y="477">Load paths</text>
+  <text class="boxText" x="882" y="511">LoadA: TMEM → AMem</text>
+  <text class="boxText" x="882" y="537">LoadB: LMEM → BMem</text>
+  <text class="boxText" x="882" y="563">LoadC: TMEM → CMem</text>
+
+  <rect class="box" x="1200" y="440" width="250" height="160" fill="#f7fee7" stroke="#84cc16"/>
+  <text class="boxTitle" x="1222" y="477">DMem</text>
+  <text class="boxText" x="1222" y="511">FP22 output subtiles</text>
+  <text class="boxText" x="1222" y="537">退休侧原位累加</text>
+  <text class="boxText" x="1222" y="563">fmt_d pack to output</text>
+
+  <rect class="box" x="1510" y="440" width="220" height="160" fill="#fff1f2" stroke="#fb7185"/>
+  <text class="boxTitle" x="1532" y="477">StoreD</text>
+  <text class="boxText" x="1532" y="511">DMem FP22 打包</text>
+  <text class="boxText" x="1532" y="537">TMEM RegionWrite</text>
+  <text class="boxText" x="1532" y="563">触发 async completion</text>
+
+  <path class="blueArrow" d="M 295 440 C 360 385, 785 385, 955 440"/>
+  <text class="smallText" x="485" y="393">A/C/D 通过 TMEM packet 通路</text>
+  <path class="greenArrow" d="M 645 440 C 690 405, 835 405, 955 440"/>
+  <text class="smallText" x="675" y="423">B 通过 LMEM descriptor 通路</text>
+  <path class="arrow" d="M 1125 520 L 1200 520"/>
+  <path class="arrow" d="M 1450 520 L 1510 520"/>
+  <path class="blueArrow" d="M 1510 570 C 1200 675, 480 675, 295 600"/>
+
+  <!-- Sync path -->
+  <text class="sectionLabel" x="76" y="705">异步完成与同步路径</text>
+
+  <rect class="box" x="150" y="730" width="230" height="120" fill="#eef2ff" stroke="#818cf8"/>
+  <text class="boxTitle" x="172" y="767">async_id</text>
+  <text class="boxText" x="172" y="801">长延迟 tensor transaction</text>
+  <text class="smallText" x="172" y="827">MMA / TMEM shift / bulk copy</text>
+
+  <rect class="box" x="460" y="730" width="220" height="120" fill="#ecfeff" stroke="#22d3ee"/>
+  <text class="boxTitle" x="482" y="767">commit</text>
+  <text class="boxText" x="482" y="801">绑定未完成 transaction</text>
+  <text class="smallText" x="482" y="827">完成后贡献 mbarrier arrival</text>
+
+  <rect class="box" x="760" y="730" width="260" height="120" fill="#f0fdf4" stroke="#4ade80"/>
+  <text class="boxTitle" x="782" y="767">mbarrier object</text>
+  <text class="boxText" x="782" y="801">arrival phase</text>
+  <text class="boxText" x="782" y="827">complete_tx bytes</text>
+
+  <rect class="box" x="1100" y="730" width="230" height="120" fill="#fffbeb" stroke="#fbbf24"/>
+  <text class="boxTitle" x="1122" y="767">wait / fence</text>
+  <text class="boxText" x="1122" y="801">phase wait</text>
+  <text class="boxText" x="1122" y="827">before / after 可见性</text>
+
+  <rect class="box" x="1410" y="730" width="260" height="120" fill="#fff7ed" stroke="#fb923c"/>
+  <text class="boxTitle" x="1432" y="767">warp resume</text>
+  <text class="boxText" x="1432" y="801">异步事件完成</text>
+  <text class="boxText" x="1432" y="827">等待 warp 被唤醒</text>
+
+  <path class="greenArrow" d="M 380 790 L 460 790"/>
+  <path class="greenArrow" d="M 680 790 L 760 790"/>
+  <path class="greenArrow" d="M 1020 790 L 1100 790"/>
+  <path class="greenArrow" d="M 1330 790 L 1410 790"/>
+
+  <path class="greenArrow dash" d="M 1610 440 C 1645 365, 1645 240, 1545 350"/>
+  <text class="smallText" x="1496" y="398">TCU_MMA completion</text>
+  <path class="greenArrow dash" d="M 1540 600 C 1600 645, 1620 690, 1540 730"/>
+
+  <!-- Notes -->
+  <rect x="70" y="890" width="1660" height="52" rx="12" ry="12" fill="#ffffff" stroke="#d0d5dd"/>
+  <text class="laneText" x="96" y="922">设计要点：</text>
+  <text class="smallText" x="184" y="922">Core decode 只识别并转发完整 RISC-V 指令上下文；TcDecode 才解析 descriptor；A/D 走 TMEM TADDR，B 走 shared-memory descriptor；DMem 在退休侧原位累加；完成事件进入 async_id、commit、mbarrier、wait/fence 链路。</text>
+</svg>

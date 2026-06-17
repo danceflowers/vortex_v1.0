@@ -119,6 +119,20 @@ public:
 	void tick() override;
 };
 
+class TmemUnit : public FuncUnit {
+public:
+	TmemUnit(const SimContext& ctx, Core*);
+
+	void tick() override;
+};
+
+class TmaUnit : public FuncUnit {
+public:
+	TmaUnit(const SimContext& ctx, Core*);
+
+	void tick() override;
+};
+
 //#endif
 
 ///////////////////////////////////////////////////////////////////////////////
