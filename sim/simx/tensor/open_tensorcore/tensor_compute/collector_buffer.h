@@ -22,9 +22,9 @@
 namespace vortex {
 
 // ============================================================================
-// CollectorState — shared ownership tracking struct for all collector buffers
+// CollectorBufState — shared ownership tracking struct for all collector buffers
 // ============================================================================
-struct CollectorState {
+struct CollectorBufState {
   bool     valid            = false;
   uint32_t owner_wid        = 0;
   bool     compute_inflight = false;
@@ -103,7 +103,7 @@ private:
 
   std::array<row_t, kDepth> lines_;
   std::array<bool, kDepth>  line_valid_;
-  CollectorState            state_;
+  CollectorBufState         state_;
 };
 
 // ============================================================================
@@ -128,7 +128,7 @@ public:
   bool valid() const { return state_.valid; }
 private:
   std::array<uint8_t, 64> data_;
-  CollectorState           state_;
+  CollectorBufState        state_;
 };
 
 // ============================================================================
@@ -198,7 +198,7 @@ private:
 
   std::array<row_t, kDepth> lines_;
   std::array<bool, kDepth>  line_valid_;
-  CollectorState            state_;
+  CollectorBufState         state_;
   uint8_t                   index_;
 };
 

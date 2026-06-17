@@ -74,6 +74,14 @@ void ComputePipeline::reset() {
   next_request_id_ = 1;
   staged_sparse_meta_.fill(0);
   staged_has_sparse_meta_ = false;
+
+  // Clear and reindex collector buffers.
+  abuf_.clear();
+  mbuf_.clear();
+  bbuf_[0] = BBuf(0); bbuf_[0].clear();
+  bbuf_[1] = BBuf(1); bbuf_[1].clear();
+  bbuf_[2] = BBuf(2); bbuf_[2].clear();
+  bbuf_[3] = BBuf(3); bbuf_[3].clear();
 }
 
 void ComputePipeline::tick() {
@@ -112,14 +120,17 @@ void ComputePipeline::tick() {
     break;
 
   case ComputeState::COMPUTE: {
-    // A: Try to receive next B chunk from Stage2a.
-    try_receive_next_chunk(job);
+    // Step order: compute first, so swap can catch round_issued_subtiles→4
+    // in the same tick, and receive can immediately fill the newly-idle bank.
 
-    // B: Try to swap to next K round.
+    // C: Drive TensorCoreTop compute (may set round_issued_subtiles → kSubtiles).
+    advance_compute(job);
+
+    // B: Try to swap to next K round (sees round_issued_subtiles just set).
     try_swap_to_next_round(job);
 
-    // C: Drive TensorCoreTop compute.
-    advance_compute(job);
+    // A: Try to receive next B chunk from Stage2a (idle bank freed by swap).
+    try_receive_next_chunk(job);
 
     // D: Check all done.
     bool all_chunks_done = (job.b_chunk_recv == job.total_b_chunks);
@@ -164,6 +175,7 @@ void ComputePipeline::tick() {
 void ComputePipeline::fill_abc(ActiveJob& job) {
   amem_.clear();
   bmem_[0].clear();
+  bmem_[1].clear();
   cmem_.clear();
   dmem_->clear();
   tensorcore_.reset();
@@ -327,13 +339,13 @@ void ComputePipeline::fill_b_bank(uint32_t bank_idx,
 
 bool ComputePipeline::try_receive_next_chunk(ActiveJob& job) {
   if (job.b_chunk_recv >= job.total_b_chunks) return false;
-  if (bmem_[1 - job.active_bmem].valid()) return false;  // idle bank has old data
+  if (bmem_[(job.active_bmem ^ 1)].valid()) return false;  // idle bank has old data
   if (Input.empty()) return false;
 
   auto tile = Input.front();
   if (tile->b_chunk_idx != job.b_chunk_recv) return false;  // validate sequence
   Input.pop();
-  fill_b_bank(1 - job.active_bmem, tile);  // write to idle bank
+  fill_b_bank((job.active_bmem ^ 1), tile);  // write to idle bank
 
   DT(4, "ComputePipeline: recv B chunk " << (int)tile->b_chunk_idx
      << "/" << (int)job.total_b_chunks << " wid=" << job.tile->wid);
@@ -343,11 +355,11 @@ bool ComputePipeline::try_receive_next_chunk(ActiveJob& job) {
 bool ComputePipeline::try_swap_to_next_round(ActiveJob& job) {
   if (job.round_issued_subtiles < kSubtiles) return false;
   if (job.b_chunk_recv >= job.total_b_chunks) return false;
-  if (!bmem_[1 - job.active_bmem].valid()) return false;
+  if (!bmem_[(job.active_bmem ^ 1)].valid()) return false;
 
   // Invalidate the bank we are vacating so it can be reused.
   bmem_[job.active_bmem].clear();
-  job.active_bmem = 1 - job.active_bmem;
+  job.active_bmem ^= 1;
   ++job.b_chunk_recv;
   job.round_issued_subtiles = 0;
 

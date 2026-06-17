@@ -31,6 +31,7 @@
 #include "open_tensorcore/tensor_compute/bmem.h"
 #include "open_tensorcore/tensor_compute/cmem.h"
 #include "open_tensorcore/tensor_compute/dmem.h"
+#include "open_tensorcore/tensor_compute/collector_buffer.h"
 #include "tensor_mem_port_types.h"
 
 namespace vortex {
@@ -57,6 +58,15 @@ public:
 
   void reset();
   void tick();
+
+  // Collector buffer readiness queries (called by OpenTensorCore::collector_ready).
+  bool abuf_ready(uint32_t wid, uint8_t collector_buffer) const {
+    return abuf_.is_ready_for(wid, collector_buffer);
+  }
+  bool bbuf_ready(int8_t bbuf_idx, uint32_t wid, uint8_t collector_buffer) const {
+    if (bbuf_idx < 0 || bbuf_idx >= 4) return true;  // no bbuf involved
+    return bbuf_[bbuf_idx].is_ready_for(wid, collector_buffer);
+  }
 
 private:
   enum class ComputeState : uint8_t { IDLE, FILL, COMPUTE, STORE, DONE };
@@ -121,6 +131,11 @@ private:
   BMem          bmem_[2];
   CMem          cmem_;
   TensorCoreTop tensorcore_;
+
+  // Collector buffers for warp-level ownership tracking.
+  ABuf abuf_;
+  MBuf mbuf_;
+  BBuf bbuf_[4];
   std::deque<ActiveJob> pending_;
 
   std::array<uint8_t, 64> staged_sparse_meta_;

@@ -17,6 +17,7 @@
 #include "core.h"
 #include "debug.h"
 #include "idescriptor.h"
+#include "opentensorcore.h"
 #include "tensor_cfg.h"
 
 namespace vortex {
@@ -61,6 +62,7 @@ uint8_t sparsity_to_mode(uint32_t kind_bit, bool sp_qualifier) {
 // ---------------------------------------------------------------------------
 
 TcDecodeStage::TcDecodeStage(const SimContext& ctx, const char* name, Core* core,
+                             OpenTensorCore* otc,
                              const TcDecodeConfig& config)
   : SimObject<TcDecodeStage>(ctx, name)
   , Input(this, config.port_depth)
@@ -69,6 +71,7 @@ TcDecodeStage::TcDecodeStage(const SimContext& ctx, const char* name, Core* core
   , LmemReadReq(this, config.lmem_read_depth)
   , LmemReadRsp(this, config.lmem_rsp_depth)
   , core_(core)
+  , otc_(otc)
   , config_(config) {
   this->reset();
 }
@@ -76,6 +79,7 @@ TcDecodeStage::TcDecodeStage(const SimContext& ctx, const char* name, Core* core
 void TcDecodeStage::reset() {
   pending_.valid = false;
   pending_.pending_req_id = 0;
+  pending_.op_block_ready = false;
   completed_lmem_rsp_.clear();
   next_request_id_ = 1;
 }
@@ -92,8 +96,35 @@ void TcDecodeStage::tick() {
     completed_lmem_rsp_[rsp.tag] = rsp;
   }
 
-  // ---- 2. Pending MMA decode: waiting for LMEM response ----
+  // ---- 2. Pending MMA decode ----
   if (pending_.valid) {
+    // Phase 2: LMEM response already received, waiting for collector buffer.
+    if (pending_.op_block_ready) {
+      if (otc_ && !otc_->collector_ready(pending_.job.wid,
+                                          pending_.job.collector_buffer,
+                                          pending_.job.ws,
+                                          pending_.job.bbuf_idx)) {
+        return;  // stall: collector buffer not ready, retry next tick
+      }
+      // Collector buffer ready — push to Output.
+      DT(3, "TcDecodeStage: job a_taddr=0x" << std::hex << pending_.job.a_taddr
+         << " d_taddr=0x" << pending_.job.d_taddr
+         << " shape=" << std::dec << pending_.job.shape_m << "x" << pending_.job.shape_n
+         << " fmt_a=" << pending_.job.fmt_a << " fmt_b=" << pending_.job.fmt_b
+         << " fmt_c=" << pending_.job.fmt_c << " fmt_d=" << pending_.job.fmt_d
+         << " enable_input_d=" << static_cast<uint32_t>(pending_.job.enable_input_d)
+         << " sp=" << static_cast<uint32_t>(pending_.job.sp)
+         << " collector_buffer=" << static_cast<uint32_t>(pending_.job.collector_buffer)
+         << " ws=" << static_cast<uint32_t>(pending_.job.ws)
+         << " bbuf_idx=" << static_cast<int>(pending_.job.bbuf_idx));
+
+      Output.push(pending_.job, config_.decode_latency);
+      pending_.valid = false;
+      pending_.op_block_ready = false;
+      return;
+    }
+
+    // Phase 1: Waiting for LMEM response.
     auto it = completed_lmem_rsp_.find(pending_.pending_req_id);
     if (it != completed_lmem_rsp_.end()) {
       // Response received — functional read of operand_block_t (32 B).
@@ -110,19 +141,17 @@ void TcDecodeStage::tick() {
                     | uint64_t(op_block.b_sdesc_lo);
       job.lanes_off = op_block.lanes_off;
 
-      DT(3, "TcDecodeStage: job a_taddr=0x" << std::hex << job.a_taddr
-         << " d_taddr=0x" << job.d_taddr
-         << " shape=" << std::dec << job.shape_m << "x" << job.shape_n
-         << " fmt_a=" << job.fmt_a << " fmt_b=" << job.fmt_b
-         << " fmt_c=" << job.fmt_c << " fmt_d=" << job.fmt_d
-         << " enable_input_d=" << static_cast<uint32_t>(job.enable_input_d)
-         << " sp=" << static_cast<uint32_t>(job.sp));
+      // Parse bbuf_idx from operand_block_t.reserved0 when ws=1.
+      if (job.ws == 1) {
+        job.bbuf_idx = static_cast<int8_t>(op_block.reserved0 & 0x3);
+      } else {
+        job.bbuf_idx = -1;
+      }
 
-      Output.push(job, config_.decode_latency);
-      pending_.valid = false;
+      pending_.op_block_ready = true;
+      // Fall through: collector check happens next tick.
     }
-    // Stall: waiting for LMEM response (or just completed this tick).
-    // Don't accept new input — one operation per tick for simplicity.
+    // Stall: waiting for LMEM response or collector buffer.
     return;
   }
 
@@ -244,7 +273,7 @@ void TcDecodeStage::tick() {
   pending_.pending_req_id    = req.tag;
   pending_.trace             = trace;
   pending_.job               = job;
-  //pending_.op_block_lmem_ptr = op_block_lmem_ptr;
+  pending_.op_block_lmem_ptr = op_block_lmem_ptr;
 }
 
 }  // namespace vortex
