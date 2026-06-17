@@ -132,6 +132,8 @@ enum class FUType {
 #endif
 //#ifdef EXT_TCU_ENABLE
   TCU,
+  TMEM,
+  TMA,
 //#endif
   Count
 };
@@ -147,6 +149,8 @@ inline std::ostream &operator<<(std::ostream &os, const FUType& type) {
 #endif
 //#ifdef EXT_TCU_ENABLE
   case FUType::TCU: os << "TCU"; break;
+  case FUType::TMEM: os << "TMEM"; break;
+  case FUType::TMA: os << "TMA"; break;
 //#endif
   default:
     assert(false);
@@ -751,7 +755,7 @@ enum class TcuType {
   MBAR_TEST_TRY_WAIT, // mbarrier.test_wait / mbarrier.try_wait
 
   // ---- custom-3 (EXT4, 0x7B): tcgen05 compute ----
-  TCU_MMA,            // tcgen05.mma{.ws,.sp}
+  TCU_WMMA,            // tcgen05.mma{.ws,.sp}
   TCU_LD,             // tcgen05.ld (TMEM -> RF)
   TCU_ST,             // tcgen05.st (RF -> TMEM)
   TCU_WAIT_LD,        // tcgen05.wait::ld
@@ -771,7 +775,7 @@ static constexpr uint32_t kTcuTmemOpControlPtxOnly = 0;
 //   - CPABULK_TENSOR_* : dim_count, im2col_tile, multicast, mbar_complete_tx
 //   - MBAR_*           : cluster_scope, arrive_drop, relaxed, expect_tx_combo,
 //                        test_or_try, timeout_bucket, fence_mode
-//   - TCU_MMA          : enable_input_d, ws, sp, cta_group, collector_a_fill, multicast
+//   - TCU_WMMA          : enable_input_d, ws, sp, cta_group, collector_a_fill, multicast
 //   - TCU_LD/ST        : ld_shape, ld_num, ld_pack
 struct IntrTcuArgs {
   // Operand-side state resolved at execute time from the PTX idesc.
@@ -785,10 +789,16 @@ struct IntrTcuArgs {
   uint32_t async_id = 0;
   uint32_t runtime_taddr = 0;
 
-  // ---- New tcgen05 ISA qualifier-decoded flags (modifier bits from funct7) ----
-  uint8_t cta_group = 0;          // qualifier[0] for most TMEM ops; qualifier[3] for TCU_MMA
+  // Raw funct7 bits for TCU_WMMA path; decode stores the verbatim funct7 here
+  // without semantic parsing. Stage1 (TcDecode) interprets ws/sp/enable_input_d/
+  // cta_group/collector/multicast from this field. Other TCU opcodes continue to
+  // use the decoded qualifier sub-fields below until their paths are migrated.
+  uint32_t raw_funct7 = 0;
+
+  // ---- tcgen05 ISA qualifier-decoded flags (modifier bits from funct7) ----
+  uint8_t cta_group = 0;          // qualifier[0] for most TMEM ops; qualifier[3] for TCU_WMMA
   uint8_t shared_addr_space = 0;  // TMEM_ALLOC qualifier[1]
-  uint8_t multicast = 0;          // TMEM_CP qualifier[6]; CPABULK qualifier[4]; MBAR_COMMIT qualifier[2]; TCU_MMA qualifier[6]
+  uint8_t multicast = 0;          // TMEM_CP qualifier[6]; CPABULK qualifier[4]; MBAR_COMMIT qualifier[2]; TCU_WMMA qualifier[6]
   uint8_t cluster_scope = 0;      // MBAR_* shared::cluster bit
   uint8_t invalidate = 0;         // MBAR_INIT qualifier[0] (0=init, 1=invalidate)
 
@@ -813,11 +823,11 @@ struct IntrTcuArgs {
   TcuTestTryWait test_or_try = TcuTestTryWait::Test;
   uint8_t timeout_bucket = 0;       // qualifier[6:2] (5 bits, only valid when test_or_try=Try)
 
-  // TCU_MMA modifiers.
+  // TCU_WMMA modifiers.
   uint8_t enable_input_d = 0;       // qualifier[0] (=output_resident OR)
   uint8_t ws = 0;                   // qualifier[1]
   uint8_t sp = 0;                   // qualifier[2]
-  uint8_t collector_a_fill = 0;     // qualifier[5:4] (fill/use/lastuse/discard)
+  uint8_t collector_buffer = 0;     // qualifier[5:4] (fill/use/lastuse/discard)
 
   // TCU_LD / TCU_ST modifiers.
   TcuLdStShape ld_shape = TcuLdStShape::Shape32x32b;
@@ -855,7 +865,7 @@ inline std::ostream &operator<<(std::ostream &os, const TcuType& type) {
   case TcuType::MBAR_WAIT:          os << "MBAR_WAIT"; break;
   case TcuType::MBAR_TEST_TRY_WAIT: os << "MBAR_TEST_TRY_WAIT"; break;
   // custom-3
-  case TcuType::TCU_MMA:            os << "TCU_MMA"; break;
+  case TcuType::TCU_WMMA:            os << "TCU_WMMA"; break;
   case TcuType::TCU_LD:             os << "TCU_LD"; break;
   case TcuType::TCU_ST:             os << "TCU_ST"; break;
   case TcuType::TCU_WAIT_LD:        os << "TCU_WAIT_LD"; break;
@@ -1152,6 +1162,7 @@ struct LsuRsp {
   uint32_t cid;
   uint64_t uuid;
 
+  LsuRsp() : mask(0), tag(0), cid(0), uuid(0) {}
  LsuRsp(uint32_t size)
     : mask(size)
     , tag (0)

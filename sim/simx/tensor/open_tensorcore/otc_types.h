@@ -42,7 +42,7 @@ struct DecodedMmaJob {
   uint8_t  ws                = 0;  // qualifier[1]
   uint8_t  sp                = 0;  // qualifier[2]
   uint8_t  cta_group         = 0;  // qualifier[3]
-  uint8_t  collector_a_state = 0;  // qualifier[5:4] — fill/use/lastuse/discard
+  uint8_t  collector_buffer = 0;   // qualifier[5:4] — fill/use/lastuse/discard
   uint8_t  multicast         = 0;  // qualifier[6]
 
   // Fields loaded from operand_block_t in LMEM.
