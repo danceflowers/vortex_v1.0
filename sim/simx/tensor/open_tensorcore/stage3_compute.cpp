@@ -173,39 +173,81 @@ void ComputePipeline::tick() {
 // ---------------------------------------------------------------------------
 
 void ComputePipeline::fill_abc(ActiveJob& job) {
-  amem_.clear();
-  bmem_[0].clear();
-  bmem_[1].clear();
+  const auto& tile = *job.tile;
+
+  uint8_t  cb  = tile.collector_buffer;
+  int8_t   bbi = tile.bbuf_idx;
+  bool use_abuf = (bbi < 0) && (cb != 0x3);   // ws=0, not DISCARD
+  bool use_bbuf = (bbi >= 0) && (cb != 0x3);   // ws=1, not DISCARD
+
+  // Clear shared resources.
   cmem_.clear();
   dmem_->clear();
   tensorcore_.reset();
 
-  const auto& tile = *job.tile;
-
-  // Fill AMem: 4 lines, each 8×8 FP9 block.
-  for (uint32_t line = 0; line < AMem::kDepth; ++line) {
-    uint32_t k_phase = line / 2;
-    uint32_t m_block = line % 2;
-    uint16_t data[8][8];
-    for (uint32_t i = 0; i < 8; ++i) {
-      for (uint32_t k = 0; k < 8; ++k) {
-        data[i][k] = tile.a_fp9[m_block * 8 + i][k_phase * 8 + k];
-      }
+  // A operand section.
+  if (use_abuf && cb == 0x0) {
+    // FILL abuf: write A data to abuf, mark fill.
+    abuf_.clear();
+    for (uint32_t line = 0; line < AMem::kDepth; ++line) {
+      uint32_t k_phase = line / 2, m_block = line % 2;
+      uint16_t data[8][8];
+      for (uint32_t i = 0; i < 8; ++i)
+        for (uint32_t k = 0; k < 8; ++k)
+          data[i][k] = tile.a_fp9[m_block * 8 + i][k_phase * 8 + k];
+      abuf_.write_line(line, data);
     }
-    amem_.write_converted_line(line, data);
+    abuf_.fill(job.tile->wid);
+    // Also fill mbuf if sparse.
+    if (tile.has_sparse_meta) {
+      mbuf_.clear();
+      mbuf_.write(tile.sparse_meta);
+      mbuf_.fill(job.tile->wid);
+    }
+  } else if (use_abuf && (cb == 0x1 || cb == 0x2)) {
+    // USE/LASTUSE: A already in abuf, mark compute started.
+    abuf_.mark_compute_started();
+    if (mbuf_.valid()) mbuf_.mark_compute_started();
+  } else {
+    // DISCARD or bbuf mode: normal AMem fill.
+    amem_.clear();
+    for (uint32_t line = 0; line < AMem::kDepth; ++line) {
+      uint32_t k_phase = line / 2, m_block = line % 2;
+      uint16_t data[8][8];
+      for (uint32_t i = 0; i < 8; ++i)
+        for (uint32_t k = 0; k < 8; ++k)
+          data[i][k] = tile.a_fp9[m_block * 8 + i][k_phase * 8 + k];
+      amem_.write_converted_line(line, data);
+    }
   }
 
-  // Fill BMem[0]: 4 lines, each 8×8 FP9 block.
-  for (uint32_t line = 0; line < BMem::kDepth; ++line) {
-    uint32_t k_phase = line / 2;
-    uint32_t n_block = line % 2;
-    uint16_t data[8][8];
-    for (uint32_t k = 0; k < 8; ++k) {
-      for (uint32_t j = 0; j < 8; ++j) {
-        data[k][j] = tile.b_fp9[k_phase * 8 + k][n_block * 8 + j];
-      }
+  // B operand section.
+  if (use_bbuf && cb == 0x0) {
+    // FILL bbuf: write B data to bbuf[bbi], mark fill.
+    bbuf_[bbi].clear();
+    for (uint32_t line = 0; line < BMem::kDepth; ++line) {
+      uint32_t k_phase = line / 2, n_block = line % 2;
+      uint16_t data[8][8];
+      for (uint32_t k = 0; k < 8; ++k)
+        for (uint32_t j = 0; j < 8; ++j)
+          data[k][j] = tile.b_fp9[k_phase * 8 + k][n_block * 8 + j];
+      bbuf_[bbi].write_line(line, data);
     }
-    bmem_[0].write_converted_line(line, data);
+    bbuf_[bbi].fill(job.tile->wid);
+  } else if (use_bbuf && (cb == 0x1 || cb == 0x2)) {
+    // USE/LASTUSE: B already in bbuf, mark compute started.
+    bbuf_[bbi].mark_compute_started();
+  } else {
+    // DISCARD or abuf mode: normal BMem fill.
+    bmem_[0].clear();
+    for (uint32_t line = 0; line < BMem::kDepth; ++line) {
+      uint32_t k_phase = line / 2, n_block = line % 2;
+      uint16_t data[8][8];
+      for (uint32_t k = 0; k < 8; ++k)
+        for (uint32_t j = 0; j < 8; ++j)
+          data[k][j] = tile.b_fp9[k_phase * 8 + k][n_block * 8 + j];
+      bmem_[0].write_converted_line(line, data);
+    }
   }
 
   // Fill CMem: 4 subtiles, each 8×8 FP22 block.
@@ -223,7 +265,7 @@ void ComputePipeline::fill_abc(ActiveJob& job) {
     }
   }
 
-  // Stage sparse metadata for the compute phase.
+  // Always stage sparse metadata for the compute path.
   staged_has_sparse_meta_ = tile.has_sparse_meta;
   if (tile.has_sparse_meta) {
     staged_sparse_meta_ = tile.sparse_meta;
@@ -256,10 +298,21 @@ void ComputePipeline::advance_compute(ActiveJob& job) {
     uint16_t b[kPrimitiveDim][kPrimitiveDim] = {};
     uint32_t c[kPrimitiveDim][kPrimitiveDim] = {};
 
-    // AMem line index = mk*2 + sm: K-phase selects upper/lower half of AMem.
-    // BMem line index = mk*2 + sn: K-phase selects left/right half of BMem.
-    amem_.read_primitive(mk * 2 + sm, a, false);
-    bmem_[job.active_bmem].read_primitive(mk * 2 + sn, b, false);
+    // Read A: from abuf if valid and in abuf mode, else AMem.
+    uint8_t  cb  = tile.collector_buffer;
+    int8_t   bbi = tile.bbuf_idx;
+    if (abuf_.valid() && bbi < 0 && cb != 0x3) {
+      abuf_.read_primitive(mk * 2 + sm, a);
+    } else {
+      amem_.read_primitive(mk * 2 + sm, a, false);
+    }
+
+    // Read B: from bbuf if valid and in bbuf mode, else BMem.
+    if (bbi >= 0 && cb != 0x3 && bbuf_[bbi].valid()) {
+      bbuf_[bbi].read_primitive(mk * 2 + sn, b);
+    } else {
+      bmem_[job.active_bmem].read_primitive(mk * 2 + sn, b, false);
+    }
 
     // C bypass only in the first accum phase (non-resident accumulator mode).
     if (accum == 0 && tile.has_c) {
@@ -475,6 +528,26 @@ bool ComputePipeline::advance_store(ActiveJob& job) {
 // ---------------------------------------------------------------------------
 
 void ComputePipeline::finish_job(ActiveJob& job) {
+  // Collector buffer cleanup.
+  const auto& tile = *job.tile;
+  if (tile.collector_buffer == 0x2 || tile.collector_buffer == 0x3) {
+    // LASTUSE or DISCARD: invalidate after compute completes.
+    if (tile.bbuf_idx < 0) {
+      abuf_.invalidate();
+      mbuf_.invalidate();
+    } else {
+      bbuf_[tile.bbuf_idx].invalidate();
+    }
+  } else {
+    // FILL or USE: mark compute done (no longer inflight).
+    if (tile.bbuf_idx < 0) {
+      abuf_.mark_compute_done();
+      mbuf_.mark_compute_done();
+    } else {
+      bbuf_[tile.bbuf_idx].mark_compute_done();
+    }
+  }
+
   CompletedMmaJob done;
   done.uuid    = job.tile->uuid;
   done.success = true;
