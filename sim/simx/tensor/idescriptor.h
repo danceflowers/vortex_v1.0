@@ -18,7 +18,7 @@
 //                                    mbarrier object format
 //
 // Placement:
-//   - idesc itself is a 32-bit register operand (TCU_MMA rs1)
+//   - idesc itself is a 32-bit register operand (TCU_WMMA rs1)
 //   - operand_block_t and mbarrier_state_t live in Vortex LocalMem (shared mem)
 //   - tensor_map_t lives in DRAM constant area, host runtime prepares it
 //
@@ -36,20 +36,56 @@ namespace vortex {
 // PTX 8.7 §9.7.16.5.4 "Instruction descriptor for tcgen05.mma"
 // ============================================================================
 
+// struct i_descriptor_t {
+//   uint32_t sparsity_meta_sel : 2;  // [1:0]   sparse_meta_taddr offset (.sp variant)
+//   uint32_t sparsity_kind     : 1;  // [2]     sparsity{2:4 / 1:4} encoding
+//   //uint32_t reserved_3        : 1;  // [3]     reserved
+//   //uint32_t kind              : 4;  // [7:4]   precision family
+//   uint32_t ctype : 1; //[4:3]
+//   uint32_t dtype : 1; //[6:5]
+//   uint32_t atype : 1; //[8:7]
+//   uint32_t btype : 1; //[10:9]
+//   uint32_t shape_m           : 8;  // [15:8]  M dimension code
+//   uint32_t shape_n           : 8;  // [23:16] N dimension code
+//  // uint32_t a_storage_layout  : 2;  // [25:24] A storage layout
+//  // uint32_t b_storage_layout  : 2;  // [27:26] B storage layout
+//   uint32_t output_negate     : 1;  // [28]    negate D
+//   uint32_t saturate          : 1;  // [29]    saturate (integer kinds)
+//   uint32_t transpose_a       : 1;  // [30]    A transpose
+//   uint32_t transpose_b       : 1;  // [31]    B transpose
+// } __attribute__((packed));
+// static_assert(sizeof(i_descriptor_t) == 4, "i_descriptor_t must be 32 bits");
+
 struct i_descriptor_t {
-  uint32_t sparsity_meta_sel : 2;  // [1:0]   sparse_meta_taddr offset (.sp variant)
-  uint32_t sparsity_kind     : 1;  // [2]     sparsity{2:4 / 1:4} encoding
-  uint32_t reserved_3        : 1;  // [3]     reserved
-  uint32_t kind              : 4;  // [7:4]   precision family
-  uint32_t shape_m           : 8;  // [15:8]  M dimension code
-  uint32_t shape_n           : 8;  // [23:16] N dimension code
-  uint32_t a_storage_layout  : 2;  // [25:24] A storage layout
-  uint32_t b_storage_layout  : 2;  // [27:26] B storage layout
-  uint32_t output_negate     : 1;  // [28]    negate D
-  uint32_t saturate          : 1;  // [29]    saturate (integer kinds)
-  uint32_t transpose_a       : 1;  // [30]    A transpose
-  uint32_t transpose_b       : 1;  // [31]    B transpose
+  uint32_t sparsity_meta_sel : 2;  // [1:0]   保留但当前未显式使用；稀疏 metadata 在 shared memory 中的存储/选择信息
+  uint32_t sparsity_kind     : 1;  // [2]     稀疏模式：表示 1:4 / 2:4 稀疏模式，具体 0/1 含义由 decoder 约定
+  uint32_t saturate          : 1;  // [3]     保留但当前未显式使用；整数运算结果是否饱和
+  uint32_t ctype             : 2;  // [5:4]   C 矩阵精度：
+                                   //         00 = FP8
+                                   //         01 = FP16
+                                   //         10 = FP32
+  uint32_t dtype             : 2;  // [7:6]   D 矩阵精度：
+                                   //         00 = FP8
+                                   //         01 = FP16
+                                   //         10 = FP32
+  uint32_t atype             : 2;  // [9:8]   A 矩阵精度：
+                                   //         00 = FP8
+                                   //         01 = FP16
+  uint32_t btype             : 2;  // [11:10] B 矩阵精度：
+                                   //         00 = FP8
+                                   //         01 = FP16
+  uint32_t negate_a          : 1;  // [12]    保留但当前未显式使用；A 矩阵是否取负
+  uint32_t negate_b          : 1;  // [13]    保留但当前未显式使用；B 矩阵是否取负
+  uint32_t transpose_a       : 1;  // [14]    A 矩阵是否转置
+  uint32_t transpose_b       : 1;  // [15]    B 矩阵是否转置
+  uint32_t shape_m           : 4;  // [19:16] A 矩阵的 M 维度编码；
+                                   //         低 4 bit 隐含为 0，即 M = shape_m << 4
+  uint32_t shape_n           : 4;  // [23:20] B 矩阵的 N 维度编码；
+                                   //         低 4 bit 隐含为 0，即 N = shape_n << 4
+  uint32_t b_shift           : 8;  // [31:24] 保留但当前未显式使用；
+                                   //         WS 模式下 B 矩阵在 collector buffer 中允许的最大移位量
 } __attribute__((packed));
+
 static_assert(sizeof(i_descriptor_t) == 4, "i_descriptor_t must be 32 bits");
 
 // kind selector (matches PTX §9.7.16.5.4 .kind encoding)
@@ -68,7 +104,7 @@ enum class i_descriptor_kind_t : uint8_t {
 
 // ============================================================================
 // operand_block_t -- 32 B in shared memory
-// Vortex-private; pointed by TCU_MMA rs2.
+// Vortex-private; pointed by TCU_WMMA rs2.
 //
 // PTX tcgen05.mma takes more operands than one RV R-type instruction can carry.
 // The custom instruction keeps idesc in rs1 and points rs2 at this block.
@@ -82,7 +118,7 @@ enum class i_descriptor_kind_t : uint8_t {
 //     (PTX §9.7.16.5.4). For Vortex Phase-2 we model A from TMEM only;
 //     a_taddr is the single A operand. Shared-sourced A (.kind=f8f6f4 et al.)
 //     is left out for now and reintroduced when those kinds land.
-//   - Current compact TCU_MMA funct7 carries enable_input_d, ws, sp,
+//   - Current compact TCU_WMMA funct7 carries enable_input_d, ws, sp,
 //     cta_group, collector_a_state and multicast. scale-input-d is intentionally
 //     not encoded yet.
 //   - lanes_off (cta_group::2 lane offset) lives here because it varies
@@ -98,14 +134,14 @@ struct operand_block_t {
   uint32_t b_sdesc_lo;         // low 32 b of 64-bit b_sdesc (PTX §9.7.16.2)
   uint32_t b_sdesc_hi;         // high 32 b of 64-bit b_sdesc
   uint16_t lanes_off;          // cta_group::2 cross-CTA lane offset
-  uint16_t reserved0;
+  uint16_t reserved0;       // [1:0]=bbuf_idx for ws=1 TCU_WMMA, [15:2]=reserved
   uint32_t fmt_cd;             // [1:0]=fmt_c, [3:2]=fmt_d; 0=fp32, 1=fp16, 2=fp8
   uint32_t reserved1[2];       // tail-pad to 32 B; available for future fields
 } __attribute__((packed));
 static_assert(sizeof(operand_block_t) == 32, "operand_block_t must be 32 bytes");
 
 // collector buffer state encoding (PTX §9.7.16.5.5).
-// Encoded in TCU_MMA qualifier[5:4]; only meaningful when collector variants
+// Encoded in TCU_WMMA qualifier[5:4]; only meaningful when collector variants
 // are enabled by the frontend.
 enum class CollectorState : uint8_t {
   Fill     = 0,  // .collector::a::fill

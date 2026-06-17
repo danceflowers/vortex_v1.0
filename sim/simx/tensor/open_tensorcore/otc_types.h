@@ -50,6 +50,7 @@ struct DecodedMmaJob {
   uint32_t d_taddr   = 0;  // D output (and optional C input) TMEM address
   uint64_t b_sdesc   = 0;  // 64-bit B shared-memory descriptor (PTX §9.7.16.2)
   uint16_t lanes_off = 0;  // cta_group::2 cross-CTA lane offset
+  int8_t   bbuf_idx = -1;  // ws=1: which BBuf[0-3]; -1 = not using BBuf
 };
 
 // ============================================================================
@@ -101,6 +102,8 @@ struct ConvertedTile {
   uint8_t eop = 1;
   uint8_t b_chunk_idx = 0;
   uint8_t total_b_chunks = 1;
+  uint8_t collector_buffer = 0;  // qualifier[5:4] passed through to Stage3
+  int8_t  bbuf_idx         = -1; // ws=1: which BBuf; -1 = not using BBuf
 };
 
 // ============================================================================
