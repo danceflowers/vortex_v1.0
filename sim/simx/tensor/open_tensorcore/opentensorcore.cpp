@@ -70,7 +70,7 @@ feed_mma_traces();
   stage2a_->tick();
   stage1_->tick();
 
-  if (!stage3_->Output.empty()) {
+  while (!stage3_->Output.empty()) {
     auto done = stage3_->Output.front(); stage3_->Output.pop();
     auto it = pending_traces_.find(done.uuid);
     if (it == pending_traces_.end()) {
