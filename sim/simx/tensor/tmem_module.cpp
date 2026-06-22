@@ -35,13 +35,15 @@ Tmem::Tmem(const SimContext& ctx, const char* name, const TmemConfig& config)
     for (auto& row : bank) row.fill(0);
   }
 
+  // ReqPorts are sinks the TMEM reads from (real depth). RspPorts are bind
+  // sources (→ arbiters) and MUST be capacity-0 virtual links (simobject.h:91).
   for (uint32_t i = 0; i < config.num_read_ports; ++i) {
     ReadReqPorts.emplace_back(this, 2);
-    ReadRspPorts.emplace_back(this, 2);
+    ReadRspPorts.emplace_back(this, 0);
   }
   for (uint32_t i = 0; i < config.num_write_ports; ++i) {
     WriteReqPorts.emplace_back(this, 2);
-    WriteRspPorts.emplace_back(this, 2);
+    WriteRspPorts.emplace_back(this, 0);
   }
 
   // TxRxCrossBar: reads and writes share the same bank routing function.
@@ -72,7 +74,7 @@ void Tmem::reset() {
 }
 
 void Tmem::tick() {
-  DT(4, "Tmem: tick cycle=" << this->current_cycle());
+  DT(4, "Tmem: tick cycle=" << SimPlatform::instance().cycles());
 
   // ---- Instruction traces ----
   for (uint32_t iw = 0; iw < ISSUE_WIDTH; ++iw) {
@@ -126,6 +128,7 @@ void Tmem::tick() {
       do_read_packet(banks_, req, &pkt);
       TensorMemPortRsp rsp;
       rsp.request_id = req.request_id; rsp.access_type = req.access_type;
+      rsp.tag = req.tag;  // crossbar routes the response back by tag (source port)
       rsp.read_packet = pkt;
       read_xbar_->RspOut[b].push(rsp, 1);
     }
@@ -135,12 +138,13 @@ void Tmem::tick() {
       do_write_packet(banks_, req);
       TensorMemPortRsp rsp;
       rsp.request_id = req.request_id; rsp.access_type = req.access_type;
+      rsp.tag = req.tag;  // crossbar routes the response back by tag (source port)
       write_xbar_->RspOut[b].push(rsp, 1);
     }
   }
 
   // ---- Feed new requests + drain responses on the port side ----
-  DT(4, "Tmem: tick cycle=" << this->current_cycle()
+  DT(4, "Tmem: tick cycle=" << SimPlatform::instance().cycles()
      << " read_rsp=" << read_xbar_->RspIn[0].size());
   for (uint32_t p = 0; p < config_.num_read_ports; ++p) {
     if (!ReadReqPorts[p].empty() && !read_xbar_->ReqIn[p].full()) {
@@ -155,9 +159,12 @@ void Tmem::tick() {
   for (uint32_t p = 0; p < config_.num_write_ports; ++p) {
     if (!WriteReqPorts[p].empty() && !write_xbar_->ReqIn[p].full()) {
       auto req = WriteReqPorts[p].front(); WriteReqPorts[p].pop();
+      DT(2, "Tmem: WriteReqPort[" << p << "] req_id=" << req.request_id
+         << " taddr=0x" << std::hex << req.taddr << std::dec << " pkt=" << req.packet_idx);
       write_xbar_->ReqIn[p].push(req, 0);
     }
     if (!write_xbar_->RspIn[p].empty() && !WriteRspPorts[p].full()) {
+      DT(2, "Tmem: WriteRspPort[" << p << "] req_id=" << write_xbar_->RspIn[p].front().request_id);
       WriteRspPorts[p].push(write_xbar_->RspIn[p].front(), 0);
       write_xbar_->RspIn[p].pop();
     }

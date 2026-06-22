@@ -13,15 +13,18 @@ Tma::Tma(const SimContext& ctx, const char* name, Core* core,
   : SimObject<Tma>(ctx, name)
   , Inputs(ISSUE_WIDTH, this)
   , Outputs(ISSUE_WIDTH, this)
-  , CacheReq(this, 2)
+  // Req/relay ports are bind sources (→ arbiters / lmem_arb / Core) and MUST be
+  // capacity-0 virtual links (simobject.h:91). Rsp ports are sinks the TMA reads
+  // from, so they keep real depth.
+  , CacheReq(this, 0)
   , CacheRsp(this, 2)
-  , TmemReadReq(this, 2)
+  , TmemReadReq(this, 0)
   , TmemReadRsp(this, 2)
-  , TmemWriteReq(this, 2)
+  , TmemWriteReq(this, 0)
   , TmemWriteRsp(this, 2)
-  , LmemDescReq(this, 2)
+  , LmemDescReq(this, 0)
   , LmemDescRsp(this, 2)
-  , AsyncCompletionOut(this, 2)
+  , AsyncCompletionOut(this, 0)
   , core_(core)
   , config_(config) {
   this->reset();
@@ -41,8 +44,9 @@ void Tma::tick() {
   // Drain responses into maps.
   if (!CacheRsp.empty())     { auto r = CacheRsp.front(); cache_rsps_[r.tag] = r; CacheRsp.pop(); }
   if (!LmemDescRsp.empty())  { auto r = LmemDescRsp.front(); lmem_rsps_[r.tag] = r; LmemDescRsp.pop(); }
-  if (!TmemReadRsp.empty())  { auto r = TmemReadRsp.front(); tmem_rsps_[r.tag] = r; TmemReadRsp.pop(); }
-  if (!TmemWriteRsp.empty()) { auto r = TmemWriteRsp.front(); tmem_rsps_[r.tag] = r; TmemWriteRsp.pop(); }
+  // TMEM responses are matched by request_id (the field the Tmem module echoes).
+  if (!TmemReadRsp.empty())  { auto r = TmemReadRsp.front(); tmem_rsps_[r.request_id] = r; TmemReadRsp.pop(); }
+  if (!TmemWriteRsp.empty()) { auto r = TmemWriteRsp.front(); tmem_rsps_[r.request_id] = r; TmemWriteRsp.pop(); }
 
   // Accept new traces.
   decode_trace();
@@ -69,6 +73,7 @@ void Tma::decode_trace() {
 
     ActiveJob job;
     job.trace = trace; job.lane = iw;
+    job.wid             = trace->wid;
     job.is_load         = (td->funct3 == 0b110);
     job.tensor_map_addr = td->tensor_map_addr;
     job.args_lmem_ptr   = static_cast<uint64_t>(td->args_lmem_ptr);
@@ -119,11 +124,19 @@ void Tma::advance_job(ActiveJob& job) {
         core_->dcache_read(job.tmap_buf + 64, job.tensor_map_addr + 64, 64);
         const auto* tmap = reinterpret_cast<const tensor_map_t*>(job.tmap_buf);
         job.global_addr = tmap->global_address;
+        // CUtensorMapDataType element sizes (the encoding a tensor_map carries).
         switch (tmap->element_type) {
-        case 0:  job.elem_bytes = 2; break;  // CUDA_R_16F
-        case 1:  job.elem_bytes = 4; break;  // CUDA_R_32F
-        case 3:  case 6: job.elem_bytes = 1; break;  // CUDA_R_8I / CUDA_R_8U
-        default: job.elem_bytes = 4; break;
+        case 0:  job.elem_bytes = 1; break;  // UINT8
+        case 1:  job.elem_bytes = 2; break;  // UINT16
+        case 2:  job.elem_bytes = 4; break;  // UINT32
+        case 3:  job.elem_bytes = 4; break;  // INT32
+        case 4:  job.elem_bytes = 8; break;  // UINT64
+        case 5:  job.elem_bytes = 8; break;  // INT64
+        case 6:  job.elem_bytes = 2; break;  // FLOAT16
+        case 7:  job.elem_bytes = 4; break;  // FLOAT32
+        case 8:  job.elem_bytes = 8; break;  // FLOAT64
+        case 9:  job.elem_bytes = 2; break;  // BFLOAT16
+        default: job.elem_bytes = 2; break;
         }
         uint64_t elems = 1;
         uint8_t rank = tmap->rank;
@@ -143,20 +156,23 @@ void Tma::advance_job(ActiveJob& job) {
           uint32_t epp = std::max<uint32_t>(1, 64 / job.elem_bytes);
           uint64_t dram_addr = job.compute_elem_addr(job.next_pkt * epp);
           core_->dcache_read(job.staging_pkt.bytes.data(), dram_addr, 64);
-          // Issue TMEM write before consuming cache response — if port is full,
-          // leave response in map and retry next tick.
+          // Forward the packet to TMEM. If the write port is full, keep the
+          // cache response and retry next tick (stay in XFER_CACHE).
+          if (TmemWriteReq.full()) return;  // pending_req_id/tag unchanged → retry
+          TensorMemPortReq wr;
+          wr.request_id = job.pending_req_id;
+          wr.access_type = TensorMemPortReq::AccessType::Write;
+          wr.taddr = job.taddr;
+          wr.packet_idx = job.next_pkt;
+          wr.write_packet = job.staging_pkt;
+          TmemWriteReq.push(wr, 0);
+          cache_rsps_.erase(it);
+          DT(2, "Tma: LD push TMEM-wr req_id=" << wr.request_id
+             << " taddr=0x" << std::hex << job.taddr << std::dec
+             << " pkt=" << job.next_pkt << "/" << job.total_pkts);
+          // Now wait for the TMEM write ack (same tag); XFER_TMEM advances next_pkt.
           job.pending_tag = ReqTag::XFER_TMEM;
-          if (!TmemWriteReq.full()) {
-            TensorMemPortReq wr;
-            wr.tag = job.pending_req_id;
-            wr.access_type = TensorMemPortReq::AccessType::Write;
-            wr.taddr = job.taddr;
-            wr.packet_idx = job.next_pkt;
-            wr.write_packet = job.staging_pkt;
-            TmemWriteReq.push(wr, 0);
-            cache_rsps_.erase(it); done = true;
-          }
-          // If TmemWriteReq full: cache response stays in map, retry next tick.
+          return;
         } else {
           // ST: write staging data to DRAM via cache.
           uint32_t epp = std::max<uint32_t>(1, 64 / job.elem_bytes);
@@ -174,6 +190,8 @@ void Tma::advance_job(ActiveJob& job) {
           // LD: TMEM write ack — advance to next packet.
           tmem_rsps_.erase(it); done = true;
           ++job.next_pkt;
+          DT(2, "Tma: LD TMEM-wr ACK req_id=" << job.pending_req_id
+             << " next_pkt=" << job.next_pkt << "/" << job.total_pkts);
         } else {
           // ST: TMEM read completed → staging_pkt has data. Issue cache write.
           job.staging_pkt = it->second.read_packet;
@@ -250,12 +268,12 @@ void Tma::advance_job(ActiveJob& job) {
       // ST: issue TMEM read for current packet.
       if (TmemReadReq.full()) break;
       TensorMemPortReq rr;
-      rr.tag = next_req_id_++;
+      rr.request_id = next_req_id_++;
       rr.access_type = TensorMemPortReq::AccessType::Read;
       rr.taddr = job.taddr;
       rr.packet_idx = job.next_pkt;
       TmemReadReq.push(rr, 0);
-      job.pending_req_id = rr.tag; job.pending_tag = ReqTag::XFER_TMEM;
+      job.pending_req_id = rr.request_id; job.pending_tag = ReqTag::XFER_TMEM;
       DT(4, "Tma: ST pkt=" << job.next_pkt << "/" << job.total_pkts);
     }
     break;
@@ -270,10 +288,18 @@ void Tma::advance_job(ActiveJob& job) {
 void Tma::complete_job(ActiveJob& job) {
   TensorAsyncOpCompletion done;
   done.async_id = job.async_id;
+  // PTX §7.6.4 cp.async.bulk.tensor.mbarrier::complete_tx::bytes: a load issued
+  // with the complete_tx flag contributes its transferred byte count to the
+  // bound mbarrier on completion. Core drains this and calls mbarrier_complete_tx.
+  done.tx_bound_mbar = (job.is_load && job.complete_tx) ? job.mbar_addr : 0;
+  done.tx_bytes      = job.tile_bytes;
+  done.payload_size_bytes = job.tile_bytes;
   if (!AsyncCompletionOut.full()) AsyncCompletionOut.push(done, 1);
   Outputs[job.lane].push(job.trace, 0);
   job.stage = TmaStage::IDLE;
-  DT(3, "Tma: complete trace=#" << job.trace->uuid);
+  DT(3, "Tma: complete trace=#" << job.trace->uuid
+     << " tx_mbar=0x" << std::hex << done.tx_bound_mbar << std::dec
+     << " tx_bytes=" << done.tx_bytes);
 }
 
 }  // namespace tensor

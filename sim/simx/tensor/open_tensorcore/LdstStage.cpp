@@ -54,48 +54,37 @@ void LdstStage::tick() {
 }
 
 void LdstStage::execute_ld(Job& job) {
-  // Read 4 subtiles from DMem into fp22_buf.
-  for (uint32_t s = 0; s < 4; ++s)
-    dmem_->read_subtile_fp22(s, job.fp22_buf[s]);
-
-  // Convert FP22 → output format, write out_buf[row-major].
-  for (uint32_t s = 0; s < 4; ++s) {
-    uint32_t sm = s / 2, sn = s % 2;
-    for (uint32_t i = 0; i < 8; ++i) {
-      for (uint32_t j = 0; j < 8; ++j) {
-        uint32_t idx = (sm * 8 + i) * 16 + (sn * 8 + j);
-        switch (job.desc.fmt) {
-        case tensor::fp32::id: job.out_buf[idx] = fp22_to_fp32(job.fp22_buf[s][i][j]); break;
-        case tensor::fp16::id: job.out_buf[idx] = fp22_to_fp16(job.fp22_buf[s][i][j]); break;
-        case tensor::fp8::id:  job.out_buf[idx] = fp22_to_fp8_e4m3(job.fp22_buf[s][i][j]); break;
-        default: break;
-        }
-      }
-    }
+  // Scalar tcgen05.ld: thread t reads the 32-bit TMEM cell at
+  // (lane = taddr.lane + t, col_byte). TMEM is the raw architectural backing
+  // store — no precision conversion (the MMA store path already converted D to
+  // the external fmt before writing TMEM).
+  auto trace = job.desc.trace;
+  uint32_t nthreads = trace ? trace->arch.num_threads() : 0;
+  for (uint32_t t = 0; t < nthreads; ++t) {
+    if (trace && !trace->tmask.test(t)) continue;
+    uint32_t taddr_t = job.desc.taddr + t;   // lane += t (lane is taddr[15:0])
+    uint32_t val = 0;
+    core_->tmem_taddr_read_bytes(taddr_t, 0,
+                                 reinterpret_cast<uint8_t*>(&val), 4);
+    job.out_buf[t] = val;
   }
-
-  DT(3, "DMemAccess: LD done, " << job.desc.rd << ".." << (job.desc.rd + 7));
+  DT(3, "DMemAccess: LD done, rd=" << job.desc.rd
+     << " taddr=0x" << std::hex << job.desc.taddr << std::dec);
 }
 
 void LdstStage::execute_st(Job& job) {
-  // Convert st_values → FP22, write to DMem subtiles.
-  for (uint32_t s = 0; s < 4; ++s) {
-    uint32_t sm = s / 2, sn = s % 2;
-    for (uint32_t i = 0; i < 8; ++i) {
-      for (uint32_t j = 0; j < 8; ++j) {
-        uint32_t idx = (sm * 8 + i) * 16 + (sn * 8 + j);
-        switch (job.desc.fmt) {
-        case tensor::fp32::id: job.fp22_buf[s][i][j] = fp32_to_fp22(job.desc.st_values[idx]); break;
-        case tensor::fp16::id: job.fp22_buf[s][i][j] = fp16_to_fp22(job.desc.st_values[idx]); break;
-        case tensor::fp8::id:  job.fp22_buf[s][i][j] = fp9_to_fp22(job.desc.st_values[idx] & 0xFF); break;
-        default: break;
-        }
-      }
-    }
-    dmem_->write_subtile_fp22(s, job.fp22_buf[s]);
+  // Scalar tcgen05.st: thread t writes its 32-bit value to the TMEM cell at
+  // (lane = taddr.lane + t, col_byte).
+  auto trace = job.desc.trace;
+  uint32_t nthreads = trace ? trace->arch.num_threads() : 0;
+  for (uint32_t t = 0; t < nthreads; ++t) {
+    if (trace && !trace->tmask.test(t)) continue;
+    uint32_t taddr_t = job.desc.taddr + t;   // lane += t
+    uint32_t val = job.desc.st_values[t];
+    core_->tmem_taddr_write_bytes(taddr_t, 0,
+                                  reinterpret_cast<const uint8_t*>(&val), 4);
   }
-
-  DT(3, "DMemAccess: ST done");
+  DT(3, "DMemAccess: ST done taddr=0x" << std::hex << job.desc.taddr << std::dec);
 }
 
 void LdstStage::complete(Job& job) {
@@ -104,12 +93,11 @@ void LdstStage::complete(Job& job) {
     ThreadMask tmask(trace->arch.num_threads());
     for (uint32_t t = 0; t < trace->arch.num_threads(); ++t)
       if (trace->tmask.test(t)) tmask.set(t);
-    for (uint32_t r = 0; r < 8; ++r) {
-      std::vector<Word> vals(trace->arch.num_threads());
-      for (uint32_t t = 0; t < trace->arch.num_threads(); ++t)
-        vals[t] = job.out_buf[t * 8 + r];
-      core_->write_ireg(trace->wid, job.desc.rd + r, tmask, vals);
-    }
+    // One destination register per thread (scalar load).
+    std::vector<Word> vals(trace->arch.num_threads());
+    for (uint32_t t = 0; t < trace->arch.num_threads(); ++t)
+      vals[t] = job.out_buf[t];
+    core_->write_ireg(trace->wid, job.desc.rd, tmask, vals);
   }
   DT(3, "DMemAccess: complete trace=#" << job.desc.trace->uuid);
   Output.push(job.desc.trace, 0);

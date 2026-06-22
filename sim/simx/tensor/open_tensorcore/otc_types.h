@@ -125,17 +125,21 @@ struct LdStConfig {
   uint32_t latency     = 4;  // total latency cycles (counter-based)
 };
 
-// LdStJob — passed from Stage1 (TcDecode) to Stage2b (DMemAccessStage).
-// TCU_LD: DMem → convert → registers (is_load=true)
-// TCU_ST: registers → convert → DMem (is_load=false)
+// LdStJob — passed from Stage1 (TcDecode) to Stage2b (LdstStage).
+// Scalar tcgen05.{ld,st}: thread t accesses TMEM cell (lane = taddr.lane + t,
+// col_byte = taddr.col_byte), one 32-bit value per thread (raw bytes, no
+// precision conversion — TMEM is the architectural backing store).
+//   TCU_LD: TMEM[cell] → register rd       (is_load=true)
+//   TCU_ST: st_values[t] → TMEM[cell]       (is_load=false)
 struct instr_trace_t;
 
 struct LdStJob {
   bool     is_load = true;
-  uint32_t fmt     = 0;                          // precision format
-  uint32_t rd      = 0;                          // dest reg base (LD only)
+  uint32_t fmt     = 0;                          // precision format (informational)
+  uint32_t rd      = 0;                          // dest reg (LD only)
+  uint32_t taddr   = 0;                          // warp-uniform base TADDR
   instr_trace_t* trace = nullptr;               // original pipeline trace
-  std::array<uint32_t, 256> st_values = {};      // source values (ST only)
+  std::array<uint32_t, 256> st_values = {};      // per-thread source values (ST only)
 };
 
 }  // namespace vortex

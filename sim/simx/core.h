@@ -243,8 +243,11 @@ public:
   uint32_t cpabulk_tensor_load(uint32_t, uint64_t, uint64_t, bool) { return 0; }
   uint32_t cpabulk_tensor_store(uint32_t, uint64_t, uint64_t) { return 0; }
   bool tmem_cp(uint32_t, uint32_t, uint64_t, uint32_t, uint32_t) { return false; }
-  bool tmem_taddr_read_bytes(uint32_t, uint32_t, uint8_t*, uint32_t) { return false; }
-  bool tmem_taddr_write_bytes(uint32_t, uint32_t, const uint8_t*, uint32_t) { return false; }
+  // Functional raw-byte access into the shared TMEM (tensor::Tmem) owned by the
+  // TensorSocket. Used by OpenTensorCore's scalar tcgen05.ld/st path. taddr is
+  // PTX-encoded (lane[15:0], col_byte[31:16]); byte_offset is added on top.
+  bool tmem_taddr_read_bytes(uint32_t taddr, uint32_t byte_offset, uint8_t* dst, uint32_t bytes);
+  bool tmem_taddr_write_bytes(uint32_t taddr, uint32_t byte_offset, const uint8_t* src, uint32_t bytes);
   bool tmem_find_allocation_by_lane(uint32_t, uint32_t*) const { return false; }
 
   // tcgen05.fence::{before,after}_thread_sync
@@ -256,60 +259,30 @@ public:
                        uint64_t mbar_addr,
                        uint32_t cta_mask = 0);
 
+  // Register a tcgen05.mma op at issue time (execute stage). Returns a fresh
+  // async_id stored in the trace and echoed back by OpenTensorCore on completion;
+  // mbar_commit binds it and the completion drives mbarrier_arrive (per-id match).
+  uint32_t alloc_mma_async_op(uint32_t wid);
+
   // tcgen05.wait::ld / tcgen05.wait::st -- block warp until prior tcgen05
   // load / store ops issued from this warp are complete.
-  void issue_tcgen05_ld_async(uint32_t wid,
-                              uint64_t trace_id,
-                              const RegOpd& dst,
-                              const ThreadMask& tmask,
-                              const std::vector<uint32_t>& taddrs);
-  void issue_tcgen05_st_async(uint32_t wid,
-                              uint64_t trace_id,
-                              const ThreadMask& tmask,
-                              const std::vector<uint32_t>& taddrs,
-                              const std::vector<uint32_t>& values);
   bool tcgen05_ld_trace_ready(uint64_t trace_id) const;
   bool tcgen05_wait_ld(uint32_t wid);
   bool tcgen05_wait_st(uint32_t wid);
-  uint32_t mma_load_async_issue(uint32_t wid, uint32_t taddr, uint32_t idesc);
-  uint32_t mma_store_async_issue(uint32_t wid, uint32_t taddr, uint32_t idesc);
-  uint32_t wmma_async_issue(uint32_t wid);
-  void async_tensor_complete(uint32_t async_id);
-  bool tmem_taddr_ready_for_mma_load(uint32_t taddr, TcuTarget target, uint32_t sparse_mode) const;
-  bool tmem_taddr_ready_for_mma_store(uint32_t taddr) const;
-  TmemTaddrBlockReason tmem_taddr_load_block_reason(uint32_t taddr, TcuTarget target, uint32_t sparse_mode) const;
-  TmemTaddrBlockReason tmem_taddr_store_block_reason(uint32_t taddr) const;
   // ===== mbarrier API (LMEM-backed; full PTX §7.6 semantics) =====
   // mbar_addr is the absolute LMEM address holding the 8 B mbarrier_state_t.
-  bool mbarrier_init(uint64_t, uint32_t) { return false; } bool _unused_mbarrier_init(uint64_t mbar_addr, uint32_t count);
-  void mbarrier_invalidate(uint64_t) {} void _unused_mbarrier_invalidate(uint64_t mbar_addr);
-  // Returns the phase token observed at arrival (caller may use it to wait
-  // on the *previous* phase, per PTX semantics).
-  uint32_t mbarrier_arrive(uint64_t, uint32_t = 1) { return 0; } uint32_t _unused_mbarrier_arrive(uint64_t mbar_addr, uint32_t decrement_count = 1);
-  void mbarrier_arrive_drop(uint64_t) {} void _unused_mbarrier_arrive_drop(uint64_t mbar_addr);
-  // expect_tx and complete_tx feed the byte-counter (PTX §7.6.4).
-  void mbarrier_expect_tx(uint64_t, uint32_t) {} void _unused_mbarrier_expect_tx(uint64_t mbar_addr, uint32_t tx_bytes);
-  void mbarrier_complete_tx(uint64_t, uint32_t) {} void _unused_mbarrier_complete_tx(uint64_t mbar_addr, uint32_t tx_bytes);
-  // Blocking wait: returns false if not yet ready (warp must stall and retry);
-  // returns true if phase has advanced past `phase_token`.
-  bool mbarrier_wait(uint32_t, uint64_t, uint32_t) { return false; } bool _unused_mbarrier_wait(uint32_t wid, uint64_t mbar_addr, uint32_t phase_token);
-  // Non-blocking poll: returns true if ready, false otherwise.
-  bool mbarrier_test_wait(uint64_t, uint32_t) { return false; } bool _unused_mbarrier_test_wait(uint64_t mbar_addr, uint32_t phase_token);
-  // Bounded wait: behaves like mbarrier_wait but with a CModel-side timeout
-  // expressed in cycles = (1 << timeout_bucket). Returns true on success,
-  // false on timeout (caller must check return value).
-  bool mbarrier_try_wait(uint32_t, uint64_t, uint32_t, uint32_t) { return false; } bool _unused_mbarrier_try_wait(uint32_t wid, uint64_t mbar_addr,
-                         uint32_t phase_token, uint32_t timeout_bucket);
-  uint64_t enqueue_tmem_request(const PortRequestDesc& desc);
-  bool tmem_request_granted(uint64_t tag) const;
-  void consume_tmem_request_grant(uint64_t tag);
-  bool tmem_query(uint32_t taddr, uint32_t* col_span, uint32_t* size_bytes) const;
-  bool tmem_lookup_allocation(uint32_t taddr, const TmemAllocation** allocation) const;
-  bool tmem_transfer_region(uint32_t taddr, uint32_t* col_base, uint32_t* col_span) const;
-  void tmem_set_payload_ready(uint32_t taddr, bool ready);
-  void tmem_set_meta_ready(uint32_t taddr, bool ready);
-  void tmem_set_meta_region(uint32_t taddr, uint32_t meta_col_base, uint32_t meta_col_span);
-  bool tmem_set_row_bytes(uint32_t taddr, uint32_t row_bytes);
+  // These keep their real Core implementations (control-plane: execute() needs
+  // synchronous warp suspend/retire decisions; cannot defer to async units).
+  bool     mbarrier_init(uint64_t mbar_addr, uint32_t count);
+  void     mbarrier_invalidate(uint64_t mbar_addr);
+  uint32_t mbarrier_arrive(uint64_t mbar_addr, uint32_t decrement_count = 1);
+  void     mbarrier_arrive_drop(uint64_t mbar_addr);
+  void     mbarrier_expect_tx(uint64_t mbar_addr, uint32_t tx_bytes);
+  void     mbarrier_complete_tx(uint64_t mbar_addr, uint32_t tx_bytes);
+  bool     mbarrier_wait(uint32_t wid, uint64_t mbar_addr, uint32_t phase_token);
+  bool     mbarrier_test_wait(uint64_t mbar_addr, uint32_t phase_token);
+  bool     mbarrier_try_wait(uint32_t wid, uint64_t mbar_addr,
+                             uint32_t phase_token, uint32_t timeout_bucket);
 //#endif
 
 #ifdef EXT_V_ENABLE
@@ -365,7 +338,11 @@ private:
   OpenTensorCore::Ptr open_tensor_core_;   // set by bind_tensor_ports()
   TensorSocket* tensor_socket_ = nullptr;
   uint32_t tensor_core_idx_ = 0;
+  // Async tensor completion notices from the new tensor modules:
+  //   tensor_async_op_completion_in_ ← TMA.AsyncCompletionOut (complete_tx bytes)
+  //   mma_completion_in_             ← OTC.AsyncCompletionOut (MMA arrive, per id)
   SimPort<TensorAsyncOpCompletion> tensor_async_op_completion_in_;
+  SimPort<TensorAsyncOpCompletion> mma_completion_in_;
 //#endif
 
 #ifdef EXT_V_ENABLE
@@ -506,14 +483,8 @@ private:
   uint64_t last_tensor_completion_drain_cycle_;
   uint64_t last_tcgen05_ldst_advance_cycle_;
 
-  void advance_async_tensor_engine();
-  uint32_t launch_lmem_to_tmem_copy(uint32_t wid,
-                                    uint32_t col_base,
-                                    uint32_t col_span,
-                                    uint64_t lmem_addr,
-                                    uint32_t byte_offset,
-                                    uint32_t total_bytes);
   void publish_visible_tensor_mem_state();
+  void advance_async_tensor_engine();
   void drain_tensor_execute_completion_notices();
   void advance_tcgen05_ldst_async_ops();
   void on_async_tensor_op_completed(AsyncTensorOp& op);
@@ -522,8 +493,8 @@ private:
   bool has_pending_tcgen05_ldst(uint32_t wid, bool wait_store) const;
   void try_resume_tcgen05_ldst_waiters();
   bool has_pending_async_ops(uint32_t wid, bool committed_only) const;
-  bool has_pending_local_tensor_ops(uint32_t wid) const;
   void try_complete_mbarrier(uint64_t mbar_addr);
+  void mirror_mbarrier_to_lmem(uint64_t mbar_addr, const mbarrier_runtime_state_t& state);
 //#endif
 
   friend class LsuUnit;

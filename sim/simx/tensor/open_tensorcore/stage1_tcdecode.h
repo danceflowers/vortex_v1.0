@@ -26,11 +26,10 @@ class Core;
 class OpenTensorCore;
 
 struct TcDecodeConfig {
-  uint32_t port_depth       = 1;
+  uint32_t port_depth       = 1;   // Input depth (Output/OutputLdSt are cap-0 relays)
   uint32_t decode_latency   = 2;   // MMA decode delay (after LMEM response)
   uint32_t ldst_latency     = 1;   // LD/ST decode delay (no LMEM read)
-  uint32_t lmem_read_depth  = 1;   // LmemReadReq port depth
-  uint32_t lmem_rsp_depth   = 1;   // LmemReadRsp port depth
+  uint32_t lmem_rsp_depth   = 1;   // LmemReadRsp port depth (LmemReadReq is cap-0 relay)
 };
 
 class TcDecodeStage : public SimObject<TcDecodeStage> {

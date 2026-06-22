@@ -24,10 +24,13 @@ ProcessorImpl::ProcessorImpl(const Arch& arch)
 
 	assert(PLATFORM_MEMORY_DATA_SIZE == MEM_BLOCK_SIZE);
 
-  // create memory simulator
+  // create memory simulator. The DRAM is shared by the L3 cache (ports
+  // [0, L3_MEM_PORTS)) and the tensor TCache (ports [L3_MEM_PORTS, ...)). The
+  // TCache needs its own memory ports — otherwise its bindings overwrite the
+  // L3↔DRAM response links and icache/dcache fills never complete.
   memsim_ = MemSim::Create("dram", MemSim::Config{
     PLATFORM_MEMORY_NUM_BANKS,
-    L3_MEM_PORTS,
+    L3_MEM_PORTS + NUM_SOCKETS,
     MEM_BLOCK_SIZE,
     MEM_CLOCK_RATIO
   });
@@ -136,10 +139,11 @@ ProcessorImpl::ProcessorImpl(const Arch& arch)
           &tensor_sockets_[i]->CacheRspPorts.at(0));
     }
 
-    // Connect TCache to RAM.
+    // Connect TCache to RAM on DRAM ports past the L3's range (see memsim
+    // creation above) so the two caches do not share — and overwrite — ports.
     for (uint32_t i = 0; i < tcache_->MemReqPorts.size(); ++i) {
-      tcache_->MemReqPorts.at(i).bind(&memsim_->MemReqPorts.at(i));
-      memsim_->MemRspPorts.at(i).bind(&tcache_->MemRspPorts.at(i));
+      tcache_->MemReqPorts.at(i).bind(&memsim_->MemReqPorts.at(L3_MEM_PORTS + i));
+      memsim_->MemRspPorts.at(L3_MEM_PORTS + i).bind(&tcache_->MemRspPorts.at(i));
     }
   }
 

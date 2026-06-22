@@ -41,11 +41,32 @@ using InstrAllocator = PoolAllocator<Instr, 64>;
 
 // Create one pipeline-visible TCU instruction shell. Runtime register values
 // such as handles and control words are resolved later during execute.
+// Route each tensor sub-op to the functional unit that owns its timing model:
+//   TMEM_*    → TMEM module (tcgen05.alloc/dealloc/cp/shift)
+//   CPABULK_* → TMA  module (cp.async.bulk.tensor)
+//   everything else (TCU_WMMA/LD/ST/WAIT, MBAR_*) → OpenTensorCore. MBAR ops are
+//   resolved synchronously in the execute stage and just pass through the OTC.
+static FUType tcu_fu_type(TcuType op_type) {
+  switch (op_type) {
+  case TcuType::TMEM_REL_PERMIT:
+  case TcuType::TMEM_ALLOC:
+  case TcuType::TMEM_DEALLOC:
+  case TcuType::TMEM_CP:
+  case TcuType::TMEM_SHIFT:
+    return FUType::TMEM;
+  case TcuType::CPABULK_TENSOR_LD:
+  case TcuType::CPABULK_TENSOR_ST:
+    return FUType::TMA;
+  default:
+    return FUType::TCU;
+  }
+}
+
 std::shared_ptr<Instr> make_tcu_instr(InstrAllocator& instr_pool,
                                       uint64_t uuid,
                                       TcuType op_type,
                                       const IntrTcuArgs& args = IntrTcuArgs{}) {
-  auto instr = std::allocate_shared<Instr>(instr_pool, uuid, FUType::TCU);
+  auto instr = std::allocate_shared<Instr>(instr_pool, uuid, tcu_fu_type(op_type));
   instr->setOpType(op_type);
   instr->setArgs(args);
   return instr;
@@ -1114,6 +1135,7 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
   case Opcode::EXT2: { // custom-1 (0x2B): tcgen05 TMEM management + cp.async.bulk.tensor
     auto qualifier = funct7;
     IntrTcuArgs args{};
+    args.raw_funct7 = funct7;  // preserve raw qualifier (WMMA collector bits, TMA complete_tx, ...)
     args.cta_group = (qualifier >> 0) & 1;
     switch (funct3) {
     case 0b001: { // TMEM_REL_PERMIT
@@ -1178,6 +1200,7 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
   case Opcode::EXT3: { // custom-2 (0x5B): tcgen05 sync + full mbarrier
     auto qualifier = funct7;
     IntrTcuArgs args{};
+    args.raw_funct7 = funct7;  // preserve raw qualifier (WMMA collector bits, TMA complete_tx, ...)
     switch (funct3) {
     case 0b000: { // MBAR_FENCE
       args.fence_mode = ((qualifier & 1) != 0) ? TcuFenceMode::After : TcuFenceMode::Before;
@@ -1251,6 +1274,7 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
   case Opcode::EXT4: { // custom-3 (0x7B): tcgen05 compute family
     auto qualifier = funct7;
     IntrTcuArgs args{};
+    args.raw_funct7 = funct7;  // preserve raw qualifier (WMMA collector bits, TMA complete_tx, ...)
     switch (funct3) {
     case 0b000: { // TCU_WMMA: rd=x0, rs1=idesc, rs2=operand_block LMEM ptr
       // PTX-aligned compact qualifier (7-bit funct7):

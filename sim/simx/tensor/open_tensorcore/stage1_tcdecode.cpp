@@ -66,9 +66,9 @@ TcDecodeStage::TcDecodeStage(const SimContext& ctx, const char* name, Core* core
                              const TcDecodeConfig& config)
   : SimObject<TcDecodeStage>(ctx, name)
   , Input(this, config.port_depth)
-  , Output(this, config.port_depth)
-  , OutputLdSt(this, config.port_depth)
-  , LmemReadReq(this, config.lmem_read_depth)
+  , Output(this, 0)            // source/relay port: must be capacity 0 for bind()
+  , OutputLdSt(this, 0)        // source/relay port
+  , LmemReadReq(this, 0)       // source/relay port (→ lmem_arb)
   , LmemReadRsp(this, config.lmem_rsp_depth)
   , core_(core)
   , otc_(otc)
@@ -175,6 +175,7 @@ void TcDecodeStage::tick() {
     job.is_load = ldst->is_load;
     job.fmt     = ldst->fmt;
     job.rd      = ldst->rd;
+    job.taddr   = ldst->taddr;
     job.trace   = trace;
     job.st_values = ldst->values;
 
@@ -196,7 +197,7 @@ void TcDecodeStage::tick() {
   }
 
   DT(3, "TcDecodeStage: wid=" << trace->wid
-     << " cycle=" << this->current_cycle()
+     << " cycle=" << SimPlatform::instance().cycles()
      << " idesc=0x" << std::hex << tcu_data->idesc
      << " opblock=0x" << tcu_data->operand_block_lmem_ptr
      << " qual=0x" << tcu_data->qualifier << std::dec);

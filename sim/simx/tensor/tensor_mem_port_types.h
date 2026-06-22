@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <array>
+#include <iostream>
 
 namespace vortex {
 
@@ -58,6 +59,23 @@ struct TensorAsyncOpCompletion {
   uint32_t tx_bytes = 0;            // Optional completed TMA byte count.
   uint32_t payload_size_bytes = 0;  // Optional completed payload size.
 };
+
+// Debug stream operators (required by SimPort/TxRxCrossBar DT() logging in
+// DEBUG builds; no-ops in release where DT() is compiled out).
+inline std::ostream& operator<<(std::ostream& os, const TensorMemPortReq& r) {
+  os << "TmemReq{id=" << r.request_id << " tag=" << r.tag
+     << " " << (r.access_type == TensorMemPortReq::AccessType::Read ? "RD" : "WR")
+     << " taddr=0x" << std::hex << r.taddr << std::dec
+     << " pkt=" << r.packet_idx << "}";
+  return os;
+}
+
+inline std::ostream& operator<<(std::ostream& os, const TensorMemPortRsp& r) {
+  os << "TmemRsp{id=" << r.request_id << " tag=" << r.tag
+     << " " << (r.access_type == TensorMemPortReq::AccessType::Read ? "RD" : "WR")
+     << "}";
+  return os;
+}
 
 enum class TmemTaddrBlockReason : uint8_t {
   None = 0, Invalid, BusyTmemShift, PayloadNotReady, MetaNotReady,

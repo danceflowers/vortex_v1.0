@@ -11,14 +11,18 @@ OpenTensorCore::OpenTensorCore(const SimContext& ctx, const char* name,
   : SimObject<OpenTensorCore>(ctx, name)
   , Inputs(ISSUE_WIDTH, this)
   , Outputs(ISSUE_WIDTH, this)
-  , TmemReadReq(this, 1)
-  , TmemReadRsp(this, 1)
-  , TmemWriteReq(this, 1)
-  , TmemWriteRsp(this, 1)
-  , LmemReadReq(this, 1)
-  , LmemReadRsp(this, 1)
-  , DecodeLmemReadReq(this, 1)
-  , DecodeLmemReadRsp(this, 1)
+  // All external ports are capacity-0 relays: the OTC forwards between its
+  // internal stages and the TensorSocket arbiters / core lmem_arb. A bind()
+  // source must be a virtual (capacity-0) port (simobject.h:91).
+  , TmemReadReq(this, 0)
+  , TmemReadRsp(this, 0)
+  , TmemWriteReq(this, 0)
+  , TmemWriteRsp(this, 0)
+  , LmemReadReq(this, 0)
+  , LmemReadRsp(this, 0)
+  , DecodeLmemReadReq(this, 0)
+  , DecodeLmemReadRsp(this, 0)
+  , AsyncCompletionOut(this, 0)
   , core_(core)
   , config_(config) {
 
@@ -76,10 +80,30 @@ feed_mma_traces();
     if (it != pending_traces_.end()) {
       auto trace = it->second.trace;
       uint32_t lane = it->second.lane;
+      // Echo the Core-assigned async id so Core can match this MMA completion to
+      // its async_tensor_ops_ entry per-id (out-of-order completion safe).
+      uint32_t aid = 0;
+      if (auto* td = dynamic_cast<TcuTraceData*>(trace->data.get())) aid = td->async_id;
+      pending_traces_.erase(it);
+      Outputs.at(lane).push(trace, 0);
+      TensorAsyncOpCompletion c;
+      c.async_id = aid;
+      AsyncCompletionOut.push(c, 1);
+    } else {
+      DT(1, "OpenTensorCore: completed uuid=#" << done.uuid << " not found");
+    }
+  }
+
+  // LD/ST completion (Stage2b) → commit the original trace back to the core.
+  if (!stage2b_->Output.empty()) {
+    auto trace = stage2b_->Output.front(); stage2b_->Output.pop();
+    auto it = pending_traces_.find(trace->uuid);
+    if (it != pending_traces_.end()) {
+      uint32_t lane = it->second.lane;
       pending_traces_.erase(it);
       Outputs.at(lane).push(trace, 0);
     } else {
-      DT(1, "OpenTensorCore: completed uuid=#" << done.uuid << " not found");
+      DT(1, "OpenTensorCore: LD/ST completed uuid=#" << trace->uuid << " not found");
     }
   }
 }
@@ -89,11 +113,12 @@ void OpenTensorCore::feed_mma_traces() {
     if (Inputs.at(iw).empty()) continue;
     auto trace = Inputs.at(iw).front();
 
-    // Skip LD/ST traces (handled by Stage1 → Stage2b path).
-    if (dynamic_cast<TcuLdStTraceData*>(trace->data.get())) continue;
-
-    auto* td = dynamic_cast<TcuTraceData*>(trace->data.get());
-    if (td == nullptr) {
+    // Both MMA (TcuTraceData) and LD/ST (TcuLdStTraceData) traces go through
+    // Stage1: MMA → Stage2a → Stage3, LD/ST → Stage2b. Anything else passes
+    // straight through to commit.
+    bool is_ldst = dynamic_cast<TcuLdStTraceData*>(trace->data.get()) != nullptr;
+    bool is_mma  = dynamic_cast<TcuTraceData*>(trace->data.get()) != nullptr;
+    if (!is_ldst && !is_mma) {
       Inputs.at(iw).pop();
       Outputs.at(iw).push(trace, 3);
       continue;

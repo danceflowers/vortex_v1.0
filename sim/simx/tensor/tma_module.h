@@ -85,7 +85,9 @@ private:
 
     // Helper: compute DRAM byte address for linear element index within tile.
     uint64_t compute_elem_addr(uint32_t linear_idx) const {
-      // De-linearize to per-dimension coords, then apply global_stride.
+      // De-linearize to per-dimension coords, then apply global_stride. Per
+      // CUtensorMap, global_stride is already in BYTES, so it must not be scaled
+      // again by elem_bytes.
       const auto* tmap = reinterpret_cast<const tensor_map_t*>(tmap_buf);
       uint64_t off = 0;
       uint32_t rem = linear_idx;
@@ -95,7 +97,7 @@ private:
         rem /= dim;
         off += coord * tmap->global_stride[d];
       }
-      return global_addr + off * elem_bytes;
+      return global_addr + off;
     }
 
     // Parsed cpabulk_transfer_args_t.

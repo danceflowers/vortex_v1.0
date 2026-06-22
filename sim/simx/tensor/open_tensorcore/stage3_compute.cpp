@@ -53,8 +53,8 @@ ComputePipeline::ComputePipeline(const SimContext& ctx, const char* name,
                                  Core* core, DMem* dmem, const ComputeConfig& config)
   : SimObject<ComputePipeline>(ctx, name)
   , Input(this, config.input_depth)
-  , Output(this, config.output_depth)
-  , TmemWriteReq(this, config.tmem_write_depth)
+  , Output(this, config.output_depth)   // sink endpoint: OTC reads via front()/pop()
+  , TmemWriteReq(this, 0)               // source/relay port (→ TMEM write arbiter)
   , TmemWriteRsp(this, config.tmem_wrsp_depth)
   , core_(core)
   , config_(config)
@@ -433,17 +433,21 @@ bool ComputePipeline::build_store_packets(ActiveJob& job) {
   uint32_t M = tile.shape_m;
   uint32_t N = tile.shape_n;
 
-  // PTX TMEM layout:
-  //   lane  = taddr.lane + row       (each row maps to one lane)
-  //   byte  = taddr.col_byte + col * elem_bytes  (columns within a lane)
-  //
-  // The tile occupies M lanes × (N * elem_bytes) bytes per lane. The linear
-  // byte stream (rows × columns within row) is split into consecutive 64B
-  // packets — taddr resolution to physical lane/byte happens in TmemSystem.
-  uint32_t row_stride = N * elem_bytes;  // bytes per lane (one row)
-  uint32_t total_bytes = M * row_stride;
-  uint32_t total_pkts = (total_bytes + 64 - 1)
-                      / 64;
+  // D TMEM layout — must match the scalar tcgen05.ld readback the kernel uses:
+  //   out_index[r*W + lane] = tcu_ld(d_taddr | (r*4)<<16)  for r in [0..cols),
+  //                                                            lane in [0..W)
+  // i.e. the warp (W lanes) reads the D element with linear index
+  //   idx = r*W + lane  (row-major over M×N, idx = m*N + n)
+  // from TMEM cell (row = lane = idx % W, bank = r = idx / W). Each cell is one
+  // 4-byte bank slot at byte offset (idx%W)*kTmemRowBytes + (idx/W)*4.
+  constexpr uint32_t kWarpLanes = 32;     // readback lanes (= NUM_THREADS)
+  constexpr uint32_t kTmemRowBytes = 128; // 32 banks × 4 B per TMEM row
+  uint32_t max_boff = 0;
+  for (uint32_t idx = 0; idx < M * N; ++idx) {
+    uint32_t boff = (idx % kWarpLanes) * kTmemRowBytes + (idx / kWarpLanes) * 4;
+    if (boff + 4 > max_boff) max_boff = boff + 4;
+  }
+  uint32_t total_pkts = (max_boff + 64 - 1) / 64;
   job.d_store_packets.assign(total_pkts, TmemPacket{});
 
   for (uint32_t subtile = 0; subtile < kSubtiles; ++subtile) {
@@ -454,9 +458,9 @@ bool ComputePipeline::build_store_packets(ActiveJob& job) {
     uint32_t sn = subtile % 2;
 
     for (uint32_t i = 0; i < kPrimitiveDim; ++i) {
-      uint32_t gr = sm * kPrimitiveDim + i;   // M direction → lane
+      uint32_t gr = sm * kPrimitiveDim + i;   // M direction (row)
       for (uint32_t j = 0; j < kPrimitiveDim; ++j) {
-        uint32_t gc = sn * kPrimitiveDim + j;  // N direction → col_byte
+        uint32_t gc = sn * kPrimitiveDim + j;  // N direction (col)
         if (gr >= M || gc >= N) continue;
 
         // FP22 → output format.
@@ -468,8 +472,9 @@ bool ComputePipeline::build_store_packets(ActiveJob& job) {
         default: return false;
         }
 
-        // tile_boff: linear byte offset within the tile, row-major (row then col).
-        uint32_t tile_boff = gr * row_stride + gc * elem_bytes;
+        uint32_t idx = gr * N + gc;           // row-major D linear index
+        uint32_t tile_boff = (idx % kWarpLanes) * kTmemRowBytes
+                           + (idx / kWarpLanes) * 4;
         uint32_t dst_pkt = tile_boff / 64;
         uint32_t dst_off = tile_boff % 64;
         std::memcpy(job.d_store_packets[dst_pkt].bytes.data() + dst_off,
@@ -486,7 +491,8 @@ bool ComputePipeline::build_store_packets(ActiveJob& job) {
 // ---------------------------------------------------------------------------
 
 void ComputePipeline::drain_tmem_responses() {
-  while (!TmemWriteRsp.empty()) {
+  // One pop per cycle (SimPort allows a single dequeue per port per tick).
+  if (!TmemWriteRsp.empty()) {
     auto rsp = TmemWriteRsp.front();
     TmemWriteRsp.pop();
     completed_tmem_wrsp_[rsp.request_id] = rsp;

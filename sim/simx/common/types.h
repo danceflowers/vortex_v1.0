@@ -1659,6 +1659,11 @@ public:
           in_rsp.tag = rsp.tag >> lg2_num_reqs_;
         }
         uint32_t i = o * R + r;
+        // Respect client backpressure: if the destination cannot accept the
+        // response, hold it and retry next cycle (avoids overflowing a slow
+        // consumer such as the OpenTensorCore LMEM response ports).
+        if (RspIn.at(i).full())
+          continue;
         DT(4, this->name() << "-rsp" << o << "_" << i << ": " << in_rsp);
         RspIn.at(i).push(in_rsp, rsp_delay_);
         rsp_out.pop();

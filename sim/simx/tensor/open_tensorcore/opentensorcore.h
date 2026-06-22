@@ -60,6 +60,11 @@ public:
   SimPort<LsuReq> DecodeLmemReadReq;
   SimPort<LsuRsp> DecodeLmemReadRsp;
 
+  // MMA completion notice → Core (bound to Core::mma_completion_in_). Carries the
+  // Core-assigned async_id so Core matches the completion to its async_tensor_ops_
+  // entry per-id (tcgen05.commit → mbarrier_arrive). Capacity-0 bind source.
+  SimPort<TensorAsyncOpCompletion> AsyncCompletionOut;
+
   OpenTensorCore(const SimContext& ctx, const char* name, Core* core,
                  const OpenTensorCoreConfig& config = OpenTensorCoreConfig{});
 

@@ -40,12 +40,10 @@ class Core;
 
 struct OperandFetchConfig {
   uint32_t input_depth       = 1;
-  uint32_t output_depth      = 1;
-  uint32_t tmem_read_depth   = 1;
   uint32_t tmem_rsp_depth    = 1;
-  uint32_t lmem_read_depth   = 1;
   uint32_t lmem_rsp_depth    = 1;
   uint32_t convert_latency   = 2;
+  // Output, TmemReadReq, LmemReadReq are cap-0 relay ports (no depth needed).
 };
 
 class OperandFetchStage : public SimObject<OperandFetchStage> {

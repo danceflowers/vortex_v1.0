@@ -50,6 +50,9 @@ struct TcuTraceData : public ITraceData {
   uint32_t idesc;                  // i_descriptor_t from rs1
   uint32_t operand_block_lmem_ptr; // LMEM pointer to operand_block_t from rs2
   uint32_t qualifier;              // raw funct7 bits (ws/sp/enable_input_d/cta_group/collector/multicast)
+  uint32_t async_id = 0;           // Core-assigned async op id; echoed back by OTC on MMA
+                                   // completion so mbar_commit/arrive can match per-id
+                                   // (handles out-of-order completion).
 };
 
 // TMEM trace payload for TMEM_* / MBAR_* instructions.
@@ -70,7 +73,11 @@ struct TcuLdStTraceData : public ITraceData {
   bool     is_load = true;          // true=LD, false=ST
   uint32_t fmt     = 0;             // output format (LD) / input format (ST)
   uint32_t rd      = 0;             // destination register (LD only)
-  // For ST: 32 threads × 8 registers = 256 values. Row-major, thread t gets [t*8..t*8+7].
+  // Warp-uniform base TADDR (PTX §9.7.16.1): bits[15:0]=lane base, bits[31:16]=
+  // col_byte. Thread t accesses cell (lane = taddr.lane + t, col_byte). One 32-bit
+  // value per thread (scalar tcgen05.ld/st).
+  uint32_t taddr   = 0;
+  // Per-thread scalar payload (ST): values[t] = value stored by thread t.
   std::array<uint32_t, 256> values = {};
 };
 

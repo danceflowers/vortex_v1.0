@@ -73,6 +73,10 @@ protected:
   LinkedListNode<SimPortBase> push_list_;
 
   friend class SimPlatform;
+  // SimPort manipulates linked ports' source_/sink_ (e.g. in unbind()), which
+  // requires access to another SimPortBase's protected members through a base
+  // pointer.
+  template <typename U> friend class SimPort;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -89,7 +93,7 @@ public:
 
   void bind(SimPort<Pkt>* sink) {
     __assert(0 == capacity_, "only virtual ports can be used a link!")
-    assert(sink_ == nullptr);
+    if (sink_ != nullptr) this->unbind();  // re-bind: tear down prior link first
     sink->source_ = this;
     sink_ = sink;
     sink_transfer_ = nullptr;
@@ -98,7 +102,7 @@ public:
   template <typename U>
   void bind(SimPort<U>* sink) {
     __assert(0 == capacity_, "only virtual ports can be used a link!")
-    assert(sink_ == nullptr);
+    if (sink_ != nullptr) this->unbind();  // re-bind: tear down prior link first
     sink->source_ = this;
     sink_ = sink;
     sink_transfer_ = [sink](const Pkt& pkt, uint64_t cycles) {
@@ -109,7 +113,7 @@ public:
   template <typename U, typename Converter>
   void bind(SimPort<U>* sink, const Converter& converter) {
     __assert(0 == capacity_, "only virtual ports can be used a link!")
-    assert(sink_ == nullptr);
+    if (sink_ != nullptr) this->unbind();  // re-bind: tear down prior link first
     sink->source_ = this;
     sink_ = sink;
     sink_transfer_ = [sink, converter](const Pkt& pkt, uint64_t cycles) {

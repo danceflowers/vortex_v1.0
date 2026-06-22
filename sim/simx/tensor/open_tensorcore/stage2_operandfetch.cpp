@@ -63,10 +63,10 @@ OperandFetchStage::OperandFetchStage(const SimContext& ctx, const char* name,
                                      const OperandFetchConfig& config)
   : SimObject<OperandFetchStage>(ctx, name)
   , Input(this, config.input_depth)
-  , Output(this, config.output_depth)
-  , TmemReadReq(this, config.tmem_read_depth)
+  , Output(this, 0)            // source/relay port: must be capacity 0 for bind()
+  , TmemReadReq(this, 0)       // source/relay port (→ TMEM read arbiter)
   , TmemReadRsp(this, config.tmem_rsp_depth)
-  , LmemReadReq(this, config.lmem_read_depth)
+  , LmemReadReq(this, 0)       // source/relay port (→ lmem_arb)
   , LmemReadRsp(this, config.lmem_rsp_depth)
   , core_(core)
   , config_(config) {

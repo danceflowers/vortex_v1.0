@@ -1652,33 +1652,35 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
         td->idesc                  = rs1_value;
         td->operand_block_lmem_ptr = rs2_value;
         td->qualifier              = qualifier;
+        // Register the async op so tcgen05.commit can bind it and its completion
+        // (echoed back from OpenTensorCore) drives one mbarrier_arrive.
+        td->async_id               = core_->alloc_mma_async_op(wid);
         // No GPR writeback for MMA (rd = x0).
       } break;
       case TcuType::TCU_LD: {
-        // New path: DMem → convert → 32 threads × 8 regs, handled by OpenTensorCore.
+        // Scalar tcgen05.ld (PTX §9.7.16.1): thread t reads the 32-bit TMEM cell
+        // at (lane = taddr.lane + t, col_byte). Warp-uniform base taddr is in rs1;
+        // the per-thread value is written back to rd by OpenTensorCore (deferred).
         trace->data = std::make_shared<TcuLdStTraceData>();
         auto* td = static_cast<TcuLdStTraceData*>(trace->data.get());
         td->is_load = true;
         td->fmt     = static_cast<uint32_t>(tpuArgs.ld_shape);
+        td->taddr   = rs1_data.at(thread_start).u32;
         td->rd      = (rdest.type != RegType::None) ? rdest.idx : 0;
         rd_write = (rdest.type != RegType::None) && (rdest.idx != 0);
         defer_rd_write = rd_write;
       } break;
       case TcuType::TCU_ST: {
-        // New path: 32 threads × 8 regs → convert FP22 → DMem, handled by OpenTensorCore.
+        // Scalar tcgen05.st (PTX §9.7.16.1): thread t writes rs2 to the 32-bit TMEM
+        // cell at (lane = taddr.lane + t, col_byte). Warp-uniform base taddr is rs1.
         trace->data = std::make_shared<TcuLdStTraceData>();
         auto* td = static_cast<TcuLdStTraceData*>(trace->data.get());
         td->is_load = false;
         td->fmt     = static_cast<uint32_t>(tpuArgs.ld_shape);
-        // Collect 8 consecutive registers per thread (r2, r2+1, ..., r2+7).
+        td->taddr   = rs1_data.at(thread_start).u32;
         for (uint32_t t = 0; t < num_threads; ++t) {
           if (!warp.tmask.test(t)) continue;
-          auto& ireg_file = warps_.at(wid).ireg_file;
-          uint32_t base_reg = rsrc1.idx;
-          for (uint32_t r = 0; r < 8; ++r) {
-            td->values[t * 8 + r] = static_cast<uint32_t>(
-                ireg_file.at(base_reg + r).at(t));
-          }
+          td->values[t] = rs2_data.at(t).u32;
         }
       } break;
       case TcuType::TCU_WAIT_LD: {

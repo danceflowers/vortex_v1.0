@@ -40,9 +40,9 @@ class Core;
 
 struct ComputeConfig {
   uint32_t input_depth       = 2;  // allows next B chunk to queue during COMPUTE
-  uint32_t output_depth      = 1;  // Output port (CompletedMmaJob)
-  uint32_t tmem_write_depth  = 2;  // TMEM write port (D result writeback)
+  uint32_t output_depth      = 1;  // Output port (CompletedMmaJob; read via front/pop)
   uint32_t tmem_wrsp_depth   = 2;  // TMEM write response port
+  // TmemWriteReq is a cap-0 relay port (no depth needed).
 };
 
 class ComputePipeline : public SimObject<ComputePipeline> {
