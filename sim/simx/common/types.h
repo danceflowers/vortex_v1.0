@@ -833,6 +833,24 @@ struct IntrTcuArgs {
   uint8_t transpose_b = 0;
   TcuTarget target = TcuTarget::None;
   TcuPayloadKind payload_kind = TcuPayloadKind::Dense;
+
+  // Compatibility fields used by the TensorUnit macro-op frontend.
+  // These are internal microarchitecture fields derived from TcDecode or from
+  // earlier frontend stages. They keep the TensorUnit implementation aligned
+  // with the current tcgen05-facing execute path while avoiding the deprecated
+  // fmt_ab/TcuType names.
+  uint32_t descriptor = 0xffffffffu;
+  uint32_t runtime_handle = 0;
+  uint32_t slot_id = 0;
+  uint32_t a_slot_id = 0;
+  uint32_t b_slot_id = 0;
+  uint32_t c_slot_id = 0;
+  uint32_t window_id = 0;
+  uint32_t step_m = 0;
+  uint32_t step_n = 0;
+  uint32_t step_k = 0;
+  uint32_t bank_span = 0;
+  uint32_t barrier_id = 0;
 };
 
 inline std::ostream &operator<<(std::ostream &os, const TcuType& type) {

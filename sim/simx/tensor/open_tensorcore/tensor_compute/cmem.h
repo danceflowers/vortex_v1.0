@@ -70,6 +70,10 @@ public:
     return kDepth;
   }
 
+  static constexpr uint32_t dump_beats(uint32_t) {
+    return kDepth;
+  }
+
   static constexpr uint32_t all_bank_mask() {
     return (1u << kBankCount) - 1u;
   }
@@ -357,6 +361,40 @@ public:
         store_elem(row, i * kPrimitiveDim + j, convert_c_to_fp22(in[i][j], PREC_FP16));
       }
     }
+  }
+
+  // Slot-aware compatibility wrappers used by the TensorUnit timing path.
+  // Current CMem is single-instance; slot_id is accepted for interface
+  // compatibility and ignored.
+  void clear_slot(uint32_t) {
+    clear();
+  }
+
+  static constexpr uint32_t fill_beats(uint32_t) {
+    return fill_subtiles(0);
+  }
+
+  static uint32_t packets_per_fill_group(uint32_t fmt_c) {
+    return packets_per_subtile(fmt_c);
+  }
+
+  bool write_fill_beat(uint32_t,
+                       uint32_t fmt_c,
+                       uint32_t beat_idx,
+                       const std::vector<packet_t>& packets) {
+    return write_fill_subtile(fmt_c, beat_idx, packets);
+  }
+
+  void read_subtile_fp22(uint32_t,
+                         uint32_t subtile_id,
+                         uint32_t out[kPrimitiveDim][kPrimitiveDim]) const {
+    read_subtile_fp22(subtile_id, out);
+  }
+
+  void accumulate_subtile(uint32_t,
+                          uint32_t subtile_id,
+                          const uint32_t in[kPrimitiveDim][kPrimitiveDim]) {
+    accumulate_subtile(subtile_id, in);
   }
 
 private:

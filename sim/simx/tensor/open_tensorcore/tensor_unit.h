@@ -77,6 +77,31 @@ public:
     uint64_t stall_no_wmma_waiting_for_taddr_alloc;
     uint64_t stall_no_wmma_waiting_for_slot_release;
 
+    // Additional counters used by the current TensorUnit implementation.
+    uint64_t first_tc_issue_cycle = 0;
+    uint64_t last_tc_issue_cycle = 0;
+    uint64_t first_tc_retire_cycle = 0;
+    uint64_t last_tc_retire_cycle = 0;
+    uint64_t mem_queue_max = 0;
+    uint64_t pending_wmma_depth_cycles_0 = 0;
+    uint64_t pending_wmma_depth_cycles_1 = 0;
+    uint64_t pending_wmma_depth_cycles_2 = 0;
+    uint64_t pending_wmma_depth_cycles_3plus = 0;
+    uint64_t stall_amem_port_busy = 0;
+    uint64_t stall_bmem_port_busy = 0;
+    uint64_t stall_cmem_port_busy = 0;
+    uint64_t stall_meta_port_busy = 0;
+    uint64_t stall_mma_load_handle_not_ready = 0;
+    uint64_t stall_handle_reuse = 0;
+    uint64_t stall_handle_busy_due_to_tma_load = 0;
+    uint64_t stall_handle_busy_due_to_tma_store_or_shift = 0;
+    uint64_t stall_no_wmma_waiting_for_handle_alloc = 0;
+    uint64_t stall_no_wmma_waiting_for_c_wmma_inflight_drain = 0;
+    uint64_t stall_no_wmma_waiting_for_accum_live_only = 0;
+    uint64_t stall_no_wmma_waiting_for_dirty_flush_only = 0;
+    uint64_t stall_no_wmma_waiting_for_store_pending = 0;
+    uint64_t stall_no_wmma_waiting_for_ab_wmma_pending_clear = 0;
+
 		PerfStats()
 			: latency(0)
       , tc_active_cycles(0)
@@ -154,6 +179,12 @@ public:
     TaddrReuse,
     SlotBusy,
     AMetaNotReady,
+
+    // Compatibility aliases for the current TensorUnit implementation.
+    MmaLoadHandleNotReady = MmaLoadTaddrNotReady,
+    HandleBusyDueToTmaLoad = TaddrBusyDueToTmaLoad,
+    HandleBusyDueToTmaStoreOrShift = TaddrBusyDueToTmaStoreOrShift,
+    HandleReuse = TaddrReuse,
   };
 
   // Instruction input ports from execute stage, one per issue lane.
@@ -203,6 +234,7 @@ private:
   // Impl owns local SRAMs, queues, TensorCore instance, and all transient state.
 	class Impl;
 	Impl* impl_;
+  Core* core_ = nullptr;
 };
 
 } // namespace vortex

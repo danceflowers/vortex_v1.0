@@ -202,6 +202,36 @@ public:
     }
   }
 
+  // Slot-aware compatibility wrappers used by the TensorUnit timing path.
+  // Current AMem is single-instance; slot_id is accepted for interface
+  // compatibility and ignored.
+  void clear_slot(uint32_t) {
+    clear();
+  }
+
+  static constexpr uint32_t fill_beats() {
+    return fill_lines();
+  }
+
+  static uint32_t packets_per_fill_beat(uint32_t fmt_a) {
+    return packets_per_fill_line(fmt_a);
+  }
+
+  bool write_fill_beat(uint32_t,
+                       uint32_t fmt_a,
+                       uint32_t beat_idx,
+                       const std::vector<packet_t>& packets) {
+    return write_fill_line(fmt_a, beat_idx, packets);
+  }
+
+  void read_primitive(uint32_t,
+                      uint32_t storage_m,
+                      uint32_t storage_k,
+                      uint16_t out[8][8],
+                      bool transpose = false) const {
+    read_primitive(storage_k * 2 + storage_m, out, transpose);
+  }
+
 private:
   using row_t = std::array<std::array<uint16_t, kBankElems>, kBankCount>;
 

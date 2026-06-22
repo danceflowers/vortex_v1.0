@@ -44,6 +44,10 @@ public:
     return 1;
   }
 
+  static constexpr uint32_t fill_beats() {
+    return 1;
+  }
+
   bool write_fill_packet(const packet_t& packet) {
     packet_ = packet;
     valid_ = true;
@@ -62,6 +66,24 @@ public:
     uint32_t line_index = step_m * 2 + step_k;
     uint32_t byte_offset = line_index * kLineBytes;
     std::copy_n(packet_.begin() + byte_offset, kLineBytes, out);
+  }
+
+  // Slot-aware compatibility wrappers used by the TensorUnit timing path.
+  // Current MetaMem is single-instance; slot_id is accepted for interface
+  // compatibility and ignored.
+  void clear_slot(uint32_t) {
+    clear();
+  }
+
+  bool write_fill_beat(uint32_t, const packet_t& packet) {
+    return write_fill_packet(packet);
+  }
+
+  void read_line(uint32_t,
+                 uint32_t step_m,
+                 uint32_t step_k,
+                 uint8_t out[kLineBytes]) const {
+    read_line(step_m, step_k, out);
   }
 
 private:

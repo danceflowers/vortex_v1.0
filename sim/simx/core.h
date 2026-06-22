@@ -46,6 +46,8 @@
 
 namespace vortex {
 
+struct TmemWindowPlan;
+
 class Socket;
 class Arch;
 class DCRS;
@@ -308,6 +310,48 @@ public:
   bool tmem_taddr_ready_for_mma_store(uint32_t taddr) const;
   TmemTaddrBlockReason tmem_taddr_load_block_reason(uint32_t taddr, TcuTarget target, uint32_t sparse_mode) const;
   TmemTaddrBlockReason tmem_taddr_store_block_reason(uint32_t taddr) const;
+  // Compatibility wrappers for older TensorUnit code paths. The current
+  // interface is TADDR-based; these names simply forward to the canonical API.
+  bool tmem_handle_ready_for_mma_load(uint32_t taddr, TcuTarget target, uint32_t sparse_mode) const {
+    return tmem_taddr_ready_for_mma_load(taddr, target, sparse_mode);
+  }
+  bool tmem_handle_ready_for_mma_store(uint32_t taddr) const {
+    return tmem_taddr_ready_for_mma_store(taddr);
+  }
+  TmemTaddrBlockReason tmem_handle_load_block_reason(uint32_t taddr, TcuTarget target, uint32_t sparse_mode) const {
+    return tmem_taddr_load_block_reason(taddr, target, sparse_mode);
+  }
+  TmemTaddrBlockReason tmem_handle_store_block_reason(uint32_t taddr) const {
+    return tmem_taddr_store_block_reason(taddr);
+  }
+  bool has_inflight_tma_handle_activity() const { return false; }
+  bool lookup_tmem_window(uint32_t, uint32_t, const TmemWindowPlan** window) const {
+    if (window) *window = nullptr;
+    return false;
+  }
+  bool ensure_tmem_window_bound(uint32_t, uint32_t, TcuTarget, uint32_t, bool = false) { return false; }
+  bool try_acquire_tmem_window_read_port(uint32_t, uint32_t, uint32_t) { return true; }
+  bool try_acquire_tmem_window_write_port(uint32_t, uint32_t, uint32_t) { return true; }
+  bool try_acquire_tmem_read_port(uint32_t, uint32_t) { return true; }
+  bool try_acquire_tmem_write_port(uint32_t, uint32_t) { return true; }
+  bool try_acquire_tmem_read_meta_port(uint32_t, uint32_t) { return true; }
+  bool tmem_read_window_packet(uint32_t taddr, uint32_t, uint32_t packet_idx, TmemPacket* packet) {
+    return packet && tmem_taddr_read_bytes(taddr, packet_idx * Tmem::kPacketBytes, packet->bytes.data(), Tmem::kPacketBytes);
+  }
+  bool tmem_write_window_packet(uint32_t taddr, uint32_t, uint32_t packet_idx, const TmemPacket& packet) {
+    return tmem_taddr_write_bytes(taddr, packet_idx * Tmem::kPacketBytes, packet.bytes.data(), Tmem::kPacketBytes);
+  }
+  bool tmem_read_packet(uint32_t taddr, uint32_t packet_idx, TmemPacket* packet) {
+    return packet && tmem_taddr_read_bytes(taddr, packet_idx * Tmem::kPacketBytes, packet->bytes.data(), Tmem::kPacketBytes);
+  }
+  bool tmem_write_packet(uint32_t taddr, uint32_t packet_idx, const TmemPacket& packet) {
+    return tmem_taddr_write_bytes(taddr, packet_idx * Tmem::kPacketBytes, packet.bytes.data(), Tmem::kPacketBytes);
+  }
+  bool tmem_read_meta_packet(uint32_t taddr, uint32_t packet_idx, TmemPacket* packet) {
+    const TmemAllocation* alloc = nullptr;
+    if (!packet || !tmem_lookup_allocation(taddr, &alloc) || !alloc) return false;
+    return tmem_taddr_read_bytes(taddr, (alloc->meta_col_base - alloc->payload_col_base) * Tmem::kColBytes + packet_idx * Tmem::kPacketBytes, packet->bytes.data(), Tmem::kPacketBytes);
+  }
   // ===== mbarrier API (LMEM-backed; full PTX §7.6 semantics) =====
   // mbar_addr is the absolute LMEM address holding the 8 B mbarrier_state_t.
   bool mbarrier_init(uint64_t mbar_addr, uint32_t count);
