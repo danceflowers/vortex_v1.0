@@ -234,10 +234,27 @@ public:
   //?
   static constexpr uint32_t kTmemPacketBytes = 64;
 //?
+  // Rows in the shared TMEM SRAM (must match tensor::TmemConfig::num_rows).
+  static constexpr uint32_t kTmemNumRows = 512;
 
   // Deprecated TMEM API — returns 0/nullptr (migrated to tensor::Tmem).
-  uint32_t tmem_alloc(uint32_t, uint32_t = 0) { return 0; }
-  bool tmem_dealloc(uint32_t) { return true; }
+  // Bump allocator over the TMEM lane (SRAM-row) axis. Each live allocation gets
+  // a distinct row range so e.g. A and D no longer collide at taddr 0. The
+  // returned taddr is a lane base (col_byte = 0). col_span is the reserved row
+  // count. Freed back to the base once all outstanding allocations are released.
+  uint32_t tmem_alloc(uint32_t col_span, uint32_t = 0) {
+    uint32_t span = (col_span == 0) ? 1 : col_span;
+    if (tmem_next_lane_ + span > kTmemNumRows) return 0xFFFFFFFFu;
+    uint32_t taddr = tmem_next_lane_;   // lane base, col_byte = 0
+    tmem_next_lane_ += span;
+    ++tmem_alloc_count_;
+    return taddr;
+  }
+  bool tmem_dealloc(uint32_t) {
+    if (tmem_alloc_count_ > 0 && --tmem_alloc_count_ == 0)
+      tmem_next_lane_ = 0;   // all allocations released → reset the bump pointer
+    return true;
+  }
   void tmem_rel_permit() {}
   uint32_t tmem_shift(uint32_t, uint32_t, uint32_t = 0) { return 0; }
   uint32_t cpabulk_tensor_load(uint32_t, uint64_t, uint64_t, bool) { return 0; }
@@ -338,6 +355,9 @@ private:
   OpenTensorCore::Ptr open_tensor_core_;   // set by bind_tensor_ports()
   TensorSocket* tensor_socket_ = nullptr;
   uint32_t tensor_core_idx_ = 0;
+  // TMEM bump-allocator state (tmem_alloc / tmem_dealloc).
+  uint32_t tmem_next_lane_ = 0;
+  uint32_t tmem_alloc_count_ = 0;
   // Async tensor completion notices from the new tensor modules:
   //   tensor_async_op_completion_in_ ← TMA.AsyncCompletionOut (complete_tx bytes)
   //   mma_completion_in_             ← OTC.AsyncCompletionOut (MMA arrive, per id)

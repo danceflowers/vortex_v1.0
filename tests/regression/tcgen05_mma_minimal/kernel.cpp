@@ -8,7 +8,6 @@ namespace vt = vortex::tensor;
 void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   constexpr uint32_t kAArgsOff = 0;
   constexpr uint32_t kBArgsOff = 32;
-  constexpr uint32_t kASdescOff = 64;
   constexpr uint32_t kMbarOff = 72;
   constexpr uint32_t kOpBlockOff = 80;
   constexpr uint32_t kAPayloadOff = 128;
@@ -17,13 +16,18 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
 
   uint8_t* lmem = reinterpret_cast<uint8_t*>(__local_mem(kLmemBytes));
   uint32_t lmem_base = reinterpret_cast<uint32_t>(__local_mem(0));
-  uint32_t a_payload_addr = reinterpret_cast<uint32_t>(lmem + kAPayloadOff);
   uint32_t b_payload_addr = reinterpret_cast<uint32_t>(lmem + kBPayloadOff);
   uint32_t mbar_addr = reinterpret_cast<uint32_t>(lmem + kMbarOff);
 
+  // Allocate TMEM up front so the TMA can deliver A straight into TMEM (A,D live
+  // in TMEM; B lives in LMEM).
+  uint32_t a_taddr = vt::tmem_alloc(16);
+  uint32_t d_taddr = vt::tmem_alloc(32);
+
   auto* a_args = reinterpret_cast<vt::cpabulk_transfer_args_t*>(lmem + kAArgsOff);
   auto* b_args = reinterpret_cast<vt::cpabulk_transfer_args_t*>(lmem + kBArgsOff);
-  *a_args = vt::make_cpabulk_args(a_payload_addr, mbar_addr, 0, 0, 0, 0, 0);
+  // A → TMEM (smem_addr field carries the TMEM taddr); B → LMEM (b_payload).
+  *a_args = vt::make_cpabulk_args(a_taddr, mbar_addr, 0, 0, 0, 0, 0);
   *b_args = vt::make_cpabulk_args(b_payload_addr, mbar_addr, 0, 0, 0, 0, 0);
 
   auto* a_tmap = reinterpret_cast<const vt::tensor_map_t*>(
@@ -37,16 +41,7 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   uint32_t tma_phase = vt::mbarrier_arrive_token(mbar_addr);
   vt::mbarrier_wait(mbar_addr, tma_phase);
 
-  uint32_t a_taddr = vt::tmem_alloc(16);
-  uint32_t d_taddr = vt::tmem_alloc(32);
-
-  uint64_t a_sdesc = static_cast<uint64_t>((a_payload_addr - lmem_base) / 16);
   uint64_t b_sdesc = static_cast<uint64_t>((b_payload_addr - lmem_base) / 16);
-  auto* a_sdesc_ptr = reinterpret_cast<uint64_t*>(lmem + kASdescOff);
-  *a_sdesc_ptr = a_sdesc;
-
-  // tcgen05.cp shape 4 == 32x128b.warpx4, 512B for one 16x16 fp16 A tile.
-  vt::tmem_cp_shape<4>(a_taddr, a_sdesc_ptr);
 
   auto* op_block = reinterpret_cast<vt::operand_block_t*>(lmem + kOpBlockOff);
   *op_block = vt::make_operand_block(a_taddr, b_sdesc, 0);

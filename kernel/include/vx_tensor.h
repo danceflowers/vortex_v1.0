@@ -93,6 +93,16 @@ template <> struct operand_fmt_code_for<fp32> { static constexpr operand_fmt_cod
 template <> struct operand_fmt_code_for<fp16> { static constexpr operand_fmt_code value = operand_fmt_code::FP16; };
 template <> struct operand_fmt_code_for<fp8 > { static constexpr operand_fmt_code value = operand_fmt_code::FP8;  };
 
+// idesc atype/btype/ctype/dtype 2-bit precision code, matching the simulator's
+// i_descriptor_t (idescriptor.h): 0=FP8, 1=FP16, 2=FP32. (Note this is a
+// different convention from operand_fmt_code above, which uses 0=FP32.)
+template <typename T> struct idesc_prec_code_for {
+  static_assert(sizeof(T) == 0, "Unsupported tcgen05.mma idesc precision type");
+};
+template <> struct idesc_prec_code_for<fp8 > { static constexpr uint32_t value = 0; };
+template <> struct idesc_prec_code_for<fp16> { static constexpr uint32_t value = 1; };
+template <> struct idesc_prec_code_for<fp32> { static constexpr uint32_t value = 2; };
+
 template <typename Ct, typename Dt>
 inline __attribute__((always_inline)) constexpr uint32_t make_operand_fmt_cd() {
   return (static_cast<uint32_t>(operand_fmt_code_for<Ct>::value) & 0x3u)
@@ -169,20 +179,26 @@ inline __attribute__((always_inline)) constexpr uint32_t make_i_descriptor(
     uint8_t sparsity_meta_sel = 0,
     uint8_t a_storage_layout = 0,
     uint8_t b_storage_layout = 0) {
-  static_cast<void>(sizeof(Ct));  // suppress unused-template-parameter warning
-  static_cast<void>(sizeof(Dt));
   uint32_t v = 0;
+  // Bit layout matches the simulator's i_descriptor_t (idescriptor.h):
+  //   [1:0] sparsity_meta_sel, [2] sparsity_kind, [3] saturate,
+  //   [5:4] ctype, [7:6] dtype, [9:8] atype, [11:10] btype,
+  //   [14] transpose_a, [15] transpose_b, [19:16] shape_m=M>>4, [23:20] shape_n=N>>4.
   v |= (static_cast<uint32_t>(sparsity_meta_sel) & 0x3u) << 0;
   v |= (static_cast<uint32_t>(sparsity_kind)     & 0x1u) << 2;
-  v |= (static_cast<uint32_t>(i_descriptor_kind_for<At, Bt>::value) & 0xFu) << 4;
-  v |= (static_cast<uint32_t>(M) & 0xFFu) << 8;
-  v |= (static_cast<uint32_t>(N) & 0xFFu) << 16;
-  v |= (static_cast<uint32_t>(a_storage_layout) & 0x3u) << 24;
-  v |= (static_cast<uint32_t>(b_storage_layout) & 0x3u) << 26;
-  v |= (static_cast<uint32_t>(output_negate ? 1u : 0u))  << 28;
-  v |= (static_cast<uint32_t>(saturate      ? 1u : 0u))  << 29;
-  v |= (static_cast<uint32_t>(transpose_a   ? 1u : 0u))  << 30;
-  v |= (static_cast<uint32_t>(transpose_b   ? 1u : 0u))  << 31;
+  v |= (static_cast<uint32_t>(saturate ? 1u : 0u))       << 3;
+  v |= (idesc_prec_code_for<Ct>::value & 0x3u) << 4;    // ctype
+  v |= (idesc_prec_code_for<Dt>::value & 0x3u) << 6;    // dtype
+  v |= (idesc_prec_code_for<At>::value & 0x3u) << 8;    // atype
+  v |= (idesc_prec_code_for<Bt>::value & 0x3u) << 10;   // btype
+  v |= (static_cast<uint32_t>(transpose_a ? 1u : 0u)) << 14;
+  v |= (static_cast<uint32_t>(transpose_b ? 1u : 0u)) << 15;
+  v |= ((static_cast<uint32_t>(M) >> 4) & 0xFu) << 16;  // shape_m
+  v |= ((static_cast<uint32_t>(N) >> 4) & 0xFu) << 20;  // shape_n
+  // The simulator decodes neither storage-layout nor output_negate from idesc.
+  static_cast<void>(a_storage_layout);
+  static_cast<void>(b_storage_layout);
+  static_cast<void>(output_negate);
   return v;
 }
 

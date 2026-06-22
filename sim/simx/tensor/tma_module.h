@@ -71,6 +71,10 @@ private:
     uint32_t  lane = 0;
 
     bool      is_load = true;
+    // Destination of a load (resolved from smem_addr once the transfer args are
+    // read): a TMEM taddr (A/D, written via TmemWriteReq) vs. a SHARED-mem/LMEM
+    // address (B, written via lmem_arb). smem_addr < LMEM_BASE_ADDR ⇒ TMEM.
+    bool      dest_is_tmem = true;
     uint64_t  tensor_map_addr = 0;    // DRAM addr of tensor_map_t (128 B)
     uint64_t  args_lmem_ptr   = 0;    // LMEM addr of cpabulk_transfer_args_t
     uint32_t  wid = 0;

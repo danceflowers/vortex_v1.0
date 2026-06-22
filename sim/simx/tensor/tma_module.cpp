@@ -108,6 +108,11 @@ void Tma::advance_job(ActiveJob& job) {
                          job.args_lmem_ptr + 4, 4);
         core_->lmem_read(reinterpret_cast<uint8_t*>(job.coords),
                          job.args_lmem_ptr + 8, 20);
+        // Resolve the destination: an LMEM-range smem_addr means deliver to
+        // SHARED memory (B); otherwise smem_addr is a TMEM taddr (A/D) and the
+        // tile is written straight into TMEM.
+        job.dest_is_tmem = (job.smem_addr < LMEM_BASE_ADDR);
+        if (job.dest_is_tmem) job.taddr = job.smem_addr;
         lmem_rsps_.erase(it); done = true;
       }
     } break;
@@ -156,23 +161,49 @@ void Tma::advance_job(ActiveJob& job) {
           uint32_t epp = std::max<uint32_t>(1, 64 / job.elem_bytes);
           uint64_t dram_addr = job.compute_elem_addr(job.next_pkt * epp);
           core_->dcache_read(job.staging_pkt.bytes.data(), dram_addr, 64);
-          // Forward the packet to TMEM. If the write port is full, keep the
-          // cache response and retry next tick (stay in XFER_CACHE).
-          if (TmemWriteReq.full()) return;  // pending_req_id/tag unchanged → retry
-          TensorMemPortReq wr;
-          wr.request_id = job.pending_req_id;
-          wr.access_type = TensorMemPortReq::AccessType::Write;
-          wr.taddr = job.taddr;
-          wr.packet_idx = job.next_pkt;
-          wr.write_packet = job.staging_pkt;
-          TmemWriteReq.push(wr, 0);
-          cache_rsps_.erase(it);
-          DT(2, "Tma: LD push TMEM-wr req_id=" << wr.request_id
-             << " taddr=0x" << std::hex << job.taddr << std::dec
-             << " pkt=" << job.next_pkt << "/" << job.total_pkts);
-          // Now wait for the TMEM write ack (same tag); XFER_TMEM advances next_pkt.
-          job.pending_tag = ReqTag::XFER_TMEM;
-          return;
+          if (job.dest_is_tmem) {
+            // A/D: forward the packet to TMEM via TmemWriteReq (timing). If the
+            // write port is full, keep the cache response and retry next tick.
+            if (TmemWriteReq.full()) return;  // pending_req_id/tag unchanged → retry
+            TensorMemPortReq wr;
+            wr.request_id = job.pending_req_id;
+            wr.access_type = TensorMemPortReq::AccessType::Write;
+            wr.taddr = job.taddr;
+            wr.packet_idx = job.next_pkt;
+            wr.write_packet = job.staging_pkt;
+            TmemWriteReq.push(wr, 0);
+            cache_rsps_.erase(it);
+            DT(2, "Tma: LD push TMEM-wr req_id=" << wr.request_id
+               << " taddr=0x" << std::hex << job.taddr << std::dec
+               << " pkt=" << job.next_pkt << "/" << job.total_pkts);
+            // Wait for the TMEM write ack (same tag); XFER_TMEM advances next_pkt.
+            job.pending_tag = ReqTag::XFER_TMEM;
+            return;
+          } else {
+            // B: deliver the packet to SHARED memory (LMEM) at smem_addr. Model
+            // the write timing with an LsuReq through lmem_arb; since LMEM has
+            // write_reponse off it is fire-and-forget, and the data itself is
+            // written functionally (时序功能分离, same as the B-read in Stage2a).
+            if (LmemDescReq.full()) return;  // retry next tick
+            uint32_t off = job.next_pkt * 64;
+            LsuReq wr(LSU_CHANNELS);
+            wr.write = true;
+            wr.tag   = next_req_id_++;
+            wr.addrs.at(0) = job.smem_addr + off;
+            wr.mask.set(0);
+            LmemDescReq.push(wr, 0);
+            uint32_t nbytes = (off < job.tile_bytes)
+                            ? std::min<uint32_t>(64, job.tile_bytes - off) : 0;
+            if (nbytes > 0)
+              core_->lmem_write(job.staging_pkt.bytes.data(),
+                                job.smem_addr + off, nbytes);
+            cache_rsps_.erase(it);
+            DT(2, "Tma: LD pkt=" << job.next_pkt << "/" << job.total_pkts
+               << " → LMEM 0x" << std::hex << (job.smem_addr + off) << std::dec
+               << " (" << nbytes << "B)");
+            done = true;
+            ++job.next_pkt;
+          }
         } else {
           // ST: write staging data to DRAM via cache.
           uint32_t epp = std::max<uint32_t>(1, 64 / job.elem_bytes);

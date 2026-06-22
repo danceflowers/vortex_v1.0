@@ -71,18 +71,22 @@ static inline void read_d_to_output(uint32_t d_taddr,
 void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   uint8_t* lmem = reinterpret_cast<uint8_t*>(__local_mem(kLmemBytes));
   uint32_t lmem_base = reinterpret_cast<uint32_t>(__local_mem(0));
-  uint32_t a_payload_addr = reinterpret_cast<uint32_t>(lmem + kAPayloadOff);
   uint32_t b_payload_addr = reinterpret_cast<uint32_t>(lmem + kBPayloadOff);
-  uint32_t a_poison_payload_addr = reinterpret_cast<uint32_t>(lmem + kAPoisonPayloadOff);
   uint32_t mbar_addr = reinterpret_cast<uint32_t>(lmem + kMbarOff);
+
+  // Allocate TMEM up front so the TMA can deliver A straight into TMEM (A,D live
+  // in TMEM; B in LMEM). No tmem_cp — A reaches TMEM via the TMA load itself.
+  uint32_t a_taddr = vt::tmem_alloc(16);
+  uint32_t d_taddr = vt::tmem_alloc(32);
 
   auto* a_args = reinterpret_cast<vt::cpabulk_transfer_args_t*>(lmem + kAArgsOff);
   auto* b_args = reinterpret_cast<vt::cpabulk_transfer_args_t*>(lmem + kBArgsOff);
   auto* a_poison_args =
       reinterpret_cast<vt::cpabulk_transfer_args_t*>(lmem + kAPoisonArgsOff);
-  *a_args = vt::make_cpabulk_args(a_payload_addr, mbar_addr, 0, 0, 0, 0, 0);
+  // A and poison → TMEM a_taddr; B → LMEM b_payload.
+  *a_args = vt::make_cpabulk_args(a_taddr, mbar_addr, 0, 0, 0, 0, 0);
   *b_args = vt::make_cpabulk_args(b_payload_addr, mbar_addr, 0, 0, 0, 0, 0);
-  *a_poison_args = vt::make_cpabulk_args(a_poison_payload_addr, mbar_addr, 0, 0, 0, 0, 0);
+  *a_poison_args = vt::make_cpabulk_args(a_taddr, mbar_addr, 0, 0, 0, 0, 0);
 
   auto* a_tmap = reinterpret_cast<const vt::tensor_map_t*>(
       static_cast<uint32_t>(arg->a_tmap_addr));
@@ -91,27 +95,15 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   auto* a_poison_tmap = reinterpret_cast<const vt::tensor_map_t*>(
       static_cast<uint32_t>(arg->a_poison_tmap_addr));
 
+  // Round 1: load A → TMEM a_taddr and B → LMEM b_payload.
   vt::mbarrier_init(mbar_addr, 1);
-  vt::mbarrier_expect_tx(mbar_addr, 3 * TCGEN05_PAYLOAD_BYTES);
+  vt::mbarrier_expect_tx(mbar_addr, 2 * TCGEN05_PAYLOAD_BYTES);
   (void)vt::cpabulk_tensor_ld_complete_tx(a_tmap, a_args);
   (void)vt::cpabulk_tensor_ld_complete_tx(b_tmap, b_args);
-  (void)vt::cpabulk_tensor_ld_complete_tx(a_poison_tmap, a_poison_args);
   uint32_t tma_phase = vt::mbarrier_arrive_token(mbar_addr);
   vt::mbarrier_wait(mbar_addr, tma_phase);
 
-  uint32_t a_taddr = vt::tmem_alloc(16);
-  uint32_t d_taddr = vt::tmem_alloc(32);
-
-  uint64_t a_sdesc = make_sdesc(lmem_base, a_payload_addr);
-  uint64_t poison_sdesc = make_sdesc(lmem_base, a_poison_payload_addr);
   uint64_t b_sdesc = make_sdesc(lmem_base, b_payload_addr);
-  auto* a_sdesc_ptr = reinterpret_cast<uint64_t*>(lmem + kASdescOff);
-  auto* poison_sdesc_ptr = reinterpret_cast<uint64_t*>(lmem + kAPoisonSdescOff);
-  *a_sdesc_ptr = a_sdesc;
-  *poison_sdesc_ptr = poison_sdesc;
-
-  vt::tmem_cp_shape<4>(a_taddr, a_sdesc_ptr);
-
   auto* op_block = reinterpret_cast<vt::operand_block_t*>(lmem + kOpBlockOff);
   *op_block = vt::make_operand_block<vt::fp32, vt::fp32>(a_taddr, b_sdesc, 0);
   uint32_t idesc = vt::make_i_descriptor<vt::fp16, vt::fp16, vt::fp32, vt::fp32>(
@@ -120,11 +112,16 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
   auto* out_words = reinterpret_cast<volatile uint32_t*>(
       static_cast<uint32_t>(arg->out_addr));
 
+  // FILL: captures A (identity) into the collector buffer (abuf).
   run_mma_and_wait(mbar_addr, d_taddr, idesc, op_block, 0x00);
 
-  // If USE/LASTUSE incorrectly refetch A from TMEM, they will see all zeros
-  // instead of the identity tile captured by the collector FILL.
-  vt::tmem_cp_shape<4>(a_taddr, poison_sdesc_ptr);
+  // Round 2: poison TMEM a_taddr with zeros. If USE/LASTUSE incorrectly refetch
+  // A from TMEM they will see zeros instead of the abuf-captured identity tile.
+  vt::mbarrier_init(mbar_addr, 1);
+  vt::mbarrier_expect_tx(mbar_addr, TCGEN05_PAYLOAD_BYTES);
+  (void)vt::cpabulk_tensor_ld_complete_tx(a_poison_tmap, a_poison_args);
+  uint32_t poison_phase = vt::mbarrier_arrive_token(mbar_addr);
+  vt::mbarrier_wait(mbar_addr, poison_phase);
 
   run_mma_and_wait(mbar_addr, d_taddr, idesc, op_block, 0x10);
   run_mma_and_wait(mbar_addr, d_taddr, idesc, op_block, 0x20);
