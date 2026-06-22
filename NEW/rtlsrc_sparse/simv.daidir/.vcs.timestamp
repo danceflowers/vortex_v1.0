@@ -1,0 +1,198 @@
+0 
+34
++itf+/export/SoftWare/Synopsys/vcs/O-2018.09-SP2/linux64/lib/vcsdp_lite.tab
++vcsd1
++vpi
+-Mamsrun=
+-Masflags=
+-Mcc=gcc
+-Mcfl= -pipe -fPIC -O -I/export/SoftWare/Synopsys/vcs/O-2018.09-SP2/include
+-Mcplusplus=g++
+-Mcrt0=
+-Mcrtn=
+-Mcsrc=
+-Mexternalobj=
+-Mldflags= -rdynamic
+-Mobjects= /export/SoftWare/Synopsys/vcs/O-2018.09-SP2/linux64/lib/libvirsim.so /export/SoftWare/Synopsys/vcs/O-2018.09-SP2/linux64/lib/liberrorinf.so /export/SoftWare/Synopsys/vcs/O-2018.09-SP2/linux64/lib/libsnpsmalloc.so /export/SoftWare/Synopsys/vcs/O-2018.09-SP2/linux64/lib/libvfs.so
+-Mout=simv
+-Msaverestoreobj=/export/SoftWare/Synopsys/vcs/O-2018.09-SP2/linux64/lib/vcs_save_restore_new.o
+-Msyslibs=/export/SoftWare/Synopsys/verdi/Verdi_O-2018.09-SP2/share/PLI/VCS/LINUX64/pli.a -ldl
+-Mvcsaceobjs=
+-Mxcflags= -pipe -fPIC -I/export/SoftWare/Synopsys/vcs/O-2018.09-SP2/include
+-P
+-debug_access+all
+-f filelist.f
+-fsdb
+-full64
+-gen_obj
+-l
+-o simv
+-picarchive
+-sverilog
+-top
+/export/SoftWare/Synopsys/vcs/O-2018.09-SP2/linux64/bin/vcs1
+/export/SoftWare/Synopsys/verdi/Verdi_O-2018.09-SP2/share/PLI/VCS/LINUX64/verdi.tab
+compile.log
+tb_tensor_core
+134
+sysc_uni_pwd=/usrhome/opensoc/_OpenTensorCore/rtl_sparse
+ossSimUserSiDir=/export/SoftWare/Keysight/ADS_2020.2/idf/ads_site/si
+ossSimUserHnlDir=/export/SoftWare/Keysight/ADS_2020.2/idf/ads_site/hnl
+XRDP_SOCKET_PATH=/run/xrdp
+XRDP_SESSION=1
+XRDP_PULSE_SOURCE_SOCKET=xrdp_chansrv_audio_in_socket_15
+XRDP_PULSE_SINK_SOCKET=xrdp_chansrv_audio_out_socket_15
+XPEDION_CADENCE_VERSION=618-64b
+XPEDION=/export/SoftWare/Keysight/GoldenGate_2020/GoldenGate-2020
+XILINX_HOME=/export/SoftWare/Xilinx
+XIC_HOME=/export/SoftWare/Xilinx/Vivado_2019.1/xic
+XDG_SESSION_ID=c7
+XDG_RUNTIME_DIR=/run/user/25072
+XDG_DATA_DIRS=/usrhome/xinruishen/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share:/usr/share
+XCELIUMMAIN_HOME=/export/SoftWare/Cadence/XCELIUMMAIN_20.09.009
+XA_HOME=/export/SoftWare/Synopsys/xa/O-2018.09-SP5
+WV_HOME=/export/SoftWare/Synopsys/wv/O-2018.09-SP2
+W3264_NO_HOST_CHECK=1
+VTE_VERSION=5204
+VMR_MODE_FLAG=64
+VIVADO_HOME=/export/SoftWare/Xilinx/Vivado_2019.1/Vivado/2019.1
+VERDI_HOME=/export/SoftWare/Synopsys/verdi/Verdi_O-2018.09-SP2
+VCS_TARGET_ARCH=amd64
+VCS_MODE_FLAG=64
+VCS_LOG_FILE=compile.log
+VCS_HOME=/export/SoftWare/Synopsys/vcs/O-2018.09-SP2
+VCS_DEPTH=0
+VCS_ARG_ADDED_FOR_TMP=1
+VCS_ARCH_OVERRIDE=linux
+VCS_ARCH=linux64
+UNAME=/bin/uname
+Totem_HOME=/export/SoftWare/Ansys/Totem2019/Totem_Linux64e6_V19.2.7
+TXS_HOME=/export/SoftWare/Synopsys/txs/O-2018.06-SP1
+TOOL_HOME=/export/SoftWare/Synopsys/vcs/O-2018.09-SP2/linux64
+TESSENT_PATH=/export/SoftWare/Mentor/Tessent_2021_2
+TCAD_HOME=/export/SoftWare/Silvaco/TCAD_2018
+TANNER_PATH=/export/SoftWare/Mentor/TannerTools_2019.2/tanner
+SYN_HOME=/export/SoftWare/Synopsys/syn/O-2018.06-SP1
+SYNOPSYS_LC_ROOT=/export/SoftWare/Synopsys/lc/O-2018.06-SP1
+SYNOPSYS_HOME=/export/SoftWare/Synopsys
+STRATUS_HOME=/export/SoftWare/Cadence/STRATUS19.24.100
+STAR_RCXT_HOME=/export/SoftWare/Synopsys/starrc/O-2018.06-SP1
+SSV_HOME=/export/SoftWare/Cadence/SSV20.20.000
+SSH_AUTH_SOCK=/tmp/ssh-8ZWz1c2B4JHJ/agent.12650
+SSH_ASKPASS=/usr/libexec/openssh/gnome-ssh-askpass
+SSH_AGENT_PID=12842
+SPYGLASS_HOME=/export/SoftWare/Synopsys/spyglass/SPYGLASS2018.09-SP1/SPYGLASS_HOME
+SPECTRE_HOME=/export/SoftWare/Cadence/SPECTRE21.10.303
+SPECTRE_DEFAULTS=-E
+SILICONSMART_HOME=/export/SoftWare/Synopsys/siliconsmart/N-2017.12-SP2
+SESSION_MANAGER=local/unix:@/tmp/.ICE-unix/12843,unix/unix:/tmp/.ICE-unix/12843
+SENTAURUS_HOME=/export/SoftWare/Synopsys/sentaurus/O_2018.06-SP2
+SDK_HOME=/export/SoftWare/Xilinx/Vivado_2019.1/SDK/2019.1
+SCRNAME=vcs
+SCRIPT_NAME=vcs
+RedHawk_HOME=/export/SoftWare/Ansys/Redhawk2019/RedHawk_Linux64e5_V19.0.3
+QUESTASIM_HOME=/export/SoftWare/Mentor/QuestaSim_2021.2_1/questasim
+QUARTUS_HOME=/export/SoftWare/Altera/QuartusPrimeStd_2018/quartus
+QUANTUS_HOME=/export/SoftWare/Cadence//export/SoftWare/Cadence/QUANTUS20.12.000
+QT_GRAPHICSSYSTEM_CHECKED=1
+QTLIB=/usr/lib64/qt-3.3/lib
+QTINC=/usr/lib64/qt-3.3/include
+QTDIR=/usr/lib64/qt-3.3
+QPROGRAMMER_HOME=/export/SoftWare/Altera/QuartusPrimeStd_2018/qprogrammer
+PVSHOME=/export/SoftWare/Cadence/PVS20.11.000
+PULSE_SCRIPT=/etc/xrdp/pulse/default.pa
+PRIMETIME_HOME=/export/SoftWare/Synopsys/pts/O-2018.06-SP1
+PRIMEPOWER_HOME=/export/SoftWare/Synopsys/pwr/O-2018.06-SP3
+OVA_UUM=0
+NIOS2EDS_HOME=/export/SoftWare/Altera/QuartusPrimeStd_2018/nios2eds
+MODEL_COMPOSER_HOME=/export/SoftWare/Xilinx/Vivado_2019.1/Model_Composer/2019.1
+MODELGEN_HOME=/export/SoftWare/Integrand/modelgen64-2.22
+MGLS_LICENSE_FILE=/export/SoftWare/Mentor/license/license.dat
+MGC_LIB_PATH=/export/SoftWare/Mentor/Calibre_2021.2_28.15/aoi_cal_2021.2_28.15/lib
+MGC_HOME=/export/SoftWare/Mentor/Calibre_2021.2_28.15/aoi_cal_2021.2_28.15
+MGC_CALIBRE_REALTIME_VIRTUOSO_ENABLED=1
+MENTOR_HOME=/export/SoftWare/Mentor
+MATLAB_HOME=/export/SoftWare/MathWork/MatlabR2020a
+LIBERATE_HOME=/export/SoftWare/Cadence/LIBERATE20.10.674
+LESSOPEN=||/usr/bin/lesspipe.sh %s
+LC_ALL=C
+JLS_HOME=/export/SoftWare/Cadence/JLS19.13.000
+JASPERGOLD_HOME=/export/SoftWare/Cadence/JASPERGOLD20.03.000
+INTEGRAND_HOME=/export/SoftWare/Integrand
+INNOVUS_HOME=/export/SoftWare/Cadence/INNOVUS20.10.000
+IMSETTINGS_MODULE=none
+IMSETTINGS_INTEGRATE_DESKTOP=yes
+IDENTIFY_HOME=/export/SoftWare/Synopsys/identify/N-2018.03-SP1
+ICC_HOME=/export/SoftWare/Synopsys/icc/O-2018.06-SP1
+ICC2_HOME=/export/SoftWare/Synopsys/icc2/O-2018.06
+HSPICE_HOME=/export/SoftWare/Synopsys/hspice/O-2018.09-SP2/hspice
+HPEESOF_DIR=/export/SoftWare/Keysight/ADS_2020.2
+HLS_HOME=/export/SoftWare/Altera/QuartusPrimeStd_2018/hls
+HLD_HOME=/export/SoftWare/Altera/QuartusPrimeStd_2018/hld
+HISTCONTROL=ignoredups
+GTK_PATH=/usr/lib64/gtk-2.0
+GPG_AGENT_INFO=/usrhome/xinruishen/.gnupg/S.gpg-agent:12851:1
+GOLDENGATE_LICENSE_FILE=/export/SoftWare/Keysight/license/license.lic
+GENUS_HOME=/export/SoftWare/Cadence/GENUS20.10.000
+FPGA_HOME=/export/SoftWare/Synopsys/fpga/N-2018.03-SP1
+FORMALITY_HOME=/export/SoftWare/Synopsys/fm/O-2018.06-SP1
+FINESIM_HOME=/export/SoftWare/Synopsys/finesim/O-2018.09-SP2
+EMX_HOME=/export/SoftWare/Integrand/emx64-5.7
+EMPRO_LICENSE_FILE=/export/SoftWare/Keysight/license/license.lic
+EMPROHOME=/export/SoftWare/Keysight/ADS_2020.2/fem/2020.20/linux_x86_64/bin
+DVE_HOME=/export/SoftWare/Synopsys/vcs/O-2018.09-SP2/gui/dve
+DBUS_SESSION_BUS_ADDRESS=unix:abstract=/tmp/dbus-fvxW8KvaWR,guid=f3dfc627f8741c5d915272f0699ffc06
+CUSTOMCOMPILER_HOME=/export/SoftWare/Synopsys/customcompiler/O-2018.09-SP1
+CONFRML_HOME=/export/SoftWare/Cadence/CONFRML19.10.100
+COLORTERM=truecolor
+CDS_SPECTRE_FBENABLE=1
+CDS_SPECTRERF_FBENABLE=1
+CDS_ROOT=/export/SoftWare/Cadence/IC06.18.250
+CDS_Netlisting_Mode=Analog
+CDS_LOAD_ENV=CWD
+CDS_LIC_ONLY=1
+CDS_LIC_FILE=/export/SoftWare/Cadence/license/license.dat
+CDS_INST_DIR=/export/SoftWare/Cadence/IC06.18.250
+CDS_HOME=/export/SoftWare/Cadence/IC06.18.250
+CDS_ENABLE_VMS=1
+CDS_AUTO_64BIT=ALL
+CDSROOT=/export/SoftWare/Cadence/IC06.18.250
+CDSHOME=/export/SoftWare/Cadence/IC06.18.250
+CDSDIR=/export/SoftWare/Cadence/IC06.18.250
+CDS=/export/SoftWare/Cadence/IC06.18.250
+CALIBRE_HOME=/export/SoftWare/Mentor/Calibre_2021.2_28.15/aoi_cal_2021.2_28.15
+CALIBRE_ENABLE_SKILL_PEXBA_MODE=1
+CADHOME=/export/SoftWare/Cadence
+CADENCE_DIR=/export/SoftWare/Cadence/IC06.18.250
+ASSURAHOME=/export/SoftWare/Cadence/ASSURA04.16.001
+APACHEDA_LICENSE_FILE=11112@icpc
+ANSYS_PATH=/export/SoftWare/Ansys
+ALTERA_HOME=/export/SoftWare/Altera
+ADS_LICENSE_FILE=/export/SoftWare/Keysight/license/license.lic
+0
+18
+1775631104 tb_tensor_core.v
+1775548085 tb_tensor_core_sparse.v
+1775548085 tensor_core.v
+1775548085 to_outtype_con.v
+1775548085 mm_mul_add.v
+1775548085 tc_mul_dual_path.v
+1775548085 spar_mul.v
+1775548085 to_next_con.v
+1775548085 to_intype_con.v
+1775550131 matrix_input_buffer_sparse.v
+1775548085 matrix_input_buffer.v
+1775548085 input_parser_bypass.v
+1775548085 fp_to_fp22.v
+1775548085 fp_to_fp9.v
+1775548085 define.v
+1775618391 filelist.f
+1550753332 /export/SoftWare/Synopsys/verdi/Verdi_O-2018.09-SP2/share/PLI/VCS/LINUX64/verdi.tab
+1551421246 /export/SoftWare/Synopsys/vcs/O-2018.09-SP2/linux64/lib/vcsdp_lite.tab
+4
+1551422344 /export/SoftWare/Synopsys/vcs/O-2018.09-SP2/linux64/lib/libvirsim.so
+1551421792 /export/SoftWare/Synopsys/vcs/O-2018.09-SP2/linux64/lib/liberrorinf.so
+1551421768 /export/SoftWare/Synopsys/vcs/O-2018.09-SP2/linux64/lib/libsnpsmalloc.so
+1551421789 /export/SoftWare/Synopsys/vcs/O-2018.09-SP2/linux64/lib/libvfs.so
+1775631238 simv.daidir
+-1 partitionlib

@@ -1,0 +1,15 @@
+/usrhome/opensoc/_OpenTensorCore/rtl_sparse/define.v
+/usrhome/opensoc/_OpenTensorCore/rtl_sparse/fp_to_fp22.v
+/usrhome/opensoc/_OpenTensorCore/rtl_sparse/fp_to_fp9.v
+/usrhome/opensoc/_OpenTensorCore/rtl_sparse/input_parser_bypass.v
+/usrhome/opensoc/_OpenTensorCore/rtl_sparse/matrix_input_buffer.v
+/usrhome/opensoc/_OpenTensorCore/rtl_sparse/matrix_input_buffer_sparse.v
+/usrhome/opensoc/_OpenTensorCore/rtl_sparse/mm_mul_add.v
+/usrhome/opensoc/_OpenTensorCore/rtl_sparse/spar_mul.v
+/usrhome/opensoc/_OpenTensorCore/rtl_sparse/tb_tensor_core.v
+/usrhome/opensoc/_OpenTensorCore/rtl_sparse/tb_tensor_core_sparse.v
+/usrhome/opensoc/_OpenTensorCore/rtl_sparse/tc_mul_dual_path.v
+/usrhome/opensoc/_OpenTensorCore/rtl_sparse/tensor_core.v
+/usrhome/opensoc/_OpenTensorCore/rtl_sparse/to_intype_con.v
+/usrhome/opensoc/_OpenTensorCore/rtl_sparse/to_next_con.v
+/usrhome/opensoc/_OpenTensorCore/rtl_sparse/to_outtype_con.v
